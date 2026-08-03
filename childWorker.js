@@ -1,11 +1,13 @@
-// child-worker.js — v3.1
+// child-worker.js — v3.2
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'child-3.4';
+const VERSION = 'child-3.5';
 let MOTHER_URL = null;
 const API_SECRET = 'saow-pan';
 const REPORT_THRESHOLD = 5 * 1024 * 1024;
 const USER_CACHE_TTL = 30 * 1000;
+
+const STATUS_HTML_URL = 'https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/node-status.html';
 
 const ADGUARD_DNS_HOST = 'dns.adguard.com';
 const ADGUARD_DNS_PORT = 53;
@@ -55,7 +57,7 @@ async function ensureBlocklist() {
     for (const url of BLOCKLIST_URLS) {
       try {
         const r = await fetch(url, {
-          headers: { 'User-Agent': 'cf-child/3.1' },
+          headers: { 'User-Agent': 'cf-child/3.2' },
           cf: { cacheTtl: 3600, cacheEverything: true },
         });
         if (!r.ok) continue;
@@ -167,6 +169,7 @@ function authHeaders() {
 }
 
 async function reportToMother(payload) {
+  if (!MOTHER_URL) return null;
   try {
     const res = await fetch(`${MOTHER_URL}/api/node/report`, {
       method: 'POST',
@@ -185,13 +188,11 @@ async function getUserConfig(uuid) {
   const cached = userCache.get(uuid);
   if (cached && Date.now() - cached.ts < USER_CACHE_TTL) return cached.data;
   try {
-    // قبلاً: /api/item  ← اشتباه
     const res = await fetch(`${MOTHER_URL}/api/users?uuid=${encodeURIComponent(uuid)}`, {
       headers: authHeaders(),
     });
     if (res.ok) {
       const data = await res.json();
-      // فرمت مادر: { ok: true, user: {...} }
       if (data.ok && data.user) {
         const u = data.user;
         const cfg = {
@@ -339,10 +340,6 @@ async function handleVlessWebSocket(request, ctx) {
           return safeClose('disabled');
         }
 
-        // const maxConn = currentConfig.ipLimit || 1;
-        // if ((activeConns.get(userUuid) || 0) >= maxConn) {
-        //   return safeClose('local conn limit');
-        // }
         const LOCAL_MAX_CONNS = 32;
         if ((activeConns.get(userUuid) || 0) >= LOCAL_MAX_CONNS) {
           return safeClose('local conn limit');
@@ -355,10 +352,7 @@ async function handleVlessWebSocket(request, ctx) {
           ip: clientIP,
         });
 
-        // fail-closed
-        // if (!joinRes || joinRes.action === 'close' || joinRes.enabled === false) {
-        //   return safeClose(joinRes?.reason || 'mother rejected');
-        // }
+        // fail-open: فقط اگر مادر صراحتاً بگوید ببند
         if (joinRes && (joinRes.action === 'close' || joinRes.enabled === false)) {
           return safeClose(joinRes?.reason || 'mother rejected');
         }
@@ -438,12 +432,55 @@ async function handleVlessWebSocket(request, ctx) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-async function sendHeartbeat(request, ctx, childId) {
-  const url = new URL(request.url);
+/** صفحه وضعیت از گیت‌هاب + تزریق نسخه */
+async function serveStatusPage(request, childId) {
+  try {
+    const res = await fetch(STATUS_HTML_URL, {
+      headers: { 'User-Agent': 'cf-child/3.2' },
+      cf: { cacheTtl: 300, cacheEverything: true },
+    });
+    if (!res.ok) throw new Error('fetch status html failed');
+
+    let html = await res.text();
+
+    const inject = `<script>window.__SAOW_VERSION__=${JSON.stringify(VERSION)};window.__SAOW_CHILD_ID__=${JSON.stringify(childId)};</script>`;
+    if (html.includes('</head>')) {
+      html = html.replace('</head>', inject + '</head>');
+    } else {
+      html = inject + html;
+    }
+
+    return new Response(html, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'public, max-age=60',
+      },
+    });
+  } catch (e) {
+    return new Response(
+      `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><title>Saow Node</title></head>
+       <body style="background:#05060f;color:#e2e8f0;font-family:system-ui;display:grid;place-items:center;min-height:100vh;margin:0">
+         <div style="text-align:center">
+           <h1 style="font-size:2.5rem;letter-spacing:.15em">SAOW</h1>
+           <p>Edge Node</p>
+           <p style="opacity:.7">Version: <b>${VERSION}</b></p>
+           <p style="opacity:.5;font-size:0.85rem">${childId}</p>
+         </div>
+       </body></html>`,
+      {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      }
+    );
+  }
+}
+
+function sendHeartbeat(ctx, childId, hostname) {
   ctx.waitUntil(reportToMother({
     type: 'heartbeat',
     child_id: childId,
-    url: `https://${url.hostname}`,
+    url: `https://${hostname}`,
     version: VERSION,
     active: activeConns.size,
   }));
@@ -455,44 +492,59 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const childId = generateChildId(request.url);
+    const isWs = (request.headers.get('Upgrade') || '').toLowerCase() === 'websocket';
 
-    // همیشه وقتی کسی به نود وصل شد heartbeat بفرست
-    if (path === '/health' || path === '/' || path === '/version' ||
-        (request.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
-      await sendHeartbeat(request, ctx, childId);   // یا ctx.waitUntil(...)
+    // Heartbeat روی مسیرهای معمولی + هر اتصال WebSocket
+    if (path === '/health' || path === '/' || path === '/version' || isWs) {
+      sendHeartbeat(ctx, childId, url.hostname);
     }
 
     if (path === '/health') {
       return new Response(JSON.stringify({
-        ok: true, id: childId, version: VERSION, activeUsers: activeConns.size,
+        ok: true,
+        id: childId,
+        version: VERSION,
+        activeUsers: activeConns.size,
       }), { headers: { 'content-type': 'application/json' } });
     }
 
-    if ((request.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
+    if (isWs) {
       ctx.waitUntil(ensureBlocklist());
       return handleVlessWebSocket(request, ctx);
     }
 
+    // صفحه HTML وضعیت
     if (path === '/') {
-      // اگر صفحه HTML می‌خوای
-      // return serveStatusPage(...) 
-      // فعلاً JSON نگه می‌داریم یا هر چی قبلاً داشتی
-      return new Response(JSON.stringify({
-        version: VERSION, role: 'node', id: childId,
-      }), { headers: { 'content-type': 'application/json' } });
+      return serveStatusPage(request, childId);
     }
 
     if (path === '/version') {
       return new Response(JSON.stringify({
-        version: VERSION, role: 'node', id: childId,
+        version: VERSION,
+        role: 'node',
+        id: childId,
       }), { headers: { 'content-type': 'application/json' } });
     }
 
     return new Response('Not Found', { status: 404 });
   },
 
+  // Cron Trigger (اگر ست شده باشد)
   async scheduled(event, env, ctx) {
+    if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || "";
+
+    // اگر CHILD_HOSTNAME در binding وجود دارد از آن استفاده کن
+    const hostname = env.CHILD_HOSTNAME || env.WORKER_NAME || 'unknown';
+    const childId = 'child-' + String(hostname).toLowerCase().replace(/[^a-z0-9.-]/g, '').replace(/\./g, '-');
+
+    ctx.waitUntil(reportToMother({
+      type: 'heartbeat',
+      child_id: childId,
+      url: env.CHILD_URL || `https://${hostname}`,
+      version: VERSION,
+      active: activeConns.size,
+    }));
+
     ctx.waitUntil(ensureBlocklist());
   },
 };
-
