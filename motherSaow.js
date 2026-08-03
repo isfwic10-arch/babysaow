@@ -265,6 +265,7 @@ async function doDeleteNode(chatId, nodeId, env, msgId) {
     }
 
     // حذف از دیتابیس پنل
+    await removeChildByScriptName(env, scriptName);
     await removeManagedNode(env, nodeId);
 
     return edit(chatId, msgId,
@@ -934,7 +935,7 @@ async function showNodes(chatId, env, msgId = null) {
   for (const m of managed) {
     kb.push([
       { text: `🗑 ${m.script_name}`, callback_data: `del_node:${m.id}` },
-      { text: `🔄 آپدیت`, callback_data: `update_child:${m.id}` },
+      { text: `♻️ نصب مجدد`, callback_data: `update_child:${m.id}` },
       { text: `📈 اکانت`, callback_data: `node_acc:${m.id}` },
     ]);
   }
@@ -1311,6 +1312,7 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
       console.log("cleanup D1 by list failed:", e?.message);
     }
 
+    await removeChildByScriptName(env, oldScript);
     await removeManagedNode(env, nodeId);
 
     // کمی صبر تا حذف در کلودفلر اعمال شود
@@ -1828,6 +1830,7 @@ async function generateSubscription(env, user, motherHost) {
   const isQuotaExceeded = user.quotaBytes > 0 && total.total >= user.quotaBytes;
   const isDailyExceeded = user.dailyQuotaBytes > 0 && daily.total >= user.dailyQuotaBytes;
   const isDisabled = !user.enabled;
+
   if (isDisabled || isExpired || isQuotaExceeded || isDailyExceeded) {
     if (isDisabled) links.push(buildInfoLink(user.uuid, motherHost, `🚫 حساب شما غیرفعال شده است`));
     if (isExpired) links.push(buildInfoLink(user.uuid, motherHost, `⏰ زمان اشتراک به پایان رسیده`));
@@ -1836,23 +1839,72 @@ async function generateSubscription(env, user, motherHost) {
     links.push(buildInfoLink(user.uuid, motherHost, `🔄 برای تمدید با پشتیبانی در ارتباط باشید`));
     return links.join("\n");
   }
-  const nodes = await getHealthyChildren(env);
-  if (nodes.length === 0) {
+
+  // ---- انتخاب نود معتبر ----
+  // اولویت: managed_nodes (ثبت‌شده در پنل) که آنلاین باشند
+  // بعد: هر managed حتی اگر فعلاً heartbeat نداده
+  // در آخر: alive بدون managed (سازگاری عقب‌رو)
+  const managed = await getManagedNodes(env);
+  const alive = await getHealthyChildren(env);
+
+  function hostFromUrl(u) {
+    try { return new URL(u).hostname; } catch { return null; }
+  }
+
+  function isAliveMatch(m, a) {
+    if (!m) return false;
+    const script = m.script_name || "";
+    const mHost = hostFromUrl(m.url || "");
+    if (script && a.id && a.id.includes(script)) return true;
+    if (mHost && a.id && a.id.includes(mHost.split(".")[0])) return true;
+    if (mHost && a.url && a.url.includes(mHost)) return true;
+    if (script && a.url && a.url.includes(script)) return true;
+    return false;
+  }
+
+  let selectedUrl = null;
+
+  // 1) managed که آنلاین است
+  for (const m of managed) {
+    if (!m.url) continue;
+    if (alive.some((a) => isAliveMatch(m, a))) {
+      selectedUrl = m.url;
+      break;
+    }
+  }
+
+  // 2) اگر هیچ managed آنلاینی نبود، اولین managed با url
+  if (!selectedUrl) {
+    const withUrl = managed.find((m) => m.url);
+    if (withUrl) selectedUrl = withUrl.url;
+  }
+
+  // 3) سازگاری: اگر managed خالی بود از alive
+  if (!selectedUrl && alive.length && alive[0].url) {
+    selectedUrl = alive[0].url;
+  }
+
+  if (!selectedUrl) {
     links.push(buildInfoLink(user.uuid, motherHost, `⚠️ هیچ نود فعالی وجود ندارد`));
     return links.join("\n");
   }
-  const selected = nodes[0];
-  let childHost = null;
-  try { childHost = new URL(selected.url).hostname; } catch { childHost = null; }
+
+  let childHost = hostFromUrl(selectedUrl);
   if (!childHost) {
     links.push(buildInfoLink(user.uuid, motherHost, `⚠️ نود نامعتبر`));
     return links.join("\n");
   }
+
   const activeCount = await getActiveIPCount(env, user.id);
   links.push(buildVlessLink({
-    ip: "127.0.0.1", port: 1, uuid: user.uuid, host: motherHost, path: "/",
+    ip: "127.0.0.1",
+    port: 1,
+    uuid: user.uuid,
+    host: motherHost,
+    path: "/",
     name: `📋 ${formatBytesShort(total.total)} / ${user.quotaBytes > 0 ? formatBytesShort(user.quotaBytes) : "∞"} | ${daysRemaining(user.expiry)}d | IP:${activeCount}/${user.ipLimit}`,
   }));
+
   let gh = [];
   try { gh = await ensureDomainsList(); } catch {}
   const preferred = (gh || []).slice(0, 3);
@@ -1860,10 +1912,16 @@ async function generateSubscription(env, user, motherHost) {
   const fps = ["chrome", "firefox", "safari"];
   for (let i = 0; i < preferred.length; i++) {
     links.push(buildVlessLink({
-      ip: preferred[i], port: ports[i % ports.length], uuid: user.uuid, host: childHost,
-      path: `/?u=${user.id}`, name: `⭐ ${base} | P${i + 1}`, fp: fps[i % fps.length],
+      ip: preferred[i],
+      port: ports[i % ports.length],
+      uuid: user.uuid,
+      host: childHost,
+      path: `/?u=${user.id}`,
+      name: `⭐ ${base} | P${i + 1}`,
+      fp: fps[i % fps.length],
     }));
   }
+
   let resolved = {};
   try { resolved = await ensureIrcfResolved(); } catch {}
   let idx = 0;
@@ -1872,11 +1930,17 @@ async function generateSubscription(env, user, motherHost) {
     const ip = resolved[item.domain];
     if (!ip) continue;
     links.push(buildVlessLink({
-      ip, port: 443, uuid: user.uuid, host: childHost, path: `/?u=${user.id}`,
-      name: `⚡ ${base} | ${item.name}`, fp: ircfFps[idx % ircfFps.length],
+      ip,
+      port: 443,
+      uuid: user.uuid,
+      host: childHost,
+      path: `/?u=${user.id}`,
+      name: `⚡ ${base} | ${item.name}`,
+      fp: ircfFps[idx % ircfFps.length],
     }));
     idx++;
   }
+
   return links.join("\n");
 }
 
@@ -1981,6 +2045,24 @@ async function handleApi(request, env, path) {
 }
 
 // ====================== Helpers ======================
+
+async function removeChildByScriptName(env, scriptName) {
+  if (!(await d1Ready(env)) || !scriptName) return;
+  try {
+    // idهای heartbeat شبیه: child-saow-child-84598-isfwic1-workers-dev
+    await env.DB.prepare(
+      `DELETE FROM children WHERE id LIKE ? OR id LIKE ? OR url LIKE ?`
+    ).bind(
+      `%${scriptName}%`,
+      `%${scriptName.replace(/-/g, "")}%`,
+      `%${scriptName}%`
+    ).run();
+  } catch (e) {
+    console.log("removeChildByScriptName:", e?.message);
+  }
+}
+
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
