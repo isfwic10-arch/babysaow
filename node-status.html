@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Saow Node</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Vazirmatn:wght@300;500;700&display=swap');
+
+    :root {
+      --bg: #05060f;
+      --cyan: #22d3ee;
+      --violet: #a78bfa;
+      --pink: #f472b6;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      font-family: 'Vazirmatn', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      overflow: hidden;
+      display: grid;
+      place-items: center;
+    }
+
+    .bg {
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 80% 50% at 20% 20%, rgba(34, 211, 238, 0.12), transparent 50%),
+        radial-gradient(ellipse 60% 40% at 80% 80%, rgba(167, 139, 250, 0.14), transparent 50%),
+        radial-gradient(ellipse 50% 30% at 50% 50%, rgba(244, 114, 182, 0.08), transparent 60%);
+      animation: drift 12s ease-in-out infinite alternate;
+      z-index: 0;
+    }
+
+    @keyframes drift {
+      from { transform: scale(1) translate(0, 0); }
+      to { transform: scale(1.08) translate(-2%, 2%); }
+    }
+
+    canvas#particles {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      pointer-events: none;
+    }
+
+    .card {
+      position: relative;
+      z-index: 2;
+      width: min(420px, 92vw);
+      padding: 2.5rem 2rem;
+      border-radius: 24px;
+      background: linear-gradient(145deg, rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.55));
+      border: 1px solid rgba(148, 163, 184, 0.15);
+      box-shadow:
+        0 0 0 1px rgba(34, 211, 238, 0.08),
+        0 25px 80px rgba(0, 0, 0, 0.55),
+        0 0 60px rgba(34, 211, 238, 0.08);
+      backdrop-filter: blur(18px);
+      text-align: center;
+      animation: enter 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+    }
+
+    @keyframes enter {
+      from { opacity: 0; transform: translateY(28px) scale(0.96); }
+      to { opacity: 1; transform: none; }
+    }
+
+    .logo {
+      font-family: 'Orbitron', sans-serif;
+      font-weight: 900;
+      font-size: clamp(2.4rem, 8vw, 3.2rem);
+      letter-spacing: 0.18em;
+      background: linear-gradient(120deg, var(--cyan), var(--violet), var(--pink), var(--cyan));
+      background-size: 300% 300%;
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      animation: gradientMove 6s linear infinite, glowPulse 2.8s ease-in-out infinite;
+      text-shadow: 0 0 40px rgba(34, 211, 238, 0.25);
+      margin-bottom: 0.35rem;
+    }
+
+    @keyframes gradientMove {
+      0% { background-position: 0% 50%; }
+      100% { background-position: 300% 50%; }
+    }
+
+    @keyframes glowPulse {
+      0%, 100% { filter: drop-shadow(0 0 8px rgba(34, 211, 238, 0.35)); }
+      50% { filter: drop-shadow(0 0 22px rgba(167, 139, 250, 0.55)); }
+    }
+
+    .tagline {
+      color: var(--muted);
+      font-size: 0.9rem;
+      font-weight: 300;
+      margin-bottom: 1.75rem;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      padding: 0.55rem 1.1rem;
+      border-radius: 999px;
+      background: rgba(34, 211, 238, 0.08);
+      border: 1px solid rgba(34, 211, 238, 0.28);
+      margin-bottom: 1.5rem;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #34d399;
+      box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.6);
+      animation: ping 1.6s ease-out infinite;
+    }
+
+    @keyframes ping {
+      0% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.55); }
+      70% { box-shadow: 0 0 0 10px rgba(52, 211, 153, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+    }
+
+    .badge span {
+      font-family: 'Orbitron', sans-serif;
+      font-size: 0.78rem;
+      letter-spacing: 0.12em;
+      color: var(--cyan);
+    }
+
+    .version-box {
+      margin: 0 auto 1.25rem;
+      padding: 1rem 1.25rem;
+      border-radius: 16px;
+      background: rgba(2, 6, 23, 0.55);
+      border: 1px solid rgba(167, 139, 250, 0.25);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .version-box::before {
+      content: '';
+      position: absolute;
+      inset: -50%;
+      background: conic-gradient(from 0deg, transparent, rgba(34, 211, 238, 0.15), transparent 30%);
+      animation: spin 8s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .version-inner {
+      position: relative;
+      z-index: 1;
+    }
+
+    .version-label {
+      font-size: 0.72rem;
+      color: var(--muted);
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      margin-bottom: 0.35rem;
+    }
+
+    .version-value {
+      font-family: 'Orbitron', sans-serif;
+      font-weight: 700;
+      font-size: 1.45rem;
+      color: #fff;
+      letter-spacing: 0.08em;
+    }
+
+    .meta {
+      display: flex;
+      justify-content: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      margin-top: 0.25rem;
+    }
+
+    .chip {
+      font-size: 0.72rem;
+      padding: 0.35rem 0.7rem;
+      border-radius: 8px;
+      background: rgba(148, 163, 184, 0.08);
+      border: 1px solid rgba(148, 163, 184, 0.15);
+      color: var(--muted);
+      font-family: 'Orbitron', sans-serif;
+      letter-spacing: 0.06em;
+    }
+
+    .footer {
+      margin-top: 1.75rem;
+      font-size: 0.75rem;
+      color: #64748b;
+    }
+
+    .ring {
+      position: absolute;
+      width: 180px;
+      height: 180px;
+      border-radius: 50%;
+      border: 1px solid rgba(34, 211, 238, 0.12);
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      animation: ringPulse 4s ease-in-out infinite;
+      z-index: 0;
+    }
+    .ring:nth-child(2) { width: 260px; height: 260px; animation-delay: 0.6s; border-color: rgba(167, 139, 250, 0.1); }
+    .ring:nth-child(3) { width: 340px; height: 340px; animation-delay: 1.2s; border-color: rgba(244, 114, 182, 0.08); }
+
+    @keyframes ringPulse {
+      0%, 100% { opacity: 0.35; transform: translate(-50%, -50%) scale(1); }
+      50% { opacity: 0.8; transform: translate(-50%, -50%) scale(1.04); }
+    }
+
+    .wrap { position: relative; z-index: 2; }
+  </style>
+</head>
+<body>
+  <div class="bg"></div>
+  <canvas id="particles"></canvas>
+
+  <div class="wrap">
+    <div class="ring"></div>
+    <div class="ring"></div>
+    <div class="ring"></div>
+
+    <div class="card">
+      <div class="logo">SAOW</div>
+      <p class="tagline">Edge Node · Online</p>
+
+      <div class="badge">
+        <div class="dot"></div>
+        <span>OPERATIONAL</span>
+      </div>
+
+      <div class="version-box">
+        <div class="version-inner">
+          <div class="version-label">Node Version</div>
+          <div class="version-value" id="ver">—</div>
+        </div>
+      </div>
+
+      <div class="meta">
+        <div class="chip" id="role">NODE</div>
+        <div class="chip" id="status">ONLINE</div>
+      </div>
+
+      <p class="footer">Powered by Saow Panel</p>
+    </div>
+  </div>
+
+  <script>
+    // نسخه از query یا از خود صفحه (child جایگزین می‌کند)
+    const params = new URLSearchParams(location.search);
+    const ver = params.get('v') || window.__SAOW_VERSION__ || 'child-3.1';
+    document.getElementById('ver').textContent = ver;
+
+    // particles
+    const c = document.getElementById('particles');
+    const ctx = c.getContext('2d');
+    let w, h, dots = [];
+
+    function resize() {
+      w = c.width = innerWidth;
+      h = c.height = innerHeight;
+      dots = Array.from({ length: Math.min(70, Math.floor(w * h / 18000)) }, () => ({
+        x: Math.random() * w,
+        y: Math.random() * h,
+        r: Math.random() * 1.6 + 0.4,
+        vx: (Math.random() - 0.5) * 0.35,
+        vy: (Math.random() - 0.5) * 0.35,
+        a: Math.random() * 0.5 + 0.15,
+      }));
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, w, h);
+      for (const d of dots) {
+        d.x += d.vx; d.y += d.vy;
+        if (d.x < 0 || d.x > w) d.vx *= -1;
+        if (d.y < 0 || d.y > h) d.vy *= -1;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(34, 211, 238, ${d.a})`;
+        ctx.fill();
+      }
+      for (let i = 0; i < dots.length; i++) {
+        for (let j = i + 1; j < dots.length; j++) {
+          const a = dots[i], b = dots[j];
+          const dx = a.x - b.x, dy = a.y - b.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist < 110) {
+            ctx.strokeStyle = `rgba(167, 139, 250, ${0.12 * (1 - dist / 110)})`;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
+          }
+        }
+      }
+      requestAnimationFrame(draw);
+    }
+
+    addEventListener('resize', resize);
+    resize();
+    draw();
+  </script>
+</body>
+</html>
