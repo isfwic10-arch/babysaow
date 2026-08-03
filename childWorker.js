@@ -2,7 +2,7 @@
 import { connect } from 'cloudflare:sockets';
 
 const VERSION = 'child-3.1';
-const MOTHER_URL = 'https://nameless-violet-8fe0.isfwic1.workers.dev';
+const MOTHER_URL = env.MOTHER_URL;
 const API_SECRET = 'saow-pan';
 const REPORT_THRESHOLD = 1 * 1024 * 1024;
 const USER_CACHE_TTL = 30 * 1000;
