@@ -1,11 +1,13 @@
 // child-worker.js — v3.2
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-3.8';
+const VERSION = 'saow-node-3.9';
 let MOTHER_URL = null;
 const API_SECRET = 'saow-pan';
-const REPORT_THRESHOLD = 15 * 1024 * 1024;  // ۱۵ مگابایت
-const USER_CACHE_TTL = 5 * 60 * 1000;   // ۵ دقیقه
+const REPORT_THRESHOLD = 30 * 1024 * 1024;  // ۳۰ مگابایت (قبلاً ۱۵)
+const USER_CACHE_TTL = 8 * 60 * 1000;       // ۸ دقیقه (قبلاً ۵)
+const NEGATIVE_CACHE_TTL = 60 * 1000;       // کش منفی ۶۰ ثانیه
+
 
 const STATUS_HTML_URL = 'https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/node-status.html';
 
@@ -186,11 +188,18 @@ async function reportToMother(payload) {
 
 async function getUserConfig(uuid) {
   const cached = userCache.get(uuid);
-  if (cached && Date.now() - cached.ts < USER_CACHE_TTL) return cached.data;
+  if (cached) {
+    const ttl = cached.negative ? NEGATIVE_CACHE_TTL : USER_CACHE_TTL;
+    if (Date.now() - cached.ts < ttl) {
+      return cached.data;   // ممکن است null باشد (کش منفی)
+    }
+  }
+
   try {
     const res = await fetch(`${MOTHER_URL}/api/users?uuid=${encodeURIComponent(uuid)}`, {
       headers: authHeaders(),
     });
+
     if (res.ok) {
       const data = await res.json();
       if (data.ok && data.user) {
@@ -203,14 +212,28 @@ async function getUserConfig(uuid) {
           quotaBytes: u.quotaBytes || 0,
           dailyQuotaBytes: u.dailyQuotaBytes || 0,
         };
-        userCache.set(uuid, { data: cfg, ts: Date.now() });
+
+        // اگر خود مادر گفته disabled است، مثل منفی کش کن
+        if (cfg.enabled === false) {
+          userCache.set(uuid, { data: null, ts: Date.now(), negative: true });
+          return null;
+        }
+
+        userCache.set(uuid, { data: cfg, ts: Date.now(), negative: false });
         return cfg;
       }
     }
+
+    // ۴۰۴ یا هر خطای دیگر → کش منفی
+    userCache.set(uuid, { data: null, ts: Date.now(), negative: true });
+    return null;
+
   } catch (e) {
     console.log('getUserConfig failed', e?.message);
+    // در خطای شبکه هم موقتاً منفی کش می‌کنیم تا طوفان نشود
+    userCache.set(uuid, { data: null, ts: Date.now(), negative: true });
+    return null;
   }
-  return null;
 }
 
 function parseVlessHeader(buffer) {
@@ -354,6 +377,8 @@ async function handleVlessWebSocket(request, ctx) {
 
         // fail-open: فقط اگر مادر صراحتاً بگوید ببند
         if (joinRes && (joinRes.action === 'close' || joinRes.enabled === false)) {
+          // کش منفی بگذار تا reconnect سریع دوباره مادر را نزند
+          userCache.set(userUuid, { data: null, ts: Date.now(), negative: true });
           return safeClose(joinRes?.reason || 'mother rejected');
         }
 
