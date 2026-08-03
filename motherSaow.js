@@ -524,8 +524,7 @@ async function handleCallback(cq, env) {
       [
         [{ text: "🔗 ساخت توکن کلودفلر", url: CF_TOKEN_URL }],
         [{ text: "❌ انصراف", callback_data: "nodes_manage" }]
-      ],
-      true
+      ]
     );
   }
   if (data === "node_delete") {
@@ -871,12 +870,13 @@ async function showNodesManage(chatId, env, msgId = null) {
 async function showNodeCreate(chatId, env, msgId = null) {
   const text =
     `➕ <b>ساخت نود جدید</b>\n\n` +
-    `• توکن API با مجوزهای لازم بسازید\n` +
-    `• سپس توکن را ارسال کنید\n\n` +
-    `⚠️ <b>مهم:</b> نود بچه <u>نمی‌تواند</u> روی همان اکانت نود مادر ساخته شود.\n` +
-    `نود مادر نباید در معرض دسترسی مستقیم کاربران قرار بگیرد.`;
+    `۱. با دکمه زیر توکن کلودفلر بساز\n` +
+    `۲. بعد روی «ارسال توکن» بزن و توکن را بفرست\n\n` +
+    `⚠️ نود بچه روی اکانت مادر ساخته نمی‌شود.`;
+
   const kb = [
-    [{ text: "🔑 دریافت توکن + ساخت نود", callback_data: "node_create_token" }],
+    [{ text: "🔗 ساخت توکن کلودفلر", url: CF_TOKEN_URL }],
+    [{ text: "📤 ارسال توکن", callback_data: "node_create_token" }],
     [{ text: "🔙 بازگشت", callback_data: "nodes_manage" }],
   ];
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
