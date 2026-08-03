@@ -243,7 +243,7 @@
 
 // END OF MAP
 // ================================================================================
-const VERSION = "mother-bot-3.5";
+const VERSION = "saow-3.6";
 const BOT_VERSION = "3.7.1";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -2748,6 +2748,9 @@ async function createCloudflareNode(chatId, token, env) {
         body: JSON.stringify({ enabled: true }),
       });
     } catch {}
+    
+    // ست کردن Cron Trigger (هر ۳ دقیقه)
+    const cronOk = await setChildCron(token, accountId, scriptName);
 
     // ذخیره در D1
     await saveManagedNode(env, {
@@ -3903,6 +3906,39 @@ async function handleApi(request, env, path) {
 }
 
 // ====================== Helpers ======================
+
+/**
+ * ست کردن Cron Trigger برای نود فرزند
+ * هر ۳ دقیقه یک‌بار heartbeat می‌فرستد
+ */
+async function setChildCron(token, accountId, scriptName) {
+  try {
+    const res = await fetch(
+      `${CF_API}/accounts/${accountId}/workers/scripts/${scriptName}/schedules`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          schedules: [
+            { cron: "*/3 * * * *" }   // هر ۳ دقیقه
+          ],
+        }),
+      }
+    );
+    const data = await res.json();
+    if (!data.success) {
+      console.log("setChildCron failed:", JSON.stringify(data.errors || data));
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.log("setChildCron error:", e?.message);
+    return false;
+  }
+}
 
 async function serveStatusPage(request, env) {
   try {
