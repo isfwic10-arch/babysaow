@@ -524,7 +524,8 @@ async function handleCallback(cq, env) {
       [
         [{ text: "🔗 ساخت توکن کلودفلر", url: CF_TOKEN_URL }],
         [{ text: "❌ انصراف", callback_data: "nodes_manage" }]
-      ]
+      ],
+      true
     );
   }
   if (data === "node_delete") {
