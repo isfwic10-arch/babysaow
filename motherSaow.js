@@ -1267,21 +1267,55 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
     const accountId = node.account_id;
     const oldScript = node.script_name;
     const oldDbId = node.db_id;
+    const oldDbName = node.db_name;
 
-    // 1) حذف Worker قدیمی
+    // 1) حذف Worker
     try {
       await cfFetch(`/accounts/${accountId}/workers/scripts/${oldScript}`, token, { method: "DELETE" });
-    } catch {}
+    } catch (e) {
+      console.log("delete worker warning:", e?.message);
+    }
 
-    // 2) حذف D1 قدیمی
+    // 2) حذف D1 با id ذخیره‌شده
     if (oldDbId) {
       try {
-        await cfFetch(`/accounts/${accountId}/d1/database/${oldDbId}`, token, { method: "DELETE" });
-      } catch {}
+        const delDb = await cfFetch(
+          `/accounts/${accountId}/d1/database/${oldDbId}`,
+          token,
+          { method: "DELETE" }
+        );
+        console.log("delete D1 by id:", delDb);
+      } catch (e) {
+        console.log("delete D1 by id failed:", e?.message);
+      }
     }
+
+    // 3) اگر با id پاک نشد، با نام پیدا کن و پاک کن
+    try {
+      const dbsRes = await cfFetch(`/accounts/${accountId}/d1/database`, token);
+      if (dbsRes.success && Array.isArray(dbsRes.result)) {
+        for (const db of dbsRes.result) {
+          const name = db.name || "";
+          const id = db.uuid || db.id;
+          // همون db قبلی
+          if (oldDbName && name === oldDbName) {
+            await cfFetch(`/accounts/${accountId}/d1/database/${id}`, token, { method: "DELETE" });
+          }
+          // یا هم‌نام اسکریپت
+          if (name === oldScript || name === `saow-db-${oldScript.replace("saow-child-", "")}`) {
+            await cfFetch(`/accounts/${accountId}/d1/database/${id}`, token, { method: "DELETE" });
+          }
+        }
+      }
+    } catch (e) {
+      console.log("cleanup D1 by list failed:", e?.message);
+    }
+
     await removeManagedNode(env, nodeId);
 
-    // 3) ساخت مجدد با همان توکن
+    // کمی صبر تا حذف در کلودفلر اعمال شود
+    await new Promise((r) => setTimeout(r, 2000));
+
     await edit(chatId, msgId, "⏳ نود قدیمی حذف شد. در حال نصب نسخه جدید...", env);
     return createCloudflareNode(chatId, token, env);
   } catch (e) {
