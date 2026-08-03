@@ -90,14 +90,6 @@ export default {
 async function handleTelegramUpdate(update, env) {
   if (update.callback_query) return handleCallback(update.callback_query, env);
   if (update.message) return handleMessage(update.message, env);
-  if (data.startsWith("del_node:")) {
-    const nodeId = data.split(":")[1];
-    return confirmDeleteNode(chatId, nodeId, env, msgId);
-  }
-  if (data.startsWith("del_node_confirm:")) {
-    const nodeId = data.split(":")[1];
-    return doDeleteNode(chatId, nodeId, env, msgId);
-  }
 }
 
 function isAdmin(id, env) {
@@ -124,6 +116,130 @@ async function confirmDeleteNode(chatId, nodeId, env, msgId) {
     ],
   ]);
 }
+
+
+async function getAccountRequestsToday(token, accountId) {
+  try {
+    const today = new Date();
+    const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()))
+      .toISOString().slice(0, 10);
+    const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1))
+      .toISOString().slice(0, 10);
+
+    const gqlQuery = {
+      query: `query {
+        viewer {
+          accounts(filter: {accountTag: "${accountId}"}) {
+            httpRequests1dGroups(limit: 1, filter: {date_geq: "${start}", date_lt: "${end}"}) {
+              sum { requests }
+            }
+          }
+        }
+      }`,
+    };
+    const gqlRes = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(gqlQuery),
+    });
+    const gqlJson = await gqlRes.json();
+    const groups = gqlJson?.data?.viewer?.accounts?.[0]?.httpRequests1dGroups;
+    if (groups && groups[0]?.sum?.requests != null) {
+      return groups[0].sum.requests;
+    }
+  } catch {}
+  return null;
+}
+
+async function showMotherAccountStatus(chatId, env, msgId) {
+  try {
+    const token = env.CF_TOKEN;
+    const accountId = env.MOTHER_ACCOUNT_ID;
+    if (!token || !accountId) {
+      return edit(chatId, msgId,
+        "❌ CF_TOKEN یا MOTHER_ACCOUNT_ID تنظیم نشده.",
+        env,
+        [[{ text: "🔙", callback_data: "nodes_manage" }]]
+      );
+    }
+
+    await edit(chatId, msgId, "⏳ در حال دریافت اطلاعات اکانت مادر...", env);
+
+    let email = "—";
+    try {
+      const userRes = await cfFetch("/user", token);
+      if (userRes.success && userRes.result) email = userRes.result.email || "—";
+    } catch {}
+
+    const requests = await getAccountRequestsToday(token, accountId);
+    const requestsText = requests != null ? requests.toLocaleString("fa-IR") : "—";
+
+    const text =
+      `📈 <b>وضعیت اکانت مادر</b>\n\n` +
+      `📧 ایمیل: <code>${escape(email)}</code>\n` +
+      `🆔 Account ID: <code>${escape(accountId)}</code>\n` +
+      `📦 Worker: <code>${escape(env.WORKER_NAME || "—")}</code>\n` +
+      `🌐 URL: <code>${escape(env.MOTHER_URL || "—")}</code>\n` +
+      `📊 درخواست امروز: <b>${requestsText}</b>\n\n` +
+      `📅 ${new Date().toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })}`;
+
+    return edit(chatId, msgId, text, env, [
+      [{ text: "🔄 بروزرسانی", callback_data: "mother_account_status" }],
+      [{ text: "🔙 مدیریت نودها", callback_data: "nodes_manage" }],
+    ]);
+  } catch (err) {
+    return edit(chatId, msgId, `❌ خطا:\n<code>${escape(err.message)}</code>`, env, [
+      [{ text: "🔙", callback_data: "nodes_manage" }],
+    ]);
+  }
+}
+
+async function showNodeAccountStatus(chatId, nodeId, env, msgId) {
+  try {
+    const node = await getManagedNode(env, nodeId);
+    if (!node || !node.token_encrypted) {
+      return edit(chatId, msgId, "❌ نود یا توکن پیدا نشد.", env, [
+        [{ text: "🔙", callback_data: "nodes" }],
+      ]);
+    }
+
+    await edit(chatId, msgId, "⏳ در حال دریافت اطلاعات اکانت نود...", env);
+
+    const token = node.token_encrypted;
+    const accountId = node.account_id;
+
+    let email = "—";
+    try {
+      const userRes = await cfFetch("/user", token);
+      if (userRes.success && userRes.result) email = userRes.result.email || "—";
+    } catch {}
+
+    const requests = await getAccountRequestsToday(token, accountId);
+    const requestsText = requests != null ? requests.toLocaleString("fa-IR") : "—";
+
+    const text =
+      `📈 <b>وضعیت اکانت نود</b>\n\n` +
+      `📛 نود: <code>${escape(node.script_name)}</code>\n` +
+      `🔗 <code>${escape(node.url || "—")}</code>\n` +
+      `📧 ایمیل: <code>${escape(email)}</code>\n` +
+      `🆔 Account ID: <code>${escape(accountId)}</code>\n` +
+      `📊 درخواست امروز: <b>${requestsText}</b>\n\n` +
+      `📅 ${new Date().toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })}`;
+
+    return edit(chatId, msgId, text, env, [
+      [{ text: "🔄 بروزرسانی", callback_data: `node_acc:${nodeId}` }],
+      [{ text: "🔙 لیست نودها", callback_data: "nodes" }],
+    ]);
+  } catch (err) {
+    return edit(chatId, msgId, `❌ خطا:\n<code>${escape(err.message)}</code>`, env, [
+      [{ text: "🔙", callback_data: "nodes" }],
+    ]);
+  }
+}
+
 
 async function doDeleteNode(chatId, nodeId, env, msgId) {
   await edit(chatId, msgId, "⏳ در حال حذف نود...", env);
@@ -434,8 +550,33 @@ async function handleCallback(cq, env) {
     );
   }
 
+    // حذف نود با دکمه
+  if (data.startsWith("del_node:")) {
+    const nodeId = data.split(":")[1];
+    return confirmDeleteNode(chatId, nodeId, env, msgId);
+  }
+  if (data.startsWith("del_node_confirm:")) {
+    const nodeId = data.split(":")[1];
+    return doDeleteNode(chatId, nodeId, env, msgId);
+  }
+
+  // آپدیت مادر (با CF_TOKEN ذخیره‌شده)
+  if (data === "update_mother") {
+    return doUpdateMother(chatId, env, msgId);
+  }
+
+  // وضعیت اکانت مادر
+  if (data === "mother_account_status") {
+    return showMotherAccountStatus(chatId, env, msgId);
+  }
+
+  // وضعیت اکانت یک نود فرزند (با توکن ذخیره‌شده)
+  if (data.startsWith("node_acc:")) {
+    const nodeId = data.split(":")[1];
+    return showNodeAccountStatus(chatId, nodeId, env, msgId);
+  }
   // Update actions
-  if (data === "update_mother") return updateMotherNode(chatId, env, msgId);
+  
   if (data.startsWith("update_child:")) {
     const nodeId = data.split(":")[1];
     return updateChildNode(chatId, nodeId, env, msgId);
@@ -715,12 +856,13 @@ async function showNodesManage(chatId, env, msgId = null) {
   const text =
     `🖥 <b>مدیریت نودها</b>\n\n` +
     `🟢 آنلاین: ${alive.length}\n` +
-    `📦 ثبت‌شده در پنل: ${managed.length}\n\n` +
-    `از این بخش نودهای فرزند را مدیریت کنید.`;
+    `📦 ثبت‌شده: ${managed.length}\n\n` +
+    `از این بخش نودها را مدیریت کنید.`;
   const kb = [
-    [{ text: "📊 وضعیت و حذف نودها", callback_data: "nodes" }],
+    [{ text: "📊 وضعیت / حذف / آپدیت نودها", callback_data: "nodes" }],
     [{ text: "➕ ساخت نود جدید", callback_data: "node_create" }],
-    [{ text: "📈 وضعیت اکانت CF", callback_data: "node_account_status" }],
+    [{ text: "🔄 آپدیت نود مادر", callback_data: "update_mother" }],
+    [{ text: "📈 وضعیت اکانت مادر", callback_data: "mother_account_status" }],
     [{ text: "🔙 بازگشت", callback_data: "main" }],
   ];
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
@@ -790,12 +932,13 @@ async function showNodes(chatId, env, msgId = null) {
   const kb = [];
   for (const m of managed) {
     kb.push([
-      { text: `🗑 حذف ${m.script_name}`, callback_data: `del_node:${m.id}` },
+      { text: `🗑 ${m.script_name}`, callback_data: `del_node:${m.id}` },
       { text: `🔄 آپدیت`, callback_data: `update_child:${m.id}` },
+      { text: `📈 اکانت`, callback_data: `node_acc:${m.id}` },
     ]);
   }
   kb.push([
-    { text: "🔄 بروزرسانی لیست", callback_data: "nodes" },
+    { text: "🔄 بروزرسانی", callback_data: "nodes" },
     { text: "🔙 مدیریت نودها", callback_data: "nodes_manage" },
   ]);
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
@@ -1023,48 +1166,127 @@ async function showAccountStatus(chatId, token, env) {
 }
 
 // ====================== Update Functions ======================
-async function updateMotherNode(chatId, env, msgId) {
-  await edit(chatId, msgId, "⏳ در حال آپدیت کد نود مادر...", env);
+async function doUpdateMother(chatId, env, msgId) {
   try {
-    // در حالت واقعی باید از API کلودفلر با توکن مادر استفاده شود
-    // فعلاً پیام راهنما
-    const text =
-      `🔄 <b>آپدیت نود مادر</b>\n\n` +
-      `برای آپدیت کد نود مادر، باید توکن اکانت مادر را داشته باشید و کد جدید را از گیت‌هاب بگیرید.\n\n` +
-      `در نسخه‌های بعدی این قابلیت به صورت کاملاً خودکار اضافه خواهد شد.\n\n` +
-      `فعلاً می‌توانید به صورت دستی Worker را آپدیت کنید.`;
-    return edit(chatId, msgId, text, env, [[{ text: "🔙 مدیریت نودها", callback_data: "nodes_manage" }]]);
-  } catch (e) {
-    return edit(chatId, msgId, `❌ خطا: ${escape(e.message)}`, env, [[{ text: "🔙", callback_data: "nodes_manage" }]]);
+    const token = env.CF_TOKEN;
+    const accountId = env.MOTHER_ACCOUNT_ID;
+    const scriptName = env.WORKER_NAME;
+    const selfUrl = (env.MOTHER_URL || env._SELF_URL || "").replace(/\/$/, "");
+
+    if (!token || !accountId || !scriptName) {
+      return edit(chatId, msgId,
+        `❌ برای آپدیت مادر این متغیرها لازم است:\n` +
+        `• CF_TOKEN\n• MOTHER_ACCOUNT_ID\n• WORKER_NAME\n\n` +
+        `اگر پنل با اینستالر جدید ساخته نشده، این‌ها را دستی در Worker ست کن.`,
+        env,
+        [[{ text: "🔙", callback_data: "nodes_manage" }]]
+      );
+    }
+
+    await edit(chatId, msgId, "⏳ در حال دریافت کد جدید از گیت‌هاب و آپلود...", env);
+
+    const codeRes = await fetch(MOTHER_CODE_URL, {
+      headers: { "User-Agent": "Saow-Mother-Updater" },
+    });
+    if (!codeRes.ok) throw new Error(`GitHub HTTP ${codeRes.status}`);
+    const workerCode = await codeRes.text();
+    if (!workerCode || workerCode.length < 500) throw new Error("کد گیت‌هاب نامعتبر است");
+
+    // حفظ bindings فعلی
+    let existingBindings = [];
+    try {
+      const settingsRes = await fetch(
+        `${CF_API}/accounts/${accountId}/workers/scripts/${scriptName}/settings`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const settingsData = await settingsRes.json();
+      if (settingsData.success && settingsData.result?.bindings) {
+        existingBindings = settingsData.result.bindings;
+      }
+    } catch {}
+
+    if (!existingBindings.length) {
+      existingBindings = [
+        { type: "plain_text", name: "BOT_TOKEN", text: env.BOT_TOKEN || "" },
+        { type: "plain_text", name: "ADMIN_IDS", text: env.ADMIN_IDS || "" },
+        { type: "plain_text", name: "MOTHER_URL", text: selfUrl },
+        { type: "plain_text", name: "MOTHER_ACCOUNT_ID", text: accountId },
+        { type: "plain_text", name: "CF_TOKEN", text: token },
+        { type: "plain_text", name: "WORKER_NAME", text: scriptName },
+      ];
+    }
+
+    const metadata = {
+      main_module: "worker.js",
+      compatibility_date: "2024-09-23",
+      bindings: existingBindings,
+    };
+
+    const form = new FormData();
+    form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+    form.append("worker.js", new Blob([workerCode], { type: "application/javascript+module" }), "worker.js");
+
+    const uploadRes = await fetch(
+      `${CF_API}/accounts/${accountId}/workers/scripts/${scriptName}`,
+      { method: "PUT", headers: { Authorization: `Bearer ${token}` }, body: form }
+    );
+    const uploadData = await uploadRes.json();
+    if (!uploadData.success) {
+      throw new Error(uploadData.errors?.[0]?.message || JSON.stringify(uploadData));
+    }
+
+    return edit(chatId, msgId,
+      `✅ <b>نود مادر آپدیت شد</b>\n\n📦 <code>${escape(scriptName)}</code>\n🌐 <code>${escape(selfUrl)}</code>`,
+      env,
+      [
+        [{ text: "🔙 مدیریت نودها", callback_data: "nodes_manage" }],
+        [{ text: "🏠 منو", callback_data: "main" }],
+      ]
+    );
+  } catch (err) {
+    return edit(chatId, msgId,
+      `❌ خطا در آپدیت مادر:\n<code>${escape(err.message)}</code>`,
+      env,
+      [[{ text: "🔙", callback_data: "nodes_manage" }]]
+    );
   }
 }
 
 async function updateChildNode(chatId, nodeId, env, msgId) {
-  await edit(chatId, msgId, `⏳ در حال آپدیت نود <code>${escape(nodeId)}</code> (حذف + نصب مجدد)...`, env);
+  await edit(chatId, msgId, `⏳ در حال آپدیت نود <code>${escape(nodeId)}</code>...`, env);
   try {
     const node = await getManagedNode(env, nodeId);
     if (!node || !node.token_encrypted) {
-      return edit(chatId, msgId, "❌ اطلاعات نود یا توکن پیدا نشد. لطفاً دستی حذف و دوباره بسازید.", env, [
-        [{ text: "🔙", callback_data: "nodes" }]
+      return edit(chatId, msgId, "❌ اطلاعات نود یا توکن پیدا نشد.", env, [
+        [{ text: "🔙", callback_data: "nodes" }],
       ]);
     }
 
-    // 1. حذف
-    await deleteCloudflareNodeInternal(node.script_name, node.token_encrypted, env);
+    const token = node.token_encrypted;
+    const accountId = node.account_id;
+    const oldScript = node.script_name;
+    const oldDbId = node.db_id;
 
-    // 2. ساخت مجدد با همان توکن
-    // (برای سادگی، کاربر را به ساخت مجدد هدایت می‌کنیم یا منطق create را صدا می‌زنیم)
-    // در اینجا یک پیام موفقیت شبیه‌سازی می‌کنیم
-    const text =
-      `✅ نود <code>${escape(nodeId)}</code> برای آپدیت حذف شد.\n\n` +
-      `حالا دوباره از بخش «ساخت نود جدید» با همان توکن بسازید تا آخرین کد نصب شود.\n\n` +
-      `(در نسخه‌های بعدی این کار کاملاً خودکار خواهد بود)`;
-    return edit(chatId, msgId, text, env, [
-      [{ text: "➕ ساخت مجدد", callback_data: "node_create" }],
-      [{ text: "🔙 مدیریت نودها", callback_data: "nodes_manage" }],
-    ]);
+    // 1) حذف Worker قدیمی
+    try {
+      await cfFetch(`/accounts/${accountId}/workers/scripts/${oldScript}`, token, { method: "DELETE" });
+    } catch {}
+
+    // 2) حذف D1 قدیمی
+    if (oldDbId) {
+      try {
+        await cfFetch(`/accounts/${accountId}/d1/database/${oldDbId}`, token, { method: "DELETE" });
+      } catch {}
+    }
+    await removeManagedNode(env, nodeId);
+
+    // 3) ساخت مجدد با همان توکن
+    await edit(chatId, msgId, "⏳ نود قدیمی حذف شد. در حال نصب نسخه جدید...", env);
+    return createCloudflareNode(chatId, token, env);
   } catch (e) {
-    return edit(chatId, msgId, `❌ خطا: ${escape(e.message)}`, env, [[{ text: "🔙", callback_data: "nodes" }]]);
+    return edit(chatId, msgId, `❌ خطا: ${escape(e.message)}`, env, [
+      [{ text: "🔙", callback_data: "nodes" }],
+    ]);
   }
 }
 
