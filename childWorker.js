@@ -1,14 +1,15 @@
-// child-worker.js — v3.10
+// child-worker.js — v3.11 (با حالت سکوت در صورت رد شدن توسط مادر)
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-3.10';
+const VERSION = 'saow-node-3.11';
 let MOTHER_URL = null;
-const API_SECRET = 'saow-pan';
+const API_SECRET = 'saow-pan2';
 
 const REPORT_THRESHOLD = 30 * 1024 * 1024;   // ۳۰ مگابایت
 const USER_CACHE_TTL = 8 * 60 * 1000;        // ۸ دقیقه
 const NEGATIVE_CACHE_TTL = 60 * 1000;        // کش منفی ۶۰ ثانیه
 const ATTEMPT_COOLDOWN_MS = 8 * 1000;        // حداقل ۸ ثانیه بین تلاش‌های یک UUID
+const SILENCE_TTL_MS = 30 * 60 * 1000;       // ۳۰ دقیقه سکوت بعد از رد شدن توسط مادر
 
 const STATUS_HTML_URL = 'https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/node-status.html';
 
@@ -30,6 +31,22 @@ const BLOCKLIST_TTL_MS = 6 * 60 * 60 * 1000;
 let blockSet = null;
 let blockSetAt = 0;
 let blockSetLoading = null;
+
+// ---- حالت سکوت سراسری ----
+let silenceUntil = 0; // timestamp
+
+function isSilenced() {
+  return Date.now() < silenceUntil;
+}
+
+function enterSilence(reason = '') {
+  silenceUntil = Date.now() + SILENCE_TTL_MS;
+  console.log('SILENCE ON:', reason, 'until', new Date(silenceUntil).toISOString());
+}
+
+function clearSilence() {
+  silenceUntil = 0;
+}
 
 function isAdHostLocal(host) {
   const h = String(host || '').toLowerCase().replace(/\.$/, '');
@@ -162,7 +179,7 @@ function getLimiter(uuid, kbps) {
 
 const userCache = new Map();
 const activeConns = new Map();
-const recentAttempts = new Map(); // uuid → timestamp
+const recentAttempts = new Map();
 
 function authHeaders() {
   return {
@@ -172,16 +189,39 @@ function authHeaders() {
   };
 }
 
+/** تشخیص اینکه مادر این نود را رد کرده */
+function isNodeRejection(status, data) {
+  if (status === 401 || status === 403) return true;
+  if (!data) return false;
+  const reason = String(data.reason || data.err || '').toLowerCase();
+  if (reason.includes('unknown node')) return true;
+  if (reason.includes('not registered')) return true;
+  if (reason.includes('node is not registered')) return true;
+  if (reason.includes('unauthorized')) return true;
+  return false;
+}
+
 async function reportToMother(payload) {
   if (!MOTHER_URL) return null;
+  if (isSilenced()) return null; // سکوت کامل
+
   try {
     const res = await fetch(`${MOTHER_URL}/api/node/report`, {
       method: 'POST',
       headers: authHeaders(),
       body: JSON.stringify(payload),
     });
+
+    let data = null;
+    try { data = await res.json(); } catch {}
+
+    if (isNodeRejection(res.status, data)) {
+      enterSilence(`report ${payload.type} → ${res.status}`);
+      return null;
+    }
+
     if (!res.ok) return null;
-    return await res.json();
+    return data;
   } catch (e) {
     console.log('reportToMother failed', e?.message);
     return null;
@@ -189,11 +229,13 @@ async function reportToMother(payload) {
 }
 
 async function getUserConfig(uuid) {
+  if (isSilenced()) return null;
+
   const cached = userCache.get(uuid);
   if (cached) {
     const ttl = cached.negative ? NEGATIVE_CACHE_TTL : USER_CACHE_TTL;
     if (Date.now() - cached.ts < ttl) {
-      return cached.data; // ممکن است null باشد (کش منفی)
+      return cached.data;
     }
   }
 
@@ -202,33 +244,36 @@ async function getUserConfig(uuid) {
       headers: authHeaders(),
     });
 
-    if (res.ok) {
-      const data = await res.json();
-      if (data.ok && data.user) {
-        const u = data.user;
-        const cfg = {
-          enabled: u.enabled !== false,
-          speedLimitKBps: u.speedLimitKBps || 0,
-          blockAds: u.blockAds !== false,
-          ipLimit: u.ipLimit || 1,
-          quotaBytes: u.quotaBytes || 0,
-          dailyQuotaBytes: u.dailyQuotaBytes || 0,
-        };
+    let data = null;
+    try { data = await res.json(); } catch {}
 
-        if (cfg.enabled === false) {
-          userCache.set(uuid, { data: null, ts: Date.now(), negative: true });
-          return null;
-        }
-
-        userCache.set(uuid, { data: cfg, ts: Date.now(), negative: false });
-        return cfg;
-      }
+    if (isNodeRejection(res.status, data)) {
+      enterSilence(`getUserConfig → ${res.status}`);
+      return null;
     }
 
-    // ۴۰۴ یا هر خطای دیگر → کش منفی
+    if (res.ok && data?.ok && data.user) {
+      const u = data.user;
+      const cfg = {
+        enabled: u.enabled !== false,
+        speedLimitKBps: u.speedLimitKBps || 0,
+        blockAds: u.blockAds !== false,
+        ipLimit: u.ipLimit || 1,
+        quotaBytes: u.quotaBytes || 0,
+        dailyQuotaBytes: u.dailyQuotaBytes || 0,
+      };
+
+      if (cfg.enabled === false) {
+        userCache.set(uuid, { data: null, ts: Date.now(), negative: true });
+        return null;
+      }
+
+      userCache.set(uuid, { data: cfg, ts: Date.now(), negative: false });
+      return cfg;
+    }
+
     userCache.set(uuid, { data: null, ts: Date.now(), negative: true });
     return null;
-
   } catch (e) {
     console.log('getUserConfig failed', e?.message);
     userCache.set(uuid, { data: null, ts: Date.now(), negative: true });
@@ -283,6 +328,11 @@ async function handleVlessWebSocket(request, ctx) {
     return new Response('Expected Upgrade: websocket', { status: 426 });
   }
 
+  // اگر در حالت سکوت هستیم، اصلاً به مادر وصل نشو
+  if (isSilenced()) {
+    return new Response('Node silenced', { status: 503 });
+  }
+
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   server.accept();
@@ -291,7 +341,7 @@ async function handleVlessWebSocket(request, ctx) {
   let remoteWriter = null;
   let headerParsed = false;
   let closed = false;
-  let joined = false;          // فقط بعد از قبول شدن توسط مادر true می‌شود
+  let joined = false;
   let bytesUp = 0;
   let bytesDown = 0;
   let sessionBytes = 0;
@@ -306,7 +356,6 @@ async function handleVlessWebSocket(request, ctx) {
     if (closed) return;
     closed = true;
 
-    // فقط اگر واقعاً به مادر وصل شده بودیم، disconnect بفرست
     if (userUuid && joined) {
       activeConns.set(userUuid, Math.max(0, (activeConns.get(userUuid) || 1) - 1));
       ctx.waitUntil(reportToMother({
@@ -329,6 +378,7 @@ async function handleVlessWebSocket(request, ctx) {
   };
 
   const maybeReportUsage = async () => {
+    if (isSilenced()) return false;
     if (sessionBytes - lastReported < REPORT_THRESHOLD) return true;
     lastReported = sessionBytes;
     const res = await reportToMother({
@@ -362,7 +412,8 @@ async function handleVlessWebSocket(request, ctx) {
         headerParsed = true;
         userUuid = parsed.uuid;
 
-        // جلوگیری از spam سریع یک UUID
+        if (isSilenced()) return safeClose('silenced');
+
         const lastAttempt = recentAttempts.get(userUuid) || 0;
         if (Date.now() - lastAttempt < ATTEMPT_COOLDOWN_MS) {
           return safeClose('rate limited');
@@ -381,13 +432,11 @@ async function handleVlessWebSocket(request, ctx) {
           ip: clientIP,
         });
 
-        // fail-open: فقط اگر مادر صراحتاً بگوید ببند
         if (joinRes && (joinRes.action === 'close' || joinRes.enabled === false)) {
           userCache.set(userUuid, { data: null, ts: Date.now(), negative: true });
           return safeClose(joinRes?.reason || 'mother rejected');
         }
 
-        // از این لحظه به بعد disconnect مجاز است
         joined = true;
 
         if (joinRes?.config) currentConfig = { ...currentConfig, ...joinRes.config };
@@ -465,7 +514,6 @@ async function handleVlessWebSocket(request, ctx) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-/** صفحه وضعیت از گیت‌هاب + تزریق نسخه */
 async function serveStatusPage(request, childId) {
   try {
     const res = await fetch(STATUS_HTML_URL, {
@@ -475,7 +523,6 @@ async function serveStatusPage(request, childId) {
     if (!res.ok) throw new Error('fetch status html failed');
 
     let html = await res.text();
-
     const inject = `<script>window.__SAOW_VERSION__=${JSON.stringify(VERSION)};window.__SAOW_CHILD_ID__=${JSON.stringify(childId)};</script>`;
     if (html.includes('</head>')) {
       html = html.replace('</head>', inject + '</head>');
@@ -510,6 +557,7 @@ async function serveStatusPage(request, childId) {
 }
 
 function sendHeartbeat(ctx, childId, hostname) {
+  if (isSilenced()) return; // سکوت → هیچ heartbeat نزن
   ctx.waitUntil(reportToMother({
     type: 'heartbeat',
     child_id: childId,
@@ -527,7 +575,6 @@ export default {
     const childId = generateChildId(request.url);
     const isWs = (request.headers.get('Upgrade') || '').toLowerCase() === 'websocket';
 
-    // Heartbeat روی مسیرهای معمولی
     if (path === '/health' || path === '/' || path === '/version') {
       sendHeartbeat(ctx, childId, url.hostname);
     }
@@ -538,10 +585,15 @@ export default {
         id: childId,
         version: VERSION,
         activeUsers: activeConns.size,
+        silenced: isSilenced(),
+        silenceUntil: silenceUntil || null,
       }), { headers: { 'content-type': 'application/json' } });
     }
 
     if (isWs) {
+      if (isSilenced()) {
+        return new Response('Node temporarily unavailable', { status: 503 });
+      }
       ctx.waitUntil(ensureBlocklist());
       return handleVlessWebSocket(request, ctx);
     }
@@ -555,6 +607,7 @@ export default {
         version: VERSION,
         role: 'node',
         id: childId,
+        silenced: isSilenced(),
       }), { headers: { 'content-type': 'application/json' } });
     }
 
@@ -563,6 +616,7 @@ export default {
 
   async scheduled(event, env, ctx) {
     if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || "";
+    if (isSilenced()) return; // سکوت → cron هم چیزی نفرستد
 
     const hostname = env.CHILD_HOSTNAME || env.WORKER_NAME || 'unknown';
     const childId = 'child-' + String(hostname).toLowerCase().replace(/[^a-z0-9.-]/g, '').replace(/\./g, '-');
