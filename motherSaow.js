@@ -90,6 +90,14 @@ export default {
 async function handleTelegramUpdate(update, env) {
   if (update.callback_query) return handleCallback(update.callback_query, env);
   if (update.message) return handleMessage(update.message, env);
+  if (data.startsWith("del_node:")) {
+    const nodeId = data.split(":")[1];
+    return confirmDeleteNode(chatId, nodeId, env, msgId);
+  }
+  if (data.startsWith("del_node_confirm:")) {
+    const nodeId = data.split(":")[1];
+    return doDeleteNode(chatId, nodeId, env, msgId);
+  }
 }
 
 function isAdmin(id, env) {
@@ -98,6 +106,67 @@ function isAdmin(id, env) {
     .map((x) => x.trim())
     .includes(String(id));
 }
+
+async function confirmDeleteNode(chatId, nodeId, env, msgId) {
+  const node = await getManagedNode(env, nodeId);
+  if (!node) {
+    return edit(chatId, msgId, "❌ نود پیدا نشد.", env, [[{ text: "🔙", callback_data: "nodes" }]]);
+  }
+  const text =
+    `🗑 <b>حذف نود</b>\n\n` +
+    `نام: <code>${escape(node.script_name)}</code>\n` +
+    `آدرس: <code>${escape(node.url || "—")}</code>\n\n` +
+    `آیا مطمئن هستید؟ این کار غیرقابل بازگشت است.`;
+  return edit(chatId, msgId, text, env, [
+    [
+      { text: "✅ بله، حذف کن", callback_data: `del_node_confirm:${nodeId}` },
+      { text: "❌ انصراف", callback_data: "nodes" },
+    ],
+  ]);
+}
+
+async function doDeleteNode(chatId, nodeId, env, msgId) {
+  await edit(chatId, msgId, "⏳ در حال حذف نود...", env);
+  try {
+    const node = await getManagedNode(env, nodeId);
+    if (!node || !node.token_encrypted) {
+      return edit(chatId, msgId, "❌ اطلاعات نود یا توکن پیدا نشد.", env, [[{ text: "🔙", callback_data: "nodes" }]]);
+    }
+
+    const token = node.token_encrypted;
+    const accountId = node.account_id;
+    const scriptName = node.script_name;
+
+    // حذف Worker
+    const delRes = await cfFetch(`/accounts/${accountId}/workers/scripts/${scriptName}`, token, { method: "DELETE" });
+    // حتی اگر Worker از قبل حذف شده باشد، ادامه می‌دهیم
+
+    // حذف D1
+    if (node.db_id) {
+      try {
+        await cfFetch(`/accounts/${accountId}/d1/database/${node.db_id}`, token, { method: "DELETE" });
+      } catch {}
+    }
+
+    // حذف از دیتابیس پنل
+    await removeManagedNode(env, nodeId);
+
+    return edit(chatId, msgId,
+      `✅ نود <code>${escape(scriptName)}</code> با موفقیت حذف شد.`,
+      env,
+      [
+        [{ text: "📊 وضعیت نودها", callback_data: "nodes" }],
+        [{ text: "🔙 مدیریت نودها", callback_data: "nodes_manage" }],
+      ]
+    );
+  } catch (err) {
+    return edit(chatId, msgId, `❌ خطا در حذف:\n<code>${escape(err.message)}</code>`, env, [
+      [{ text: "🔙", callback_data: "nodes" }],
+    ]);
+  }
+}
+
+
 
 async function handleMessage(msg, env) {
   const chatId = msg.chat.id;
@@ -645,18 +714,14 @@ async function showNodesManage(chatId, env, msgId = null) {
   const managed = await getManagedNodes(env);
   const text =
     `🖥 <b>مدیریت نودها</b>\n\n` +
-    `🟢 فعال: ${alive.length}\n` +
+    `🟢 آنلاین: ${alive.length}\n` +
     `📦 ثبت‌شده در پنل: ${managed.length}\n\n` +
     `از این بخش نودهای فرزند را مدیریت کنید.`;
   const kb = [
-    [{ text: "📊 وضعیت فعلی نودها", callback_data: "nodes" }],
-    [
-      { text: "➕ ساخت نود جدید", callback_data: "node_create" },
-      { text: "🗑 حذف نود", callback_data: "node_delete" },
-    ],
+    [{ text: "📊 وضعیت و حذف نودها", callback_data: "nodes" }],
+    [{ text: "➕ ساخت نود جدید", callback_data: "node_create" }],
     [{ text: "📈 وضعیت اکانت CF", callback_data: "node_account_status" }],
-    [{ text: "🔄 آپدیت نود مادر", callback_data: "update_mother" }],
-    [{ text: "🔙 منو اصلی", callback_data: "main" }],
+    [{ text: "🔙 بازگشت", callback_data: "main" }],
   ];
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
@@ -678,28 +743,56 @@ async function showNodeCreate(chatId, env, msgId = null) {
 async function showNodes(chatId, env, msgId = null) {
   const alive = await getHealthyChildren(env);
   const managed = await getManagedNodes(env);
+  const aliveMap = new Map(alive.map(n => [n.id, n]));
+
   let text = `🖥 <b>وضعیت نودهای فرزند</b>\n\n`;
 
-  if (!alive.length && !managed.length) {
+  if (!managed.length && !alive.length) {
     text += "هیچ نودی ثبت نشده است.";
   } else {
+    // اول نودهای مدیریت‌شده (حتی اگر آنلاین نباشن)
+    for (const m of managed) {
+      const live = alive.find(a =>
+        a.id.includes(m.script_name) ||
+        (m.url && a.id.includes(m.script_name.replace(/-/g, "")))
+      );
+      const isOnline = !!live;
+      const status = isOnline ? "🟢" : "🔴";
+      const lastSeen = live?.lastSeen
+        ? new Date(live.lastSeen).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })
+        : "هنوز آنلاین نشده";
+
+      text += `${status} <b>${escape(m.script_name)}</b>\n`;
+      text += ` 🔗 <code>${escape(m.url || "—")}</code>\n`;
+      if (isOnline) {
+        text += ` نسخه: ${live.version || "—"}\n`;
+        text += ` ظرفیت: ${live.capacity ?? "—"}\n`;
+        text += ` کاربران فعال: ${live.activeUsers ?? 0}\n`;
+      }
+      text += ` آخرین آنلاین: ${lastSeen}\n\n`;
+    }
+
+    // نودهایی که heartbeat دادن ولی در managed نیستن
     for (const n of alive) {
+      const alreadyShown = managed.some(m =>
+        n.id.includes(m.script_name) || n.id.includes(m.script_name?.replace(/-/g, ""))
+      );
+      if (alreadyShown) continue;
       const lastSeen = n.lastSeen
         ? new Date(n.lastSeen).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })
         : "—";
-      text += `🟢 <b>${escape(n.id)}</b>\n`;
+      text += `🟢 <b>${escape(n.id)}</b> (ثبت‌نشده)\n`;
       text += ` نسخه: ${n.version || "—"}\n`;
-      text += ` ظرفیت: ${n.capacity ?? "—"}\n`;
-      text += ` کاربران فعال: ${n.activeUsers ?? 0}\n`;
-      text += ` آخرین آنلاین: ${lastSeen}\n`;
-      text += ` [آپدیت] 👇\n\n`;
+      text += ` آخرین آنلاین: ${lastSeen}\n\n`;
     }
-    // دکمه‌های آپدیت برای نودهای مدیریت‌شده
   }
 
   const kb = [];
   for (const m of managed) {
-    kb.push([{ text: `🔄 آپدیت ${m.script_name}`, callback_data: `update_child:${m.id}` }]);
+    kb.push([
+      { text: `🗑 حذف ${m.script_name}`, callback_data: `del_node:${m.id}` },
+      { text: `🔄 آپدیت`, callback_data: `update_child:${m.id}` },
+    ]);
   }
   kb.push([
     { text: "🔄 بروزرسانی لیست", callback_data: "nodes" },
@@ -718,7 +811,6 @@ async function createCloudflareNode(chatId, token, env) {
     const accountId = accountsRes.result[0].id;
     const accountName = accountsRes.result[0].name || "—";
 
-    // ===== محدودیت مهم: همان اکانت مادر نباشد =====
     const motherAccountId = await getMotherAccountId(env);
     if (motherAccountId && motherAccountId === accountId) {
       return send(chatId,
@@ -730,14 +822,26 @@ async function createCloudflareNode(chatId, token, env) {
       );
     }
 
+    // دریافت زیردامنه واقعی اکانت
+    let accountSubdomain = null;
+    try {
+      const subRes = await cfFetch(`/accounts/${accountId}/workers/subdomain`, token);
+      if (subRes.success && subRes.result?.subdomain) {
+        accountSubdomain = subRes.result.subdomain;
+      }
+    } catch {}
+    if (!accountSubdomain) {
+      return send(chatId, "❌ نتوانستم زیردامنه workers.dev این اکانت را پیدا کنم.", env);
+    }
+
     // دریافت کد child
     const codeRes = await fetch(CHILD_WORKER_URL);
     if (!codeRes.ok) return send(chatId, `❌ خطا در دریافت کد ورکر فرزند`, env);
     let workerCode = await codeRes.text();
 
-    // Fix env top-level
+    // Fix MOTHER_URL (هر دو حالت const/let و null/env)
     workerCode = workerCode.replace(
-      /const\s+MOTHER_URL\s*=\s*env\.MOTHER_URL\s*;?/,
+      /(?:const|let|var)\s+MOTHER_URL\s*=\s*[^;]+;?/,
       `let MOTHER_URL = null;`
     );
     workerCode = workerCode.replace(
@@ -748,6 +852,7 @@ async function createCloudflareNode(chatId, token, env) {
     const randomNum = Math.floor(10000 + Math.random() * 90000);
     const scriptName = `saow-child-${randomNum}`;
     const dbName = `saow-db-${randomNum}`;
+    const nodeUrl = `https://${scriptName}.${accountSubdomain}.workers.dev`;
 
     // ساخت D1
     const dbRes = await cfFetch(`/accounts/${accountId}/d1/database`, token, {
@@ -801,8 +906,8 @@ async function createCloudflareNode(chatId, token, env) {
       account_id: accountId,
       db_id: databaseId,
       db_name: dbName,
-      token_encrypted: token, // در پروداکشن بهتره رمزنگاری شود
-      url: `https://${scriptName}.workers.dev`,
+      token_encrypted: token,
+      url: nodeUrl,
       created_at: Date.now(),
     });
     await saveCfAccount(env, { account_id: accountId, token, email: "", name: accountName });
@@ -812,10 +917,11 @@ async function createCloudflareNode(chatId, token, env) {
       `📛 نام: <code>${scriptName}</code>\n` +
       `🗄 دیتابیس: <code>${dbName}</code>\n` +
       `🏷 اکانت: ${escape(accountName)}\n` +
-      `🔗 MOTHER_URL: <code>${escape(motherUrl)}</code>\n\n` +
-      `نود به صورت خودکار به پنل گزارش می‌دهد.`;
+      `🔗 آدرس نود:\n<code>${nodeUrl}</code>\n\n` +
+      `اگر نود تا چند دقیقه دیگر آنلاین نشد، روی دکمه «باز کردن نود» بزنید تا فعال شود.`;
 
     return send(chatId, successText, env, [
+      [{ text: "🌐 باز کردن نود", url: nodeUrl }],
       [{ text: "📊 وضعیت نودها", callback_data: "nodes" }],
       [{ text: "🔙 مدیریت نودها", callback_data: "nodes_manage" }],
     ]);
