@@ -243,7 +243,7 @@
 
 // END OF MAP
 // ================================================================================
-const VERSION = "mother-bot-3.5";
+const VERSION = "saow-3.7";
 const BOT_VERSION = "3.7.1";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
