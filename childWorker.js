@@ -1,7 +1,7 @@
 // child-worker.js — v3.2
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'child-3.5';
+const VERSION = 'child-3.2';
 let MOTHER_URL = null;
 const API_SECRET = 'saow-pan';
 const REPORT_THRESHOLD = 5 * 1024 * 1024;
@@ -340,10 +340,10 @@ async function handleVlessWebSocket(request, ctx) {
           return safeClose('disabled');
         }
 
-        const LOCAL_MAX_CONNS = 32;
-        if ((activeConns.get(userUuid) || 0) >= LOCAL_MAX_CONNS) {
-          return safeClose('local conn limit');
-        }
+        // const LOCAL_MAX_CONNS = 32;
+        // if ((activeConns.get(userUuid) || 0) >= LOCAL_MAX_CONNS) {
+        //   return safeClose('local conn limit');
+        // }
 
         const joinRes = await reportToMother({
           type: 'connect',
