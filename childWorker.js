@@ -416,6 +416,7 @@ async function handleVlessWebSocket(request, ctx) {
 
 export default {
   async fetch(request, env, ctx) {
+    if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || "";
     const url = new URL(request.url);
     const path = url.pathname;
     const childId = generateChildId(request.url);
