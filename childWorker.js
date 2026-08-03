@@ -4,8 +4,8 @@ import { connect } from 'cloudflare:sockets';
 const VERSION = 'saow-node-3.8';
 let MOTHER_URL = null;
 const API_SECRET = 'saow-pan';
-const REPORT_THRESHOLD = 5 * 1024 * 1024;
-const USER_CACHE_TTL = 30 * 1000;
+const REPORT_THRESHOLD = 15 * 1024 * 1024;  // ۱۵ مگابایت
+const USER_CACHE_TTL = 5 * 60 * 1000;   // ۵ دقیقه
 
 const STATUS_HTML_URL = 'https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/node-status.html';
 
@@ -495,7 +495,7 @@ export default {
     const isWs = (request.headers.get('Upgrade') || '').toLowerCase() === 'websocket';
 
     // Heartbeat روی مسیرهای معمولی + هر اتصال WebSocket
-    if (path === '/health' || path === '/' || path === '/version' || isWs) {
+    if (path === '/health' || path === '/' || path === '/version') {
       sendHeartbeat(ctx, childId, url.hostname);
     }
 
