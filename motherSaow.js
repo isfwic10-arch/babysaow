@@ -87,6 +87,45 @@ export default {
 };
 
 // ====================== Telegram Handlers ======================
+async function expiryMenu(chatId, id, env, msgId) {
+  const text =
+    `⏰ <b>تاریخ انقضا</b>\n\n` +
+    `کاربر: <code>${id}</code>\n\n` +
+    `یکی از گزینه‌ها را انتخاب کنید یا تاریخ دستی بفرستید.`;
+  const kb = [
+    [
+      { text: "∞ نامحدود", callback_data: `expiry:${id}:0` },
+      { text: "۱ روز", callback_data: `expiry:${id}:1` },
+    ],
+    [
+      { text: "۷ روز", callback_data: `expiry:${id}:7` },
+      { text: "۳۰ روز", callback_data: `expiry:${id}:30` },
+    ],
+    [
+      { text: "۹۰ روز", callback_data: `expiry:${id}:90` },
+      { text: "۱۸۰ روز", callback_data: `expiry:${id}:180` },
+    ],
+    [
+      { text: "۳۶۵ روز", callback_data: `expiry:${id}:365` },
+    ],
+    [{ text: "✏️ ورود دستی", callback_data: `expirymanual:${id}` }],
+    [{ text: "🔙 بازگشت", callback_data: `user:${id}` }],
+  ];
+  return edit(chatId, msgId, text, env, kb);
+}
+
+async function setExpiry(chatId, id, days, env, msgId) {
+  const user = await getUserById(env, id);
+  if (!user) return showUser(chatId, id, env, msgId);
+
+  let expiry = null;
+  if (days > 0) {
+    expiry = new Date(Date.now() + days * 86400000).toISOString();
+  }
+  await upsertUser(env, { ...user, expiry });
+  return showUser(chatId, id, env, msgId);
+}
+
 async function handleTelegramUpdate(update, env) {
   if (update.callback_query) return handleCallback(update.callback_query, env);
   if (update.message) return handleMessage(update.message, env);
@@ -312,6 +351,38 @@ async function handleMessage(msg, env) {
     return showUser(chatId, id, env);
   }
 
+  // ----- تاریخ انقضا -----
+  if (replyText.includes("تاریخ انقضا را ارسال کنید")) {
+    const id = extractIdFromReply(replyText) || (replyText.match(/کاربر: (\S+)/) || [])[1];
+    if (!id) return send(chatId, "❌ خطا در شناسایی کاربر", env);
+
+    const raw = text.trim();
+    const user = await getUserById(env, id);
+    if (!user) return send(chatId, "❌ کاربر پیدا نشد", env);
+
+    let expiry = null;
+
+    if (raw === "0" || raw === "∞" || raw.toLowerCase() === "unlimited") {
+      expiry = null;
+    } else if (/^\d+$/.test(raw)) {
+      // تعداد روز از الان
+      const days = parseInt(raw, 10);
+      if (days < 0 || days > 3650) return send(chatId, "❌ تعداد روز بین ۰ تا ۳۶۵۰", env);
+      if (days === 0) expiry = null;
+      else expiry = new Date(Date.now() + days * 86400000).toISOString();
+    } else if (/^\d{4}-\d{2}-\d{2}/.test(raw)) {
+      // تاریخ میلادی
+      const t = Date.parse(raw);
+      if (!Number.isFinite(t)) return send(chatId, "❌ تاریخ نامعتبر است", env);
+      expiry = new Date(t).toISOString();
+    } else {
+      return send(chatId, "❌ فرمت نامعتبر. مثال: <code>30</code> یا <code>2026-12-31</code>", env);
+    }
+
+    await upsertUser(env, { ...user, expiry });
+    await send(chatId, "✅ تاریخ انقضا تنظیم شد", env);
+    return showUser(chatId, id, env);
+  }
   // ----- ویرایش یادداشت -----
   if (replyText.includes("یادداشت جدید را ارسال کنید")) {
     const id = extractIdFromReply(replyText);
@@ -446,6 +517,30 @@ async function handleCallback(cq, env) {
     const page = parseInt(data.split(":")[1]) || 0;
     return showUsers(chatId, page, env, msgId);
   }
+
+  if (data.startsWith("expirymenu:")) return expiryMenu(chatId, data.split(":")[1], env, msgId);
+  if (data.startsWith("expiry:")) {
+    // expiry:USERID:DAYS   یا expiry:USERID:0 برای نامحدود
+    const parts = data.split(":");
+    const id = parts[1];
+    const days = parseInt(parts[2], 10);
+    return setExpiry(chatId, id, days, env, msgId);
+  }
+  if (data.startsWith("expirymanual:")) {
+    const id = data.split(":")[1];
+    return send(chatId,
+      `✏️ <b>تاریخ انقضا را ارسال کنید</b>\n\n` +
+      `کاربر: ${id}\n\n` +
+      `فرمت‌های مجاز:\n` +
+      `• تعداد روز: <code>30</code>\n` +
+      `• تاریخ: <code>2026-12-31</code>\n` +
+      `• یا <code>0</code> برای نامحدود`,
+      env,
+      [[{ text: "❌ انصراف", callback_data: `user:${id}` }]],
+      true
+    );
+  }
+
   if (data.startsWith("user:")) return showUser(chatId, data.split(":")[1], env, msgId);
   if (data.startsWith("toggle:")) return doToggle(chatId, data.split(":")[1], env, msgId);
   if (data.startsWith("reset:")) return doReset(chatId, data.split(":")[1], env, msgId);
@@ -686,6 +781,9 @@ async function showUser(chatId, id, env, msgId = null) {
   const quota = u.quotaBytes === 0 ? "∞" : (u.quotaBytes / 1073741824).toFixed(2) + " GB";
   const daily = u.dailyQuotaBytes === 0 ? "∞" : (u.dailyQuotaBytes / 1073741824).toFixed(2) + " GB";
   const speed = u.speedLimitKBps === 0 ? "∞" : u.speedLimitKBps + " KB/s";
+  const expiryText = u.expiry
+    ? new Date(u.expiry).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })
+    : "∞ نامحدود";
   let devices = "";
   if (u.activeDevices?.length) {
     devices = "\n\n📱 <b>IPهای فعال:</b>\n";
@@ -703,6 +801,7 @@ async function showUser(chatId, id, env, msgId = null) {
     `📈 مصرف: <b>${u.usage?.totalGB || 0} GB</b> (روزانه ${u.usage?.dailyGB || 0})\n` +
     `📦 حجم کل: ${quota}\n` +
     `📅 حجم روزانه: ${daily}\n` +
+    `📅 انقضا: <b>${expiryText}</b>\n` +
     `⚡ سرعت: ${speed}\n` +
     `🌐 IP همزمان: <b>${u.activeIPs}/${u.ipLimit}</b>\n` +
     `🛡 بلاک تبلیغات: ${u.blockAds ? "✅" : "❌"}\n` +
@@ -712,6 +811,9 @@ async function showUser(chatId, id, env, msgId = null) {
     [
       { text: u.enabled ? "🔴 غیرفعال" : "🟢 فعال", callback_data: `toggle:${u.id}` },
       { text: "🔄 رفرش", callback_data: `user:${u.id}` },
+    ],
+    [
+      { text: "⏰ تاریخ انقضا", callback_data: `expirymenu:${u.id}` },
     ],
     [
       { text: "🌐 محدودیت IP", callback_data: `ipmenu:${u.id}` },
