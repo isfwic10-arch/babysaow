@@ -185,17 +185,30 @@ async function getUserConfig(uuid) {
   const cached = userCache.get(uuid);
   if (cached && Date.now() - cached.ts < USER_CACHE_TTL) return cached.data;
   try {
-    const res = await fetch(`${MOTHER_URL}/api/item?uuid=${encodeURIComponent(uuid)}`, {
+    // قبلاً: /api/item  ← اشتباه
+    const res = await fetch(`${MOTHER_URL}/api/users?uuid=${encodeURIComponent(uuid)}`, {
       headers: authHeaders(),
     });
     if (res.ok) {
       const data = await res.json();
-      if (data.ok && data.d) {
-        userCache.set(uuid, { data: data.d, ts: Date.now() });
-        return data.d;
+      // فرمت مادر: { ok: true, user: {...} }
+      if (data.ok && data.user) {
+        const u = data.user;
+        const cfg = {
+          enabled: u.enabled !== false,
+          speedLimitKBps: u.speedLimitKBps || 0,
+          blockAds: u.blockAds !== false,
+          ipLimit: u.ipLimit || 1,
+          quotaBytes: u.quotaBytes || 0,
+          dailyQuotaBytes: u.dailyQuotaBytes || 0,
+        };
+        userCache.set(uuid, { data: cfg, ts: Date.now() });
+        return cfg;
       }
     }
-  } catch {}
+  } catch (e) {
+    console.log('getUserConfig failed', e?.message);
+  }
   return null;
 }
 
