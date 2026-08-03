@@ -256,7 +256,7 @@ const API_ROOT = "/api";
 const SUB_PATH = "/pull";
 const NODE_TTL = 15 * 60 * 1000;
 const IP_IDLE_MS = 5 * 60 * 1000;   // ۵ دقیقه
-const API_SECRET = "saow-pan"; // برای گزارش نودهای بچه
+const API_SECRET = "saow-pan2"; // برای گزارش نودهای بچه
 
 // ====================== Main Entry ======================
 export default {
@@ -344,6 +344,31 @@ export default {
 };
 
 // ====================== Telegram Handlers ======================
+
+async function purgeUnknownChildren(env) {
+  if (!(await d1Ready(env))) return;
+  try {
+    const managed = await getManagedNodes(env);
+    if (!managed.length) return;
+
+    const allChildren = await env.DB.prepare("SELECT id, url FROM children").all();
+    const rows = allChildren.results || [];
+
+    for (const c of rows) {
+      const isKnown = managed.some(m =>
+        c.id?.includes(m.script_name) ||
+        (m.url && c.id?.includes(String(m.script_name || "").replace(/-/g, ""))) ||
+        (m.script_name && c.url?.includes(m.script_name))
+      );
+      if (!isKnown) {
+        await env.DB.prepare("DELETE FROM children WHERE id = ?").bind(c.id).run();
+      }
+    }
+  } catch (e) {
+    console.log("purgeUnknownChildren:", e?.message);
+  }
+}
+
 
 async function serveSubPage(request, env, user, url) {
   const full = await buildFullUser(env, user);
@@ -3462,6 +3487,7 @@ async function registerChild(env, data) {
 async function getHealthyChildren(env) {
   try {
     if (!(await d1Ready(env))) return [];
+    await purgeUnknownChildren(env);
     const now = Date.now();
     const rows = await env.DB.prepare(`
       SELECT * FROM children WHERE last_seen > ? ORDER BY active_users ASC
@@ -3725,8 +3751,8 @@ async function generateSubscription(env, user, motherHost) {
   for (const m of managed) {
     if (!m.url) continue;
     if (alive.some((a) => isAliveMatch(m, a))) {
-      selectedUrl = m.url;
-      break;
+        selectedUrl = m.url;
+        break;
     }
   }
 
@@ -3818,14 +3844,31 @@ async function handleApi(request, env, path) {
         const body = await request.json();
         const { type, child_id, uuid } = body;
 
-        // ۱. بررسی قفل بودن نود
+        // ---- فقط نودهای ثبت‌شده در managed_nodes مجاز هستند ----
         const managedNodes = await getManagedNodes(env);
         const matchedNode = managedNodes.find(m =>
             child_id?.includes(m.script_name) ||
-            (m.url && child_id?.includes(m.script_name.replace(/-/g, "")))
+            (m.url && child_id?.includes(String(m.script_name || "").replace(/-/g, ""))) ||
+            (m.script_name && child_id?.includes(m.script_name.replace(/-/g, "")))
         );
 
-        if (matchedNode && matchedNode.is_disabled === 1) {
+        // نود ناشناس یا حذف‌شده → کاملاً رد
+        if (!matchedNode) {
+            if (type === "heartbeat") {
+            // حتی heartbeat را هم قبول نکن (در children ذخیره نشود)
+            return json({ ok: false, reason: "unknown node" }, 403);
+            }
+            // connect / usage / disconnect
+            return json({
+            ok: false,
+            action: "close",
+            enabled: false,
+            reason: "Node is not registered"
+            }, 403);
+        }
+
+        // نود قفل‌شده
+        if (matchedNode.is_disabled === 1) {
             if (type === "connect" || type === "usage") {
             return json({
                 ok: false,
@@ -3837,10 +3880,10 @@ async function handleApi(request, env, path) {
             if (type === "heartbeat") {
             return json({ ok: true, status: "disabled" });
             }
-            // disconnect را پایین‌تر هندل می‌کنیم
         }
 
-        // ۲. heartbeat — نیاز به user ندارد
+        // ---- از اینجا به بعد فقط نودهای معتبر ----
+
         if (type === "heartbeat") {
             const ok = await registerChild(env, {
             id: child_id,
@@ -3853,7 +3896,6 @@ async function handleApi(request, env, path) {
             return json({ ok: !!ok });
         }
 
-        // ۳. برای connect / usage / disconnect باید user را پیدا کنیم
         let user = null;
         if (uuid) {
             user = await getUserByUuid(env, uuid);
@@ -3863,11 +3905,7 @@ async function handleApi(request, env, path) {
             return json({ ok: false, action: "close", reason: "user not found", enabled: false }, 404);
         }
 
-        // ۴. پردازش نوع درخواست
         if (type === "connect") {
-            if (matchedNode && matchedNode.is_disabled === 1) {
-            return json({ ok: false, action: "close", enabled: false, reason: "Node is disabled by admin" });
-            }
             const ipCheck = await touchAndCheckIpLimit(env, user, body.ip, child_id);
             if (!ipCheck.ok) return json({ ok: true, action: "close", reason: "IP limit exceeded", enabled: false });
             if (!user.enabled) return json({ ok: true, action: "close", reason: "disabled", enabled: false });
@@ -3905,9 +3943,6 @@ async function handleApi(request, env, path) {
         }
 
         if (type === "usage") {
-            if (matchedNode && matchedNode.is_disabled === 1) {
-            return json({ ok: false, action: "close", enabled: false, reason: "Node is disabled by admin" });
-            }
             const up = body.up || 0, down = body.down || 0;
             if (up + down > 0) await addUsage(env, user.id, up, down);
             if (body.ip) await touchAndCheckIpLimit(env, user, body.ip, child_id);
