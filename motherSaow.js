@@ -243,7 +243,7 @@
 
 // END OF MAP
 // ================================================================================
-const VERSION = "saow-3.6";
+const VERSION = "mother-bot-3.5";
 const BOT_VERSION = "3.7.1";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -294,22 +294,37 @@ export default {
       }
 
       // Subscription
-      if (path === SUB_PATH || path === SUB_PATH + "/") {
+    if (path === SUB_PATH || path === SUB_PATH + "/") {
         const token = url.searchParams.get("token") || "";
         if (!token) return new Response("token required", { status: 401 });
+
         const user = await getUserByUuid(env, token);
         if (!user) return new Response("invalid", { status: 404 });
+
+        // تشخیص مرورگر در مقابل کلاینت‌های پروکسی
+        const ua = (request.headers.get("user-agent") || "").toLowerCase();
+        const accept = (request.headers.get("accept") || "").toLowerCase();
+        const isBrowser =
+            accept.includes("text/html") ||
+            /mozilla|chrome|safari|firefox|edge|opera|samsung/i.test(ua);
+
+        if (isBrowser) {
+            // صفحه زیبا برای مرورگر
+            return serveSubPage(request, env, user, url);
+        }
+
+        // کلاینت‌های معمولی → متن سابسکریپشن
         ctx.waitUntil(ensureDomainsList());
         ctx.waitUntil(ensureIrcfResolved());
         const body = await generateSubscription(env, user, url.hostname);
         return new Response(body, {
-          headers: {
+            headers: {
             "content-type": "text/plain; charset=utf-8",
             "cache-control": "no-store",
             "profile-update-interval": "6",
-          },
+            },
         });
-      }
+        }
 
       if (path === "/") {
         return serveStatusPage(request, env);
@@ -329,6 +344,70 @@ export default {
 };
 
 // ====================== Telegram Handlers ======================
+
+async function serveSubPage(request, env, user, url) {
+  const full = await buildFullUser(env, user);
+  const clientIP = request.headers.get("CF-Connecting-IP") || 
+                   request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || "—";
+  const country = request.cf?.country || "—";
+
+  // لینک‌های واقعی ساب
+  const linksText = await generateSubscription(env, user, url.hostname);
+  const links = linksText.split("\n").filter(l => l.startsWith("vless://"));
+
+  const usedGB = full.usage?.totalGB || 0;
+  const quotaGB = user.quotaBytes > 0 ? +(user.quotaBytes / 1073741824).toFixed(2) : 0;
+  const usagePercent = quotaGB > 0 ? Math.min(100, (usedGB / quotaGB) * 100) : 0;
+
+  const data = {
+    name: user.name,
+    status: full.status,
+    expiryText: user.expiry
+      ? new Date(user.expiry).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })
+      : "∞",
+    usageText: usedGB + " GB",
+    quotaText: quotaGB > 0 ? quotaGB + " GB" : "∞",
+    usagePercent,
+    activeIPs: full.activeIPs,
+    ipLimit: user.ipLimit,
+    clientIP,
+    country,
+    links,
+    subUrl: `${url.origin}/pull?token=${user.uuid}`,
+  };
+
+  // لود کردن قالب از گیت‌هاب
+  let html = "";
+  try {
+    const res = await fetch(
+      "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/sub-status.html",
+      { cf: { cacheTtl: 300, cacheEverything: true } }
+    );
+    if (res.ok) html = await res.text();
+  } catch {}
+
+  if (!html) {
+    // fallback خیلی ساده
+    html = `<!DOCTYPE html><html><body style="background:#05060f;color:#e2e8f0;font-family:sans-serif;padding:2rem">
+      <h1>SAOW</h1><p>${full.status}</p><p>${usedGB} / ${quotaGB || "∞"} GB</p></body></html>`;
+  }
+
+  // تزریق داده
+  const inject = `<script>window.__SAOW_SUB__=${JSON.stringify(data)};</script>`;
+  if (html.includes("</head>")) {
+    html = html.replace("</head>", inject + "</head>");
+  } else {
+    html = inject + html;
+  }
+
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
 
 
 async function toggleNodeStatus(chatId, nodeId, env, msgId) {
@@ -2748,7 +2827,7 @@ async function createCloudflareNode(chatId, token, env) {
         body: JSON.stringify({ enabled: true }),
       });
     } catch {}
-    
+
     // ست کردن Cron Trigger (هر ۳ دقیقه)
     const cronOk = await setChildCron(token, accountId, scriptName);
 
