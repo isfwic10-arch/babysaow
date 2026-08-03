@@ -1,7 +1,7 @@
 // child-worker.js — v3.1
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'child-3.1';
+const VERSION = 'child-3.4';
 let MOTHER_URL = null;
 const API_SECRET = 'saow-pan';
 const REPORT_THRESHOLD = 5 * 1024 * 1024;
