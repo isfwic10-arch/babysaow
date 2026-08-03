@@ -28,26 +28,35 @@
     }
 
     .bg {
-      position: fixed; inset: 0; z-index: 0;
+      position: fixed;
+      inset: 0;
+      z-index: 0;
       background:
         radial-gradient(ellipse 80% 50% at 15% 15%, rgba(34,211,238,.13), transparent 50%),
         radial-gradient(ellipse 60% 40% at 85% 80%, rgba(167,139,250,.14), transparent 50%),
         radial-gradient(ellipse 50% 30% at 50% 50%, rgba(244,114,182,.07), transparent 60%);
       animation: drift 14s ease-in-out infinite alternate;
     }
+
     @keyframes drift {
       from { transform: scale(1) translate(0,0); }
       to   { transform: scale(1.07) translate(-1.5%,1.5%); }
     }
 
     canvas#particles {
-      position: fixed; inset: 0; width: 100%; height: 100%;
-      z-index: 1; pointer-events: none;
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      pointer-events: none;
     }
 
     .wrap {
-      position: relative; z-index: 2;
-      max-width: 520px; margin: 0 auto;
+      position: relative;
+      z-index: 2;
+      max-width: 480px;
+      margin: 0 auto;
       padding: 2.2rem 1.1rem 3rem;
     }
 
@@ -59,19 +68,29 @@
       text-align: center;
       background: linear-gradient(120deg, var(--cyan), var(--violet), var(--pink), var(--cyan));
       background-size: 300% 300%;
-      -webkit-background-clip: text; background-clip: text; color: transparent;
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
       animation: gradientMove 6s linear infinite, glowPulse 2.8s ease-in-out infinite;
       margin-bottom: .25rem;
     }
-    @keyframes gradientMove { 0%{background-position:0% 50%} 100%{background-position:300% 50%} }
+
+    @keyframes gradientMove {
+      0%   { background-position: 0% 50%; }
+      100% { background-position: 300% 50%; }
+    }
+
     @keyframes glowPulse {
-      0%,100%{ filter: drop-shadow(0 0 8px rgba(34,211,238,.35)); }
-      50%    { filter: drop-shadow(0 0 20px rgba(167,139,250,.55)); }
+      0%, 100% { filter: drop-shadow(0 0 8px rgba(34,211,238,.35)); }
+      50%      { filter: drop-shadow(0 0 20px rgba(167,139,250,.55)); }
     }
 
     .tagline {
-      text-align: center; color: var(--muted); font-size: .88rem;
-      font-weight: 300; margin-bottom: 1.6rem;
+      text-align: center;
+      color: var(--muted);
+      font-size: .88rem;
+      font-weight: 300;
+      margin-bottom: 1.6rem;
     }
 
     .card {
@@ -85,39 +104,55 @@
     }
 
     .badge {
-      display: inline-flex; align-items: center; gap: .5rem;
-      padding: .4rem .9rem; border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      gap: .5rem;
+      padding: .4rem .9rem;
+      border-radius: 999px;
       background: rgba(34,211,238,.08);
       border: 1px solid rgba(34,211,238,.28);
       margin-bottom: 1rem;
     }
+
     .dot {
-      width: 8px; height: 8px; border-radius: 50%;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
       background: #34d399;
       box-shadow: 0 0 0 0 rgba(52,211,153,.55);
       animation: ping 1.6s ease-out infinite;
     }
+
     @keyframes ping {
       0%   { box-shadow: 0 0 0 0 rgba(52,211,153,.55); }
       70%  { box-shadow: 0 0 0 9px rgba(52,211,153,0); }
       100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); }
     }
+
     .badge span {
       font-family: 'Orbitron', sans-serif;
-      font-size: .72rem; letter-spacing: .12em; color: var(--cyan);
+      font-size: .72rem;
+      letter-spacing: .12em;
+      color: var(--cyan);
     }
 
     .status-title {
       font-family: 'Orbitron', sans-serif;
-      font-size: .78rem; letter-spacing: .14em;
-      color: var(--muted); margin-bottom: .6rem;
+      font-size: .78rem;
+      letter-spacing: .14em;
+      color: var(--muted);
+      margin-bottom: .6rem;
     }
 
     .row {
-      display: flex; justify-content: space-between; align-items: center;
-      padding: .45rem 0; border-bottom: 1px solid rgba(148,163,184,.08);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: .45rem 0;
+      border-bottom: 1px solid rgba(148,163,184,.08);
       font-size: .92rem;
     }
+
     .row:last-child { border-bottom: none; }
     .row .label { color: var(--muted); }
     .row .value { font-weight: 500; }
@@ -126,75 +161,105 @@
     .row .value.bad  { color: #f87171; }
 
     .progress {
-      height: 7px; border-radius: 99px;
+      height: 7px;
+      border-radius: 99px;
       background: rgba(148,163,184,.12);
-      margin-top: .7rem; overflow: hidden;
+      margin-top: .7rem;
+      overflow: hidden;
     }
+
     .progress > div {
-      height: 100%; border-radius: 99px;
+      height: 100%;
+      border-radius: 99px;
       background: linear-gradient(90deg, var(--cyan), var(--violet));
       transition: width .6s ease;
     }
 
     .section-title {
       font-family: 'Orbitron', sans-serif;
-      font-size: .75rem; letter-spacing: .16em;
-      color: var(--muted); margin: 1.4rem 0 .7rem;
+      font-size: .75rem;
+      letter-spacing: .16em;
+      color: var(--muted);
+      margin: 1.6rem 0 .9rem;
       text-align: center;
     }
 
-    .qr-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: .9rem;
+    .qr-single {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      background: rgba(2, 6, 23, 0.55);
+      border: 1px solid rgba(167, 139, 250, 0.25);
+      border-radius: 18px;
+      padding: 1.5rem 1.2rem;
+      margin-bottom: 0.3rem;
     }
-    .qr-item {
-      background: rgba(2,6,23,.55);
-      border: 1px solid rgba(167,139,250,.2);
-      border-radius: 14px;
-      padding: .85rem .6rem;
-      text-align: center;
-    }
-    .qr-item img {
-      width: 120px; height: 120px;
-      border-radius: 8px;
+
+    .qr-single img {
+      width: 180px;
+      height: 180px;
+      border-radius: 12px;
       background: #fff;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.4);
     }
-    .qr-item .name {
-      font-size: .72rem; margin-top: .5rem;
-      color: var(--muted); line-height: 1.35;
-      word-break: break-all;
+
+    .qr-single .label {
+      margin-top: 1rem;
+      font-family: 'Orbitron', sans-serif;
+      font-size: 0.72rem;
+      letter-spacing: 0.1em;
+      color: var(--cyan);
+    }
+
+    .qr-single .hint {
+      margin-top: 0.4rem;
+      font-size: 0.78rem;
+      color: var(--muted);
+      text-align: center;
+      line-height: 1.55;
     }
 
     .ip-box {
-      display: flex; justify-content: space-between; gap: .8rem;
+      display: flex;
+      justify-content: space-between;
+      gap: .8rem;
       flex-wrap: wrap;
     }
+
     .chip {
       font-family: 'Orbitron', sans-serif;
-      font-size: .7rem; letter-spacing: .06em;
-      padding: .35rem .7rem; border-radius: 8px;
+      font-size: .7rem;
+      letter-spacing: .06em;
+      padding: .35rem .7rem;
+      border-radius: 8px;
       background: rgba(148,163,184,.08);
       border: 1px solid rgba(148,163,184,.15);
       color: var(--muted);
     }
 
     .footer {
-      text-align: center; margin-top: 1.8rem;
-      font-size: .72rem; color: #64748b;
+      text-align: center;
+      margin-top: 1.8rem;
+      font-size: .72rem;
+      color: #64748b;
     }
 
     .copy-btn {
-      display: block; width: 100%;
-      margin-top: 1rem; padding: .75rem;
+      display: block;
+      width: 100%;
+      margin-top: 1.1rem;
+      padding: .8rem;
       border-radius: 12px;
       background: rgba(34,211,238,.1);
       border: 1px solid rgba(34,211,238,.3);
       color: var(--cyan);
       font-family: 'Orbitron', sans-serif;
-      font-size: .78rem; letter-spacing: .08em;
-      cursor: pointer; transition: .2s;
+      font-size: .78rem;
+      letter-spacing: .08em;
+      cursor: pointer;
+      transition: .2s;
     }
+
     .copy-btn:hover {
       background: rgba(34,211,238,.18);
       transform: translateY(-1px);
@@ -209,6 +274,7 @@
     <div class="logo">SAOW</div>
     <p class="tagline">Subscription · Status</p>
 
+    <!-- اطلاعات اکانت -->
     <div class="card">
       <div class="badge">
         <div class="dot"></div>
@@ -226,6 +292,7 @@
       <div class="progress"><div id="bar" style="width:0%"></div></div>
     </div>
 
+    <!-- اطلاعات اتصال -->
     <div class="card">
       <div class="status-title">YOUR CONNECTION</div>
       <div class="ip-box">
@@ -234,8 +301,11 @@
       </div>
     </div>
 
-    <div class="section-title">QR CODES</div>
-    <div class="qr-grid" id="qrs"></div>
+    <!-- فقط یک QR از لینک ساب -->
+    <div class="section-title">QR CODE</div>
+    <div class="qr-single" id="qrBox">
+      <!-- توسط جاوااسکریپت پر می‌شود -->
+    </div>
 
     <button class="copy-btn" onclick="copySub()">کپی لینک سابسکریپشن</button>
 
@@ -259,7 +329,7 @@
       return 'warn';
     }
 
-    // پر کردن اطلاعات
+    // پر کردن اطلاعات اکانت
     set('name', DATA.name || '—');
     set('status', DATA.status || '—', statusClass(DATA.status));
     set('expiry', DATA.expiryText || '∞');
@@ -275,16 +345,16 @@
     const pct = Math.min(100, DATA.usagePercent || 0);
     document.getElementById('bar').style.width = pct + '%';
 
-    // QRها
-    const qrs = document.getElementById('qrs');
-    (DATA.links || []).forEach((link, i) => {
-      const name = decodeURIComponent((link.split('#')[1] || `Config ${i+1}`).replace(/\+/g, ' '));
-      const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(link)}`;
-      const div = document.createElement('div');
-      div.className = 'qr-item';
-      div.innerHTML = `<img src="${qrUrl}" alt="QR" loading="lazy"><div class="name">${name}</div>`;
-      qrs.appendChild(div);
-    });
+    // فقط یک QR از لینک سابسکریپشن
+    const subUrl = DATA.subUrl || location.href;
+    const qrBox = document.getElementById('qrBox');
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(subUrl)}`;
+
+    qrBox.innerHTML = `
+      <img src="${qrUrl}" alt="Subscription QR" loading="lazy">
+      <div class="label">SUBSCRIPTION LINK</div>
+      <div class="hint">با اسکن این QR، لینک سابسکریپشن<br>مستقیماً به اپلیکیشن اضافه می‌شود</div>
+    `;
 
     function copySub() {
       const url = DATA.subUrl || location.href;
@@ -299,34 +369,51 @@
     const c = document.getElementById('particles');
     const ctx = c.getContext('2d');
     let w, h, dots = [];
+
     function resize() {
-      w = c.width = innerWidth; h = c.height = innerHeight;
-      dots = Array.from({ length: Math.min(55, Math.floor(w*h/20000)) }, () => ({
-        x: Math.random()*w, y: Math.random()*h,
-        r: Math.random()*1.5+.4,
-        vx: (Math.random()-.5)*.3, vy: (Math.random()-.5)*.3,
-        a: Math.random()*.45+.15
+      w = c.width = innerWidth;
+      h = c.height = innerHeight;
+      dots = Array.from({ length: Math.min(55, Math.floor(w * h / 20000)) }, () => ({
+        x: Math.random() * w,
+        y: Math.random() * h,
+        r: Math.random() * 1.5 + 0.4,
+        vx: (Math.random() - 0.5) * 0.3,
+        vy: (Math.random() - 0.5) * 0.3,
+        a: Math.random() * 0.45 + 0.15
       }));
     }
+
     function draw() {
-      ctx.clearRect(0,0,w,h);
+      ctx.clearRect(0, 0, w, h);
       for (const d of dots) {
         d.x += d.vx; d.y += d.vy;
-        if (d.x<0||d.x>w) d.vx*=-1;
-        if (d.y<0||d.y>h) d.vy*=-1;
-        ctx.beginPath(); ctx.arc(d.x,d.y,d.r,0,Math.PI*2);
-        ctx.fillStyle = `rgba(34,211,238,${d.a})`; ctx.fill();
+        if (d.x < 0 || d.x > w) d.vx *= -1;
+        if (d.y < 0 || d.y > h) d.vy *= -1;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(34,211,238,${d.a})`;
+        ctx.fill();
       }
-      for (let i=0;i<dots.length;i++) for (let j=i+1;j<dots.length;j++) {
-        const a=dots[i],b=dots[j], dx=a.x-b.x, dy=a.y-b.y, dist=Math.hypot(dx,dy);
-        if (dist<100) {
-          ctx.strokeStyle = `rgba(167,139,250,${.1*(1-dist/100)})`;
-          ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+      for (let i = 0; i < dots.length; i++) {
+        for (let j = i + 1; j < dots.length; j++) {
+          const a = dots[i], b = dots[j];
+          const dx = a.x - b.x, dy = a.y - b.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist < 100) {
+            ctx.strokeStyle = `rgba(167,139,250,${0.1 * (1 - dist / 100)})`;
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
+          }
         }
       }
       requestAnimationFrame(draw);
     }
-    addEventListener('resize', resize); resize(); draw();
+
+    addEventListener('resize', resize);
+    resize();
+    draw();
   </script>
 </body>
 </html>
