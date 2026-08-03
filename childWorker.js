@@ -2,7 +2,7 @@
 import { connect } from 'cloudflare:sockets';
 
 const VERSION = 'child-3.1';
-const MOTHER_URL = null;
+let MOTHER_URL = null;
 const API_SECRET = 'saow-pan';
 const REPORT_THRESHOLD = 1 * 1024 * 1024;
 const USER_CACHE_TTL = 30 * 1000;
