@@ -243,7 +243,7 @@
 
 // END OF MAP
 // ================================================================================
-const VERSION = "saow-3.7";
+const VERSION = "mother-bot-3.5";
 const BOT_VERSION = "3.7.1";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -255,7 +255,7 @@ const STATUS_HTML_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysao
 const API_ROOT = "/api";
 const SUB_PATH = "/pull";
 const NODE_TTL = 15 * 60 * 1000;
-const IP_IDLE_MS = 90 * 1000;
+const IP_IDLE_MS = 5 * 60 * 1000;   // ۵ دقیقه
 const API_SECRET = "saow-pan"; // برای گزارش نودهای بچه
 
 // ====================== Main Entry ======================
