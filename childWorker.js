@@ -4,7 +4,7 @@ import { connect } from 'cloudflare:sockets';
 const VERSION = 'child-3.1';
 let MOTHER_URL = null;
 const API_SECRET = 'saow-pan';
-const REPORT_THRESHOLD = 1 * 1024 * 1024;
+const REPORT_THRESHOLD = 5 * 1024 * 1024;
 const USER_CACHE_TTL = 30 * 1000;
 
 const ADGUARD_DNS_HOST = 'dns.adguard.com';
@@ -339,8 +339,12 @@ async function handleVlessWebSocket(request, ctx) {
           return safeClose('disabled');
         }
 
-        const maxConn = currentConfig.ipLimit || 1;
-        if ((activeConns.get(userUuid) || 0) >= maxConn) {
+        // const maxConn = currentConfig.ipLimit || 1;
+        // if ((activeConns.get(userUuid) || 0) >= maxConn) {
+        //   return safeClose('local conn limit');
+        // }
+        const LOCAL_MAX_CONNS = 32;
+        if ((activeConns.get(userUuid) || 0) >= LOCAL_MAX_CONNS) {
           return safeClose('local conn limit');
         }
 
@@ -352,7 +356,10 @@ async function handleVlessWebSocket(request, ctx) {
         });
 
         // fail-closed
-        if (!joinRes || joinRes.action === 'close' || joinRes.enabled === false) {
+        // if (!joinRes || joinRes.action === 'close' || joinRes.enabled === false) {
+        //   return safeClose(joinRes?.reason || 'mother rejected');
+        // }
+        if (joinRes && (joinRes.action === 'close' || joinRes.enabled === false)) {
           return safeClose(joinRes?.reason || 'mother rejected');
         }
 
@@ -397,7 +404,11 @@ async function handleVlessWebSocket(request, ctx) {
                   await limiter.take(value.byteLength);
                   bytesDown += value.byteLength;
                   sessionBytes += value.byteLength;
-                  if (server.readyState === 1) server.send(value);
+                  try {
+                    server.send(value);
+                  } catch {
+                    return safeClose('ws send fail');
+                  }
                 }
               }
             } catch {}
@@ -468,3 +479,4 @@ export default {
     ctx.waitUntil(ensureBlocklist());
   },
 };
+
