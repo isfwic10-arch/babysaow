@@ -184,30 +184,58 @@
       text-align: center;
     }
 
+    /* QR زیبا و رنگی */
     .qr-single {
       display: flex;
       flex-direction: column;
       align-items: center;
-      background: rgba(2, 6, 23, 0.55);
-      border: 1px solid rgba(167, 139, 250, 0.25);
-      border-radius: 18px;
-      padding: 1.5rem 1.2rem;
-      margin-bottom: 0.3rem;
+      background: linear-gradient(145deg, rgba(15,23,42,0.9), rgba(2,6,23,0.7));
+      border: 1px solid rgba(34, 211, 238, 0.25);
+      border-radius: 22px;
+      padding: 1.6rem 1.3rem;
+      position: relative;
+      overflow: hidden;
     }
 
-    .qr-single img {
-      width: 180px;
-      height: 180px;
-      border-radius: 12px;
-      background: #fff;
-      box-shadow: 0 8px 30px rgba(0,0,0,0.4);
+    .qr-single::before {
+      content: '';
+      position: absolute;
+      inset: -50%;
+      background: conic-gradient(from 0deg, transparent, rgba(34,211,238,0.12), transparent 40%);
+      animation: spin 10s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .qr-inner {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .qr-frame {
+      padding: 12px;
+      border-radius: 16px;
+      background: linear-gradient(135deg, rgba(34,211,238,0.15), rgba(167,139,250,0.15));
+      box-shadow:
+        0 0 0 1px rgba(34,211,238,0.3),
+        0 10px 40px rgba(34,211,238,0.15);
+    }
+
+    .qr-frame img {
+      width: 170px;
+      height: 170px;
+      border-radius: 10px;
+      display: block;
     }
 
     .qr-single .label {
-      margin-top: 1rem;
+      margin-top: 1.1rem;
       font-family: 'Orbitron', sans-serif;
       font-size: 0.72rem;
-      letter-spacing: 0.1em;
+      letter-spacing: 0.12em;
       color: var(--cyan);
     }
 
@@ -237,32 +265,58 @@
       color: var(--muted);
     }
 
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.7rem;
+      margin-top: 1.15rem;
+    }
+
+    .btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+      padding: 0.8rem 0.6rem;
+      border-radius: 12px;
+      font-family: 'Orbitron', sans-serif;
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      cursor: pointer;
+      transition: all 0.22s ease;
+      text-decoration: none;
+      border: none;
+    }
+
+    .btn-copy {
+      background: rgba(34,211,238,0.1);
+      border: 1px solid rgba(34,211,238,0.32);
+      color: var(--cyan);
+    }
+
+    .btn-copy:hover {
+      background: rgba(34,211,238,0.2);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(34,211,238,0.15);
+    }
+
+    .btn-v2ray {
+      background: linear-gradient(135deg, rgba(167,139,250,0.18), rgba(244,114,182,0.12));
+      border: 1px solid rgba(167,139,250,0.4);
+      color: #c4b5fd;
+    }
+
+    .btn-v2ray:hover {
+      background: linear-gradient(135deg, rgba(167,139,250,0.28), rgba(244,114,182,0.2));
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(167,139,250,0.2);
+    }
+
     .footer {
       text-align: center;
       margin-top: 1.8rem;
       font-size: .72rem;
       color: #64748b;
-    }
-
-    .copy-btn {
-      display: block;
-      width: 100%;
-      margin-top: 1.1rem;
-      padding: .8rem;
-      border-radius: 12px;
-      background: rgba(34,211,238,.1);
-      border: 1px solid rgba(34,211,238,.3);
-      color: var(--cyan);
-      font-family: 'Orbitron', sans-serif;
-      font-size: .78rem;
-      letter-spacing: .08em;
-      cursor: pointer;
-      transition: .2s;
-    }
-
-    .copy-btn:hover {
-      background: rgba(34,211,238,.18);
-      transform: translateY(-1px);
     }
   </style>
 </head>
@@ -301,19 +355,28 @@
       </div>
     </div>
 
-    <!-- فقط یک QR از لینک ساب -->
+    <!-- QR رنگی و زیبا -->
     <div class="section-title">QR CODE</div>
-    <div class="qr-single" id="qrBox">
-      <!-- توسط جاوااسکریپت پر می‌شود -->
+    <div class="qr-single">
+      <div class="qr-inner">
+        <div class="qr-frame">
+          <img id="qrImg" src="" alt="Subscription QR" loading="lazy">
+        </div>
+        <div class="label">SUBSCRIPTION LINK</div>
+        <div class="hint">با اسکن این QR، لینک سابسکریپشن<br>مستقیماً به اپلیکیشن اضافه می‌شود</div>
+      </div>
     </div>
 
-    <button class="copy-btn" onclick="copySub()">کپی لینک سابسکریپشن</button>
+    <!-- دکمه‌ها -->
+    <div class="actions">
+      <button class="btn btn-copy" onclick="copySub()">کپی لینک ساب</button>
+      <a class="btn btn-v2ray" id="v2rayBtn" href="#">باز کردن در v2rayNG</a>
+    </div>
 
     <p class="footer">Powered by Saow Panel</p>
   </div>
 
   <script>
-    // داده‌ها توسط نود مادر تزریق می‌شوند
     const DATA = window.__SAOW_SUB__ || {};
 
     function set(id, val, cls) {
@@ -329,7 +392,7 @@
       return 'warn';
     }
 
-    // پر کردن اطلاعات اکانت
+    // اطلاعات اکانت
     set('name', DATA.name || '—');
     set('status', DATA.status || '—', statusClass(DATA.status));
     set('expiry', DATA.expiryText || '∞');
@@ -345,23 +408,27 @@
     const pct = Math.min(100, DATA.usagePercent || 0);
     document.getElementById('bar').style.width = pct + '%';
 
-    // فقط یک QR از لینک سابسکریپشن
+    // QR رنگی (cyan روی پس‌زمینه تیره)
     const subUrl = DATA.subUrl || location.href;
-    const qrBox = document.getElementById('qrBox');
-    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(subUrl)}`;
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&color=22d3ee&bgcolor=0a0e1a&margin=8&data=${encodeURIComponent(subUrl)}`;
+    document.getElementById('qrImg').src = qrUrl;
 
-    qrBox.innerHTML = `
-      <img src="${qrUrl}" alt="Subscription QR" loading="lazy">
-      <div class="label">SUBSCRIPTION LINK</div>
-      <div class="hint">با اسکن این QR، لینک سابسکریپشن<br>مستقیماً به اپلیکیشن اضافه می‌شود</div>
-    `;
+    // دکمه v2rayNG
+    const v2rayBtn = document.getElementById('v2rayBtn');
+    v2rayBtn.href = `v2rayng://install-config?url=${encodeURIComponent(subUrl)}`;
+
+    // پشتیبانی از چند کلاینت (اختیاری - روی موبایل کار می‌کند)
+    v2rayBtn.addEventListener('click', (e) => {
+      // اول v2rayNG را امتحان می‌کند
+      // اگر نصب نبود، کاربر می‌تواند از دکمه کپی استفاده کند
+    });
 
     function copySub() {
-      const url = DATA.subUrl || location.href;
-      navigator.clipboard.writeText(url).then(() => {
-        const btn = document.querySelector('.copy-btn');
+      navigator.clipboard.writeText(subUrl).then(() => {
+        const btn = document.querySelector('.btn-copy');
+        const original = btn.textContent;
         btn.textContent = 'کپی شد ✓';
-        setTimeout(() => btn.textContent = 'کپی لینک سابسکریپشن', 1800);
+        setTimeout(() => btn.textContent = original, 1800);
       });
     }
 
