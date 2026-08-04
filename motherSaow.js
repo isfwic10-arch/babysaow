@@ -244,7 +244,7 @@
 // END OF MAP
 // ================================================================================
 const VERSION = "mother-bot-3.6-push";
-const BOT_VERSION = "3.8.0-push";
+const BOT_VERSION = "3.8.1-push";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
 const CHILD_WORKER_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/childWorker.js";
@@ -2302,8 +2302,62 @@ async function handleCallback(cq, env) {
 
   if (data === "main") return showMain(chatId, env, msgId);
   if (data === "status") return showStatus(chatId, env, msgId);
+  
+
+  // ========== Nodes ==========
   if (data === "nodes") return showNodes(chatId, env, msgId);
   if (data === "nodes_manage") return showNodesManage(chatId, env, msgId);
+  if (data === "node_create") return showNodeCreate(chatId, env, msgId);
+
+  if (data.startsWith("node_detail:")) {
+    const nodeId = data.split(":")[1];
+    const node = await getManagedNode(env, nodeId);
+    if (!node) {
+      return edit(chatId, msgId, "❌ نود پیدا نشد.", env, [
+        [{ text: "🔙 لیست نودها", callback_data: "nodes" }],
+      ]);
+    }
+    return showNodeDetail(chatId, node, env, msgId);
+  }
+
+  if (data.startsWith("toggle_node:")) {
+    return toggleNodeStatus(chatId, data.split(":")[1], env, msgId);
+  }
+
+  if (data === "node_create_token") {
+    return send(
+      chatId,
+      `🔑 <b>ساخت نود جدید</b>\n\n` +
+        `۱. روی دکمه زیر کلیک کنید و توکن بسازید.\n` +
+        `۲. توکن را کپی کرده و اینجا ارسال کنید.\n\n` +
+        `⚠️ <b>توجه:</b> نود بچه نمی‌تواند روی همان اکانت نود مادر ساخته شود.\n\n` +
+        `✏️ <b>توکن API کلودفلر را ارسال کنید:</b>\n\nبرای بازگشت /start`,
+      env,
+      [
+        [{ text: "🔗 ساخت توکن کلودفلر", url: CF_TOKEN_URL }],
+        [{ text: "❌ انصراف", callback_data: "nodes_manage" }],
+      ],
+      true
+    );
+  }
+
+  if (data.startsWith("del_node:")) {
+    return confirmDeleteNode(chatId, data.split(":")[1], env, msgId);
+  }
+  if (data.startsWith("del_node_confirm:")) {
+    return doDeleteNode(chatId, data.split(":")[1], env, msgId);
+  }
+
+  if (data === "update_mother") return doUpdateMother(chatId, env, msgId);
+  if (data === "mother_account_status") return showMotherAccountStatus(chatId, env, msgId);
+
+  if (data.startsWith("node_acc:")) {
+    return showNodeAccountStatus(chatId, data.split(":")[1], env, msgId);
+  }
+
+  if (data.startsWith("update_child:")) {
+    return updateChildNode(chatId, data.split(":")[1], env, msgId);
+  }
 
   if (data.startsWith("users:")) {
     const page = parseInt(data.split(":")[1]) || 0;
@@ -2801,21 +2855,34 @@ async function doDelete(chatId, id, env, msgId) {
 
 // ====================== Nodes UI ======================
 async function showNodesManage(chatId, env, msgId = null) {
-  const alive = await getHealthyChildren(env);
-  const managed = await getManagedNodes(env);
-  const text =
-    `🖥 <b>مدیریت نودها (Push Mode)</b>\n\n` +
-    `🟢 آنلاین (آخرین همگام‌سازی < ۱۵ دقیقه): ${alive.length}\n` +
-    `📦 ثبت‌شده: ${managed.length}\n\n` +
-    `از این بخش نودها را مدیریت کنید.\nهمگام‌سازی هر دقیقه توسط مادر انجام می‌شود.`;
-  const kb = [
-    [{ text: "📊 وضعیت / حذف / آپدیت نودها", callback_data: "nodes" }],
-    [{ text: "➕ ساخت نود جدید", callback_data: "node_create" }],
-    [{ text: "🔄 آپدیت نود مادر", callback_data: "update_mother" }],
-    [{ text: "📈 وضعیت اکانت مادر", callback_data: "mother_account_status" }],
-    [{ text: "🔙 بازگشت", callback_data: "main" }],
-  ];
-  return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
+  try {
+    const [alive, managed] = await Promise.all([
+      getHealthyChildren(env),
+      getManagedNodes(env),
+    ]);
+
+    const text =
+      `🖥 <b>مدیریت نودها (Push Mode)</b>\n\n` +
+      `🟢 آنلاین (آخرین همگام‌سازی < ۱۵ دقیقه): ${alive.length}\n` +
+      `📦 ثبت‌شده: ${managed.length}\n\n` +
+      `از این بخش نودها را مدیریت کنید.\nهمگام‌سازی هر دقیقه توسط مادر انجام می‌شود.`;
+
+    const kb = [
+      [{ text: "📊 وضعیت / حذف / آپدیت نودها", callback_data: "nodes" }],
+      [{ text: "➕ ساخت نود جدید", callback_data: "node_create" }],
+      [{ text: "🔄 آپدیت نود مادر", callback_data: "update_mother" }],
+      [{ text: "📈 وضعیت اکانت مادر", callback_data: "mother_account_status" }],
+      [{ text: "🔙 بازگشت", callback_data: "main" }],
+    ];
+
+    return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
+  } catch (e) {
+    console.error("showNodesManage error:", e);
+    const errText = `❌ خطا در بارگذاری مدیریت نودها:\n<code>${escape(e.message)}</code>`;
+    return msgId
+      ? edit(chatId, msgId, errText, env, [[{ text: "🔙 منو", callback_data: "main" }]])
+      : send(chatId, errText, env);
+  }
 }
 
 async function showNodeCreate(chatId, env, msgId = null) {
