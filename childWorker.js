@@ -3,13 +3,15 @@
 // کاربران، IPهای فعال و مصرف همگی در D1 ذخیره می‌شوند تا بین isolateها از دست نروند.
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-4.4-push';
+const VERSION = 'saow-node-4.5-push';
 const API_SECRET = 'saow-pan2';
 let MOTHER_URL = null;
 
 const REPORT_THRESHOLD = 2 * 1024 * 1024; // هر ۲ مگابایت یک‌بار در D1 بنویس
 const STATUS_HTML_URL = 'https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/node-status.html';
 const IP_IDLE_MS = 10 * 60 * 1000; // IP بدون فعالیت بعد از ۱۰ دقیقه پاک می‌شود
+const UDP_REJECT_DELAY_MS = 3000; // ۳ ثانیه تأخیر عمدی برای UDP غیر DNS
+
 
 const ADGUARD_DNS_HOST = 'dns.adguard.com';
 const ADGUARD_DNS_PORT = 53;
@@ -597,7 +599,6 @@ async function handleVlessWebSocket(request, env, ctx) {
       const down = bytesDown;
       bytesUp = 0;
       bytesDown = 0;
-      // fire-and-forget به D1
       dbAddUsage(envRef, userId, up, down).catch(() => {});
     }
   };
@@ -611,6 +612,7 @@ async function handleVlessWebSocket(request, env, ctx) {
       activeConns.set(userUuid, Math.max(0, (activeConns.get(userUuid) || 1) - 1));
       if (userId) {
         flushUsage();
+        // فقط وقتی واقعاً join شده بودیم IP را پاک کن
         dbClearIp(envRef, userId, clientIP).catch(() => {});
       }
     }
@@ -622,6 +624,13 @@ async function handleVlessWebSocket(request, env, ctx) {
 
   const sendResponse = () => {
     try { server.send(new Uint8Array([0x00, 0x00])); } catch {}
+  };
+
+  /** بستن با تأخیر عمدی (برای UDP و درخواست‌های مزاحم) */
+  const delayedClose = async (reason, delayMs = UDP_REJECT_DELAY_MS) => {
+    sendResponse(); // کلاینت باید پاسخ VLESS بگیرد وگرنه ممکن است فوری retry کند
+    await sleep(delayMs);
+    safeClose(reason);
   };
 
   const maybeAccumulate = () => {
@@ -637,7 +646,7 @@ async function handleVlessWebSocket(request, env, ctx) {
       if (typeof data === 'string') data = new TextEncoder().encode(data).buffer;
       if (!(data instanceof ArrayBuffer)) data = new Uint8Array(data).buffer;
 
-            if (!headerParsed) {
+      if (!headerParsed) {
         const parsed = parseVlessHeader(data);
         if (!parsed.ok) return safeClose('bad header');
         headerParsed = true;
@@ -650,31 +659,12 @@ async function handleVlessWebSocket(request, env, ctx) {
 
         userId = currentConfig.id;
 
-        // محدودیت IP از D1
-        const currentIps = await dbCountIps(envRef, userId);
-        let ipAlreadyExists = false;
-        try {
-          const row = await envRef.DB.prepare(
-            `SELECT 1 AS x FROM node_active_ips WHERE user_id = ? AND ip = ?`
-          ).bind(userId, clientIP).first();
-          ipAlreadyExists = !!row;
-        } catch {}
-
-        if (!ipAlreadyExists && currentIps >= (currentConfig.ipLimit || 1)) {
-          return safeClose('ip limit');
-        }
-
-        joined = true;
-        activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
-        ctx.waitUntil(dbTouchIp(envRef, userId, clientIP));
-        limiter = getLimiter(userUuid, currentConfig.speedLimitKBps || 0);
-
-        let dstHost = parsed.address;
-        let dstPort = parsed.port;
-
         // ---------- UDP (cmd = 2) ----------
+        // اول چک کن UDP است یا نه؛ اگر UDP غیر DNS بود اصلاً سراغ D1 نرو
         if (parsed.cmd === 2) {
-          // فقط تلاش برای DNS؛ بقیه UDP پشتیبانی نمی‌شود
+          const dstHost = parsed.address;
+          const dstPort = parsed.port;
+
           const isDns =
             dstPort === 53 ||
             dstHost === '1.1.1.1' ||
@@ -684,58 +674,83 @@ async function handleVlessWebSocket(request, env, ctx) {
             dstHost === 'dns.google' ||
             dstHost === 'dns.google.com';
 
-          if (isDns) {
-            dstHost = ADGUARD_DNS_HOST;
-            dstPort = ADGUARD_DNS_PORT;
-            try {
-              remoteSocket = connect({ hostname: dstHost, port: dstPort });
-              remoteWriter = remoteSocket.writable.getWriter();
-              const reader = remoteSocket.readable.getReader();
-              sendResponse();
-
-              if (parsed.rest && parsed.rest.byteLength > 0) {
-                // ساده‌سازی: داده UDP را مستقیم می‌فرستیم
-                await remoteWriter.write(new Uint8Array(parsed.rest));
-              }
-
-              (async () => {
-                try {
-                  while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    if (value && value.byteLength) {
-                      try {
-                        server.send(value);
-                      } catch {
-                        return safeClose('ws send fail');
-                      }
-                    }
-                  }
-                } catch {}
-                safeClose();
-              })();
-              return;
-            } catch {
-              sendResponse();
-              return safeClose('udp dns fail');
-            }
+          if (!isDns) {
+            // بدون دست زدن به D1 و بدون join → فقط تأخیر + بستن
+            return delayedClose('udp not supported', UDP_REJECT_DELAY_MS);
           }
 
-          // UDP غیر DNS
-          sendResponse();
-          return safeClose('udp not supported');
+          // فقط DNS را قبول می‌کنیم → حالا محدودیت IP را چک کن
+          const acquire = await tryAcquireIp(
+            envRef,
+            userId,
+            clientIP,
+            currentConfig.ipLimit || 1
+          );
+          if (!acquire.ok) {
+            return delayedClose(acquire.reason || 'ip limit', 1500);
+          }
+
+          joined = true;
+          activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
+
+          // DNS → AdGuard
+          try {
+            remoteSocket = connect({ hostname: ADGUARD_DNS_HOST, port: ADGUARD_DNS_PORT });
+            remoteWriter = remoteSocket.writable.getWriter();
+            const reader = remoteSocket.readable.getReader();
+            sendResponse();
+
+            if (parsed.rest && parsed.rest.byteLength > 0) {
+              await remoteWriter.write(new Uint8Array(parsed.rest));
+            }
+
+            (async () => {
+              try {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  if (value && value.byteLength) {
+                    try { server.send(value); } catch { return safeClose('ws send fail'); }
+                  }
+                }
+              } catch {}
+              safeClose();
+            })();
+            return;
+          } catch {
+            return delayedClose('udp dns fail', 1000);
+          }
         }
 
-        // ---------- فقط TCP ----------
+        // ---------- فقط TCP از اینجا به بعد ----------
         if (parsed.cmd !== 1) {
-          sendResponse();
-          return safeClose('only TCP');
+          return delayedClose('only TCP', 2000);
         }
+
+        // محدودیت IP (فقط برای TCP واقعی)
+        const acquire = await tryAcquireIp(
+          envRef,
+          userId,
+          clientIP,
+          currentConfig.ipLimit || 1
+        );
+        if (!acquire.ok) {
+          return delayedClose(acquire.reason || 'ip limit', 2000);
+        }
+
+        joined = true;
+        activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
+        limiter = getLimiter(userUuid, currentConfig.speedLimitKBps || 0);
+
+        let dstHost = parsed.address;
+        let dstPort = parsed.port;
 
         // بلاک تبلیغات
         if (currentConfig.blockAds && (await isAdHost(dstHost))) {
-          sendResponse();
-          return safeClose('ad blocked');
+          // IP را قبلاً ثبت کردیم → باید پاک کنیم چون واقعاً استفاده نشد
+          dbClearIp(envRef, userId, clientIP).catch(() => {});
+          joined = false; // تا در safeClose دوباره پاک نکند
+          return delayedClose('ad blocked', 2500);
         }
 
         // DNS روی پورت ۵۳ → AdGuard
@@ -767,11 +782,7 @@ async function handleVlessWebSocket(request, env, ctx) {
                   await limiter.take(value.byteLength);
                   bytesDown += value.byteLength;
                   sessionBytes += value.byteLength;
-                  try {
-                    server.send(value);
-                  } catch {
-                    return safeClose('ws send fail');
-                  }
+                  try { server.send(value); } catch { return safeClose('ws send fail'); }
                 }
               }
             } catch {}
@@ -783,6 +794,7 @@ async function handleVlessWebSocket(request, env, ctx) {
         return;
       }
 
+      // داده‌های بعدی (بعد از header)
       if (remoteWriter && data.byteLength > 0) {
         maybeAccumulate();
         await limiter.take(data.byteLength);
@@ -830,6 +842,62 @@ async function serveStatusPage(request, id) {
     );
   }
 }
+
+
+async function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** چک + ثبت IP به صورت نسبتاً امن‌تر و با یک بار نوشتن */
+async function tryAcquireIp(env, userId, ip, limit) {
+  if (!env?.DB || !userId || !ip) return { ok: false, reason: 'no-db' };
+  try {
+    await ensureDb(env);
+    const now = Date.now();
+    const cutoff = now - IP_IDLE_MS;
+
+    // پاک‌سازی قدیمی‌ها فقط برای این یوزر
+    await env.DB.prepare(
+      `DELETE FROM node_active_ips WHERE user_id = ? AND last_seen < ?`
+    ).bind(userId, cutoff).run();
+
+    // آیا همین IP از قبل هست؟
+    const exists = await env.DB.prepare(
+      `SELECT 1 AS x FROM node_active_ips WHERE user_id = ? AND ip = ?`
+    ).bind(userId, String(ip)).first();
+
+    if (exists) {
+      // فقط last_seen را آپدیت کن
+      await env.DB.prepare(
+        `UPDATE node_active_ips SET last_seen = ? WHERE user_id = ? AND ip = ?`
+      ).bind(now, userId, String(ip)).run();
+      return { ok: true, already: true };
+    }
+
+    // شمارش فعلی
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM node_active_ips WHERE user_id = ?`
+    ).bind(userId).first();
+    const current = Number(row?.c) || 0;
+
+    if (current >= limit) {
+      return { ok: false, reason: 'ip limit' };
+    }
+
+    // ثبت جدید
+    await env.DB.prepare(
+      `INSERT INTO node_active_ips (user_id, ip, last_seen) VALUES (?, ?, ?)`
+    ).bind(userId, String(ip), now).run();
+
+    return { ok: true, already: false };
+  } catch (e) {
+    console.log('tryAcquireIp:', e?.message);
+    // در صورت خطای D1، اجازه بده (یا false کن اگر سخت‌گیر هستی)
+    return { ok: true, already: false, fallback: true };
+  }
+}
+
+
 
 // ====================== Main ======================
 export default {
