@@ -243,8 +243,8 @@
 
 // END OF MAP
 // ================================================================================
-const VERSION = "mother-bot-3.6-push";
-const BOT_VERSION = "3.8.1-push";
+const VERSION = "mother-bot-3.7-push";
+const BOT_VERSION = "3.8.7-push";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
 const CHILD_WORKER_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/childWorker.js";
@@ -1998,8 +1998,37 @@ async function handleCallback(cq, env) {
   const userId = cq.from.id;
   const admin = isAdmin(userId, env);
 
+  console.log("CALLBACK:", { data, userId, admin, ADMIN_IDS: env.ADMIN_IDS });
+
+  // اول باید answer را صدا بزنی
   await answer(cq.id, "", env);
 
+  // ---------- Nodes (بعد از answer) ----------
+  if (data === "nodes_manage") {
+    console.log("ENTERED nodes_manage");
+    try {
+      return await showNodesManage(chatId, env, msgId);
+    } catch (e) {
+      console.error("showNodesManage CRASH:", e?.message || e, e?.stack);
+      return edit(chatId, msgId, `❌ خطا در مدیریت نودها:\n<code>${escape(String(e?.message || e))}</code>`, env, [
+        [{ text: "🔙 منو", callback_data: "main" }],
+      ]);
+    }
+  }
+
+  if (data === "nodes") {
+    console.log("ENTERED nodes");
+    try {
+      return await showNodes(chatId, env, msgId);
+    } catch (e) {
+      console.error("showNodes CRASH:", e?.message || e);
+      return edit(chatId, msgId, `❌ خطا:\n<code>${escape(String(e?.message || e))}</code>`, env, [
+        [{ text: "🔙", callback_data: "nodes_manage" }],
+      ]);
+    }
+  }
+
+  // از اینجا به بعد بقیه کد قبلی‌ات (user_home و ... و if (!admin) return; و بقیه)
   if (data === "user_home") return showUserHome(chatId, env, msgId);
 
   if (data === "user_buy") {
@@ -2863,9 +2892,10 @@ async function showNodesManage(chatId, env, msgId = null) {
 
     const text =
       `🖥 <b>مدیریت نودها (Push Mode)</b>\n\n` +
-      `🟢 آنلاین (آخرین همگام‌سازی < ۱۵ دقیقه): ${alive.length}\n` +
-      `📦 ثبت‌شده: ${managed.length}\n\n` +
-      `از این بخش نودها را مدیریت کنید.\nهمگام‌سازی هر دقیقه توسط مادر انجام می‌شود.`;
+      `🟢 آنلاین (آخرین همگام‌سازی کمتر از ۱۵ دقیقه): <b>${alive.length}</b>\n` +
+      `📦 ثبت‌شده: <b>${managed.length}</b>\n\n` +
+      `از این بخش نودها را مدیریت کنید.\n` +
+      `همگام‌سازی هر دقیقه توسط مادر انجام می‌شود.`;
 
     const kb = [
       [{ text: "📊 وضعیت / حذف / آپدیت نودها", callback_data: "nodes" }],
@@ -4247,35 +4277,80 @@ async function cfFetch(path, token, options = {}) {
   return res.json();
 }
 
+const TG_MAX_LEN = 4000; // کمی کمتر از 4096 برای حاشیه امن
+
+function truncateTg(text) {
+  const s = String(text || "");
+  if (s.length <= TG_MAX_LEN) return s;
+  return s.slice(0, TG_MAX_LEN - 30) + "\n\n… (متن کوتاه شد)";
+}
+
 async function send(chatId, text, env, keyboard = null, forceReply = false) {
   const body = {
     chat_id: chatId,
-    text,
+    text: truncateTg(text),
     parse_mode: "HTML",
     disable_web_page_preview: true,
   };
   if (forceReply) body.reply_markup = { force_reply: true, selective: true };
   else if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
-  await fetch(`${TG}/bot${env.BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+
+  try {
+    const res = await fetch(`${TG}/bot${env.BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      console.error("sendMessage FAILED:", JSON.stringify(data));
+      // اگر HTML خراب بود، بدون parse_mode یک‌بار دیگر تلاش کن
+      if (String(data.description || "").includes("parse")) {
+        const body2 = { ...body, parse_mode: undefined, text: truncateTg(text.replace(/<[^>]+>/g, "")) };
+        await fetch(`${TG}/bot${env.BOT_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body2),
+        });
+      }
+    }
+  } catch (e) {
+    console.error("send exception:", e?.message || e);
+  }
 }
+
 async function edit(chatId, msgId, text, env, keyboard = null) {
+  const safeText = truncateTg(text);
   const body = {
     chat_id: chatId,
     message_id: msgId,
-    text,
+    text: safeText,
     parse_mode: "HTML",
     disable_web_page_preview: true,
   };
   if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
-  await fetch(`${TG}/bot${env.BOT_TOKEN}/editMessageText`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+
+  try {
+    const res = await fetch(`${TG}/bot${env.BOT_TOKEN}/editMessageText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+
+    if (!data.ok) {
+      const desc = data.description || "";
+      console.error("editMessageText FAILED:", JSON.stringify(data));
+
+      if (desc.includes("message is not modified")) return;
+
+      // پیام خیلی بلند یا خطای دیگر → پیام جدید (از قبل truncate شده)
+      await send(chatId, safeText, env, keyboard);
+    }
+  } catch (e) {
+    console.error("edit exception:", e?.message || e);
+    await send(chatId, safeText, env, keyboard);
+  }
 }
 async function answer(id, text, env, alert = false) {
   await fetch(`${TG}/bot${env.BOT_TOKEN}/answerCallbackQuery`, {
