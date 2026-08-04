@@ -1,9 +1,10 @@
 // child-worker.js — v4.3-push (Push + D1 full state exchange)
 // فرزند ساکت است. فقط به POST /sync پاسخ می‌دهد.
 // کاربران، IPهای فعال و مصرف همگی در D1 ذخیره می‌شوند تا بین isolateها از دست نروند.
+
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-4.7-push';
+const VERSION = 'saow-node-4.7.1-push';
 const API_SECRET = 'saow-pan2';
 let MOTHER_URL = null;
 
@@ -562,258 +563,202 @@ async function handleSync(request, env) {
   });
 }
 
-// ====================== VLESS WebSocket ======================
+// ====================== VLESS WebSocket (بهبود یافته) ======================
 async function handleVlessWebSocket(request, env, ctx) {
   if ((request.headers.get('Upgrade') || '').toLowerCase() !== 'websocket') {
     return new Response('Expected Upgrade: websocket', { status: 426 });
   }
 
   await ensureUsersLoaded(env);
-
-  if (nodeDisabled) {
-    return new Response('Node disabled by mother', { status: 503 });
-  }
+  if (nodeDisabled) return new Response('Node disabled', { status: 503 });
 
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
-  server.accept();
+
+  // ===== دو خط حیاتی =====
+  server.binaryType = 'arraybuffer';
+  server.accept({ allowHalfOpen: true });
 
   const envRef = env;
-  let remoteSocket = null;
-  let remoteWriter = null;
-  let headerParsed = false;
+  const clientIP = getClientIP(request);
+
   let closed = false;
   let joined = false;
+  let userUuid = null;
+  let userId = null;
   let bytesUp = 0;
   let bytesDown = 0;
   let sessionBytes = 0;
-  let lastReportedLocal = 0;
-  let userUuid = null;
-  let userId = null;
-  let clientIP = getClientIP(request);
-  let limiter = { enabled: false, async take() {} };
+  let lastReported = 0;
+  let remoteSocket = null;
+  let remoteWriter = null;   // یک writer برای کل عمر اتصال نگه می‌داریم
 
   const flushUsage = () => {
-    if (userId && bytesUp + bytesDown > 0) {
-      const up = bytesUp;
-      const down = bytesDown;
-      bytesUp = 0;
-      bytesDown = 0;
-      dbAddUsage(envRef, userId, up, down).catch(() => {});
-    }
+    if (!userId || bytesUp + bytesDown === 0) return;
+    const u = bytesUp, d = bytesDown;
+    bytesUp = 0;
+    bytesDown = 0;
+    ctx.waitUntil(dbAddUsage(envRef, userId, u, d).catch(() => {}));
   };
 
   const safeClose = (reason = '') => {
     if (closed) return;
     closed = true;
-    if (reason) console.log('WS close:', reason, userUuid || '');
-
     if (userUuid && joined) {
       activeConns.set(userUuid, Math.max(0, (activeConns.get(userUuid) || 1) - 1));
       if (userId) {
         flushUsage();
-        dbClearIp(envRef, userId, clientIP).catch(() => {});
+        ctx.waitUntil(dbClearIp(envRef, userId, clientIP).catch(() => {}));
       }
     }
-
-    try { server.close(1000, reason); } catch {}
-    try { remoteWriter?.close(); } catch {}
+    try { remoteWriter?.releaseLock(); } catch {}
     try { remoteSocket?.close(); } catch {}
-  };
-
-  const sendResponse = () => {
-    try { server.send(new Uint8Array([0x00, 0x00])); } catch {}
-  };
-
-  /** بستن با تأخیر خیلی کوتاه (فقط برای ip limit / ad / only TCP) */
-  const delayedClose = async (reason, delayMs = SOFT_REJECT_DELAY_MS) => {
-    try { sendResponse(); } catch {}
-    if (delayMs > 0) await sleep(delayMs);
-    safeClose(reason);
-  };
-
-  const maybeAccumulate = () => {
-    if (sessionBytes - lastReportedLocal < REPORT_THRESHOLD) return;
-    flushUsage();
-    lastReportedLocal = sessionBytes;
-  };
-
-  server.addEventListener('message', async (event) => {
     try {
-      let data = event.data;
-      if (data instanceof Blob) data = await data.arrayBuffer();
-      if (typeof data === 'string') data = new TextEncoder().encode(data).buffer;
-      if (!(data instanceof ArrayBuffer)) data = new Uint8Array(data).buffer;
+      if (server.readyState === 1 || server.readyState === 2) server.close(1000, reason);
+    } catch {}
+  };
 
-      if (!headerParsed) {
-        const parsed = parseVlessHeader(data);
-        if (!parsed.ok) return safeClose('bad header');
-        headerParsed = true;
-        userUuid = parsed.uuid.toLowerCase();
+  // early data (0-RTT)
+  const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+  let earlyData = null;
+  if (earlyDataHeader) {
+    try {
+      const b64 = earlyDataHeader.replace(/-/g, '+').replace(/_/g, '/');
+      const bin = atob(b64);
+      earlyData = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    } catch {}
+  }
 
-        if (nodeDisabled) return safeClose('node disabled');
+  // ---------- پردازش یک chunk (هدر یا داده) ----------
+  const processChunk = async (chunk) => {
+    if (closed || !(chunk instanceof Uint8Array) || chunk.byteLength === 0) return;
 
-        const currentConfig = getUserByUuid(userUuid);
-        if (!currentConfig) return safeClose('user not found or disabled');
+    // هنوز هدر پارس نشده
+    if (!remoteSocket) {
+      const buf = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+      const parsed = parseVlessHeader(buf);
+      if (!parsed.ok) return safeClose('bad header');
 
-        userId = currentConfig.id;
+      userUuid = parsed.uuid.toLowerCase();
+      const cfg = getUserByUuid(userUuid);
+      if (!cfg) return safeClose('user not found');
 
-        // ---------- UDP (cmd = 2) ----------
-        if (parsed.cmd === 2) {
-          const dstHost = parsed.address;
-          const dstPort = parsed.port;
+      userId = cfg.id;
 
-          const isDns =
-            dstPort === 53 ||
-            dstHost === '1.1.1.1' ||
-            dstHost === '1.0.0.1' ||
-            dstHost === '8.8.8.8' ||
-            dstHost === '8.8.4.4' ||
-            dstHost === 'dns.google' ||
-            dstHost === 'dns.google.com';
-
-          if (!isDns) {
-            // فوری ببند — بدون D1 و بدون sleep
-            sendResponse();
-            return safeClose('udp not supported');
-          }
-
-          // فقط DNS → محدودیت IP
-          const acquire = await tryAcquireIp(
-            envRef,
-            userId,
-            clientIP,
-            currentConfig.ipLimit || 1
-          );
-          if (!acquire.ok) {
-            return delayedClose(acquire.reason || 'ip limit', SOFT_REJECT_DELAY_MS);
-          }
-
-          joined = true;
-          activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
-
-          // DNS → AdGuard
-          try {
-            remoteSocket = connect({ hostname: ADGUARD_DNS_HOST, port: ADGUARD_DNS_PORT });
-            remoteWriter = remoteSocket.writable.getWriter();
-            const reader = remoteSocket.readable.getReader();
-            sendResponse();
-
-            if (parsed.rest && parsed.rest.byteLength > 0) {
-              await remoteWriter.write(new Uint8Array(parsed.rest));
-            }
-
-            (async () => {
-              try {
-                while (true) {
-                  const { done, value } = await reader.read();
-                  if (done) break;
-                  if (value && value.byteLength) {
-                    try { server.send(value); } catch { return safeClose('ws send fail'); }
-                  }
-                }
-              } catch {}
-              safeClose();
-            })();
-            return;
-          } catch {
-            // اگر وصل نشد، IP را آزاد کن
-            dbClearIp(envRef, userId, clientIP).catch(() => {});
-            joined = false;
-            return delayedClose('udp dns fail', SOFT_REJECT_DELAY_MS);
-          }
-        }
-
-        // ---------- فقط TCP ----------
-        if (parsed.cmd !== 1) {
-          return delayedClose('only TCP', SOFT_REJECT_DELAY_MS);
-        }
-
-        // محدودیت IP
-        const acquire = await tryAcquireIp(
-          envRef,
-          userId,
-          clientIP,
-          currentConfig.ipLimit || 1
-        );
-        if (!acquire.ok) {
-          return delayedClose(acquire.reason || 'ip limit', SOFT_REJECT_DELAY_MS);
-        }
-
-        joined = true;
-        activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
-        limiter = getLimiter(userUuid, currentConfig.speedLimitKBps || 0);
-
-        let dstHost = parsed.address;
-        let dstPort = parsed.port;
-
-        // بلاک تبلیغات
-        if (currentConfig.blockAds && (await isAdHost(dstHost))) {
-          dbClearIp(envRef, userId, clientIP).catch(() => {});
-          joined = false;
-          return delayedClose('ad blocked', SOFT_REJECT_DELAY_MS);
-        }
-
-        // DNS روی پورت ۵۳ → AdGuard
-        if (dstPort === 53) {
-          dstHost = ADGUARD_DNS_HOST;
-          dstPort = ADGUARD_DNS_PORT;
-        }
-
-        try {
-          remoteSocket = connect({ hostname: dstHost, port: dstPort });
-          remoteWriter = remoteSocket.writable.getWriter();
-          const reader = remoteSocket.readable.getReader();
-          sendResponse();
-
-          if (parsed.rest && parsed.rest.byteLength > 0) {
-            await limiter.take(parsed.rest.byteLength);
-            bytesUp += parsed.rest.byteLength;
-            sessionBytes += parsed.rest.byteLength;
-            await remoteWriter.write(new Uint8Array(parsed.rest));
-          }
-
-          (async () => {
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                if (value && value.byteLength) {
-                  maybeAccumulate();
-                  await limiter.take(value.byteLength);
-                  bytesDown += value.byteLength;
-                  sessionBytes += value.byteLength;
-                  try { server.send(value); } catch { return safeClose('ws send fail'); }
-                }
-              }
-            } catch {}
-            safeClose();
-          })();
-        } catch {
-          safeClose('connect fail');
-        }
-        return;
+      // فقط TCP
+      if (parsed.cmd !== 1) {
+        try { server.send(new Uint8Array([0, 0])); } catch {}
+        return safeClose('only TCP');
       }
 
-      // داده‌های بعدی (بعد از header)
-      if (remoteWriter && data.byteLength > 0) {
-        maybeAccumulate();
-        await limiter.take(data.byteLength);
-        bytesUp += data.byteLength;
-        sessionBytes += data.byteLength;
-        await remoteWriter.write(new Uint8Array(data));
+      // IP limit (فقط یک بار در شروع)
+      const acq = await tryAcquireIp(envRef, userId, clientIP, cfg.ipLimit || 1);
+      if (!acq.ok) {
+        try { server.send(new Uint8Array([0, 0])); } catch {}
+        await sleep(SOFT_REJECT_DELAY_MS);
+        return safeClose('ip limit');
       }
+      joined = true;
+      activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
+
+      let host = parsed.address;
+      let port = parsed.port;
+
+      // adblock فقط در شروع
+      if (cfg.blockAds && (await isAdHost(host))) {
+        ctx.waitUntil(dbClearIp(envRef, userId, clientIP).catch(() => {}));
+        joined = false;
+        try { server.send(new Uint8Array([0, 0])); } catch {}
+        await sleep(SOFT_REJECT_DELAY_MS);
+        return safeClose('ad blocked');
+      }
+
+      if (port === 53) {
+        host = ADGUARD_DNS_HOST;
+        port = ADGUARD_DNS_PORT;
+      }
+
+      try {
+        remoteSocket = connect({ hostname: host, port });
+        remoteWriter = remoteSocket.writable.getWriter(); // یک بار می‌گیریم و نگه می‌داریم
+
+        // پاسخ VLESS
+        try { server.send(new Uint8Array([0, 0])); } catch {}
+
+        // دادهٔ اولیه
+        if (parsed.rest && parsed.rest.byteLength > 0) {
+          const first = new Uint8Array(parsed.rest);
+          bytesUp += first.byteLength;
+          sessionBytes += first.byteLength;
+          await remoteWriter.write(first);
+        }
+
+        // remote → client (pipeTo — بهترین backpressure)
+        remoteSocket.readable
+          .pipeTo(
+            new WritableStream({
+              write(remoteChunk) {
+                if (server.readyState !== 1) return;
+                bytesDown += remoteChunk.byteLength;
+                sessionBytes += remoteChunk.byteLength;
+                if (sessionBytes - lastReported >= REPORT_THRESHOLD) {
+                  flushUsage();
+                  lastReported = sessionBytes;
+                }
+                try {
+                  server.send(remoteChunk);
+                } catch {
+                  safeClose('ws send fail');
+                }
+              },
+              close() { safeClose('remote closed'); },
+              abort() { safeClose('remote abort'); },
+            })
+          )
+          .catch(() => safeClose('remote pipe'));
+      } catch {
+        return safeClose('connect fail');
+      }
+      return;
+    }
+
+    // دادهٔ بعدی (آپلود) — بدون rate-limit و بدون D1
+    try {
+      bytesUp += chunk.byteLength;
+      sessionBytes += chunk.byteLength;
+      if (sessionBytes - lastReported >= REPORT_THRESHOLD) {
+        flushUsage();
+        lastReported = sessionBytes;
+      }
+      await remoteWriter.write(chunk);
     } catch {
-      safeClose();
+      safeClose('write fail');
+    }
+  };
+
+  // ---------- دریافت از کلاینت ----------
+  server.addEventListener('message', (ev) => {
+    let data = ev.data;
+    // با binaryType=arraybuffer باید ArrayBuffer باشد
+    if (data instanceof ArrayBuffer) {
+      processChunk(new Uint8Array(data)).catch(() => safeClose());
+    } else if (data instanceof Blob) {
+      data.arrayBuffer().then((b) => processChunk(new Uint8Array(b))).catch(() => safeClose());
+    } else if (typeof data === 'string') {
+      processChunk(new TextEncoder().encode(data)).catch(() => safeClose());
     }
   });
 
   server.addEventListener('close', () => safeClose());
   server.addEventListener('error', () => safeClose());
 
+  // early data را بعد از accept پردازش کن
+  if (earlyData && earlyData.byteLength > 0) {
+    ctx.waitUntil(processChunk(earlyData).catch(() => {}));
+  }
+
   return new Response(null, { status: 101, webSocket: client });
 }
-
 // ====================== Status ======================
 async function serveStatusPage(request, id) {
   try {
@@ -910,6 +855,8 @@ async function tryAcquireIp(env, userId, ip, limit) {
 // ====================== Main ======================
 export default {
   async fetch(request, env, ctx) {
+    if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || "";
+
     _env = env;
     if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || '';
 
