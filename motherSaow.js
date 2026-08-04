@@ -243,20 +243,20 @@
 
 // END OF MAP
 // ================================================================================
-const VERSION = "mother-bot-3.5";
-const BOT_VERSION = "3.7.1";
+const VERSION = "mother-bot-3.6-push";
+const BOT_VERSION = "3.8.0-push";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
 const CHILD_WORKER_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/childWorker.js";
-const MOTHER_CODE_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/motherSaow.js"; // یا همین فایل
+const MOTHER_CODE_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/motherSaow.js";
 const CF_TOKEN_URL = "https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22user_details%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Saow%20Installer";
 const STATUS_HTML_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/master-status.html";
 
 const API_ROOT = "/api";
 const SUB_PATH = "/pull";
-const NODE_TTL = 15 * 60 * 1000;
-const IP_IDLE_MS = 5 * 60 * 1000;   // ۵ دقیقه
-const API_SECRET = "saow-pan2"; // برای گزارش نودهای بچه
+const NODE_TTL = 15 * 60 * 1000; // ۱۵ دقیقه بدون پاسخ → آفلاین
+const IP_IDLE_MS = 5 * 60 * 1000;
+const API_SECRET = "saow-pan2";
 
 // ====================== Main Entry ======================
 export default {
@@ -265,7 +265,6 @@ export default {
       const url = new URL(request.url);
       const path = url.pathname;
 
-      // Telegram Webhook
       if (request.method === "POST" && (path === "/" || path === "/webhook")) {
         const update = await request.json();
         env._SELF_URL = url.origin;
@@ -273,7 +272,6 @@ export default {
         return new Response("OK");
       }
 
-      // Manual setWebhook helper
       if (request.method === "GET" && path === "/setwebhook") {
         const target = url.searchParams.get("url") || url.origin;
         const res = await fetch(`${TG}/bot${env.BOT_TOKEN}/setWebhook`, {
@@ -288,51 +286,45 @@ export default {
         return new Response(await res.text(), { status: res.status });
       }
 
-      // API for child nodes (heartbeat / connect / usage)
       if (path.startsWith(API_ROOT)) {
         return handleApi(request, env, path.slice(API_ROOT.length) || "/");
       }
 
-      // Subscription
-    if (path === SUB_PATH || path === SUB_PATH + "/") {
+      if (path === SUB_PATH || path === SUB_PATH + "/") {
         const token = url.searchParams.get("token") || "";
         if (!token) return new Response("token required", { status: 401 });
 
         const user = await getUserByUuid(env, token);
         if (!user) return new Response("invalid", { status: 404 });
 
-        // تشخیص مرورگر در مقابل کلاینت‌های پروکسی
         const ua = (request.headers.get("user-agent") || "").toLowerCase();
         const accept = (request.headers.get("accept") || "").toLowerCase();
         const isBrowser =
-            accept.includes("text/html") ||
-            /mozilla|chrome|safari|firefox|edge|opera|samsung/i.test(ua);
+          accept.includes("text/html") ||
+          /mozilla|chrome|safari|firefox|edge|opera|samsung/i.test(ua);
 
         if (isBrowser) {
-            // صفحه زیبا برای مرورگر
-            return serveSubPage(request, env, user, url);
+          return serveSubPage(request, env, user, url);
         }
 
-        // کلاینت‌های معمولی → متن سابسکریپشن
         ctx.waitUntil(ensureDomainsList());
         ctx.waitUntil(ensureIrcfResolved());
         const body = await generateSubscription(env, user, url.hostname);
         return new Response(body, {
-            headers: {
+          headers: {
             "content-type": "text/plain; charset=utf-8",
             "cache-control": "no-store",
             "profile-update-interval": "6",
-            },
+          },
         });
-        }
+      }
 
       if (path === "/") {
         return serveStatusPage(request, env);
       }
 
-        // /version همچنان JSON
       if (path === "/version") {
-        return json({ v: VERSION, r: "core+bot" });
+        return json({ v: VERSION, r: "core+bot+push" });
       }
 
       return new Response("Not Found", { status: 404 });
@@ -341,7 +333,172 @@ export default {
       return new Response("Error", { status: 500 });
     }
   },
+
+  // Cron Trigger: هر دقیقه یک Full Sync کامل
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(fullSyncAll(env));
+  },
 };
+
+// ====================== Push + State Exchange ======================
+
+/**
+ * همگام‌سازی کامل با همه نودهای مدیریت‌شده
+ * فقط مادر درخواست می‌زند. فرزند هیچ‌وقت شروع‌کننده نیست.
+ */
+async function fullSyncAll(env) {
+  if (!(await d1Ready(env))) return;
+  try {
+    const managed = await getManagedNodes(env);
+    if (!managed.length) return;
+
+    // موازی اما با محدودیت ساده برای جلوگیری از overload
+    const results = await Promise.allSettled(
+      managed.map((node) => syncWithChild(env, node))
+    );
+
+    let ok = 0;
+    for (const r of results) if (r.status === "fulfilled" && r.value) ok++;
+    console.log(`fullSyncAll: ${ok}/${managed.length} success`);
+  } catch (e) {
+    console.error("fullSyncAll error", e?.message);
+  }
+}
+
+/**
+ * یک نود خاص را همگام می‌کند.
+ * مادر → POST /sync به فرزند
+ * فرزند در همان پاسخ گزارش کامل می‌دهد.
+ */
+async function syncWithChild(env, node) {
+  if (!node?.url) return false;
+
+  try {
+    const users = await getUsers(env);
+    const payload = {
+      type: "full_sync",
+      timestamp: Date.now(),
+      mother_version: VERSION,
+      users: users.map((u) => ({
+        id: u.id,
+        uuid: u.uuid,
+        name: u.name,
+        enabled: !!u.enabled,
+        expiry: u.expiry || null,
+        quotaBytes: u.quotaBytes || 0,
+        dailyQuotaBytes: u.dailyQuotaBytes || 0,
+        speedLimitKBps: u.speedLimitKBps || 0,
+        ipLimit: u.ipLimit || 1,
+        blockAds: !!u.blockAds,
+      })),
+      node: {
+        disabled: node.is_disabled === 1,
+        script_name: node.script_name,
+      },
+    };
+
+    const target = String(node.url).replace(/\/$/, "") + "/sync";
+    const res = await fetch(target, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${API_SECRET}`,
+        "X-Mother-Secret": API_SECRET,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      console.log(`sync fail ${node.script_name}: HTTP ${res.status}`);
+      return false;
+    }
+
+    const report = await res.json();
+    if (!report || report.ok === false) {
+      console.log(`sync reject ${node.script_name}:`, report?.reason || "no ok");
+      return false;
+    }
+
+    await processChildReport(env, node, report);
+    return true;
+  } catch (e) {
+    console.log(`syncWithChild ${node.script_name}:`, e?.message);
+    return false;
+  }
+}
+
+/**
+ * پردازش گزارش دریافتی از فرزند در پاسخ همان درخواست
+ */
+async function processChildReport(env, node, report) {
+  if (!(await d1Ready(env))) return;
+  const now = Date.now();
+  const childId = report.child_id || node.script_name || node.id;
+
+  // به‌روزرسانی حضور نود
+  try {
+    await env.DB.prepare(`
+      INSERT INTO children (id, url, version, capacity, last_seen, active_users, healthy, meta)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        url = CASE WHEN excluded.url != '' THEN excluded.url ELSE children.url END,
+        version = excluded.version,
+        capacity = excluded.capacity,
+        last_seen = excluded.last_seen,
+        active_users = excluded.active_users,
+        healthy = 1,
+        meta = excluded.meta
+    `).bind(
+      childId,
+      node.url || "",
+      report.version || "",
+      report.capacity ?? 50,
+      now,
+      report.active_users ?? 0,
+      JSON.stringify(report.meta || {})
+    ).run();
+  } catch (e) {
+    console.log("processChildReport children:", e?.message);
+  }
+
+  // مصرف (دلتا از آخرین sync)
+  if (Array.isArray(report.usage)) {
+    for (const u of report.usage) {
+      const uid = u.user_id || u.id;
+      const up = Number(u.up) || 0;
+      const down = Number(u.down) || 0;
+      if (uid && up + down > 0) {
+        await addUsage(env, uid, up, down);
+      }
+    }
+  }
+
+  // IPهای فعال گزارش‌شده توسط این نود
+  if (Array.isArray(report.active_ips)) {
+    for (const entry of report.active_ips) {
+      const uid = entry.user_id || entry.id;
+      if (!uid) continue;
+      const ips = Array.isArray(entry.ips) ? entry.ips : [];
+      for (const ip of ips) {
+        if (!ip) continue;
+        try {
+          await env.DB.prepare(`
+            INSERT INTO active_ips (user_id, ip, last_seen, child_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, ip) DO UPDATE SET
+              last_seen = excluded.last_seen,
+              child_id = excluded.child_id
+          `).bind(uid, String(ip), now, childId).run();
+        } catch {}
+      }
+    }
+  }
+}
+
+/** فراخوانی همگام‌سازی پس از تغییرات مدیریتی (بدون مسدود کردن پاسخ تلگرام) */
+function triggerSync(env) {
+  fullSyncAll(env).catch((e) => console.log("triggerSync:", e?.message));
+}
 
 // ====================== Telegram Handlers ======================
 
@@ -355,10 +512,11 @@ async function purgeUnknownChildren(env) {
     const rows = allChildren.results || [];
 
     for (const c of rows) {
-      const isKnown = managed.some(m =>
-        c.id?.includes(m.script_name) ||
-        (m.url && c.id?.includes(String(m.script_name || "").replace(/-/g, ""))) ||
-        (m.script_name && c.url?.includes(m.script_name))
+      const isKnown = managed.some(
+        (m) =>
+          c.id?.includes(m.script_name) ||
+          (m.url && c.id?.includes(String(m.script_name || "").replace(/-/g, ""))) ||
+          (m.script_name && c.url?.includes(m.script_name))
       );
       if (!isKnown) {
         await env.DB.prepare("DELETE FROM children WHERE id = ?").bind(c.id).run();
@@ -369,16 +527,16 @@ async function purgeUnknownChildren(env) {
   }
 }
 
-
 async function serveSubPage(request, env, user, url) {
   const full = await buildFullUser(env, user);
-  const clientIP = request.headers.get("CF-Connecting-IP") || 
-                   request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || "—";
+  const clientIP =
+    request.headers.get("CF-Connecting-IP") ||
+    request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ||
+    "—";
   const country = request.cf?.country || "—";
 
-  // لینک‌های واقعی ساب
   const linksText = await generateSubscription(env, user, url.hostname);
-  const links = linksText.split("\n").filter(l => l.startsWith("vless://"));
+  const links = linksText.split("\n").filter((l) => l.startsWith("vless://"));
 
   const usedGB = full.usage?.totalGB || 0;
   const quotaGB = user.quotaBytes > 0 ? +(user.quotaBytes / 1073741824).toFixed(2) : 0;
@@ -401,7 +559,6 @@ async function serveSubPage(request, env, user, url) {
     subUrl: `${url.origin}/pull?token=${user.uuid}`,
   };
 
-  // لود کردن قالب از گیت‌هاب
   let html = "";
   try {
     const res = await fetch(
@@ -412,12 +569,10 @@ async function serveSubPage(request, env, user, url) {
   } catch {}
 
   if (!html) {
-    // fallback خیلی ساده
     html = `<!DOCTYPE html><html><body style="background:#05060f;color:#e2e8f0;font-family:sans-serif;padding:2rem">
       <h1>SAOW</h1><p>${full.status}</p><p>${usedGB} / ${quotaGB || "∞"} GB</p></body></html>`;
   }
 
-  // تزریق داده
   const inject = `<script>window.__SAOW_SUB__=${JSON.stringify(data)};</script>`;
   if (html.includes("</head>")) {
     html = html.replace("</head>", inject + "</head>");
@@ -434,7 +589,6 @@ async function serveSubPage(request, env, user, url) {
   });
 }
 
-
 async function toggleNodeStatus(chatId, nodeId, env, msgId) {
   await edit(chatId, msgId, "⏳ در حال تغییر وضعیت نود...", env);
 
@@ -446,41 +600,43 @@ async function toggleNodeStatus(chatId, nodeId, env, msgId) {
 
     const newDisabled = node.is_disabled === 1 ? 0 : 1;
 
-    // ۱. به‌روزرسانی پرچم قفل در جدول اصلی
     await env.DB.prepare("UPDATE managed_nodes SET is_disabled = ? WHERE id = ?")
       .bind(newDisabled, nodeId)
       .run();
 
-    // ۲. غیرفعال کردن فوری در جدول children (تغییر healthy و صفر کردن active_users)
-    await env.DB.prepare("UPDATE children SET healthy = ?, active_users = 0 WHERE id LIKE ? OR url LIKE ?")
+    // فوری وضعیت children را هم به‌روز کن
+    await env.DB.prepare(
+      "UPDATE children SET healthy = ?, active_users = 0 WHERE id LIKE ? OR url LIKE ?"
+    )
       .bind(newDisabled === 1 ? 0 : 1, `%${node.script_name}%`, `%${node.script_name}%`)
       .run();
 
-    const statusMsg = newDisabled === 1 
-      ? `🔒 نود <code>${escape(node.script_name)}</code> <b>کاملاً قفل و غیرفعال شد</b>.\n\n• تمام اتصال‌های جدید ریجکت خواهند شد.\n• لینک‌های سابسکریپشن به این نود متصل نمی‌شوند.`
-      : `🔓 نود <code>${escape(node.script_name)}</code> <b>آنلاک و فعال شد</b>.\n\n• دریافت هارت‌بیت و خروجی ساب به حالت عادی برگشت.`;
+    // فوری به خود نود هم بگو (اگر آنلاین باشد)
+    triggerSync(env);
+
+    const statusMsg =
+      newDisabled === 1
+        ? `🔒 نود <code>${escape(node.script_name)}</code> <b>کاملاً قفل و غیرفعال شد</b>.\n\n• تمام اتصال‌های جدید ریجکت خواهند شد.\n• لینک‌های سابسکریپشن به این نود متصل نمی‌شوند.`
+        : `🔓 نود <code>${escape(node.script_name)}</code> <b>آنلاک و فعال شد</b>.\n\n• همگام‌سازی و خروجی ساب به حالت عادی برگشت.`;
 
     return edit(chatId, msgId, statusMsg, env, [
       [{ text: "🔙 جزئیات نود", callback_data: `node_detail:${nodeId}` }],
-      [{ text: "🖥 لیست نودها", callback_data: "nodes" }]
+      [{ text: "🖥 لیست نودها", callback_data: "nodes" }],
     ]);
   } catch (err) {
     return edit(chatId, msgId, `❌ خطا در تغییر وضعیت:\n<code>${escape(err.message)}</code>`, env, [
-      [{ text: "🔙", callback_data: "nodes" }]
+      [{ text: "🔙", callback_data: "nodes" }],
     ]);
   }
 }
-
 
 function extractUuidFromText(text) {
   const raw = String(text || "").trim();
   if (!raw) return null;
 
-  // vless://UUID@...
   const m = raw.match(/^vless:\/\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})@/i);
   if (m) return m[1].toLowerCase();
 
-  // UUID خام
   const m2 = raw.match(/\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
   if (m2) return m2[1].toLowerCase();
 
@@ -504,7 +660,6 @@ async function findManagedNodeByText(text, env) {
     }
   } catch {}
 
-  // استخراج نام احتمالی از hostname: saow-child-40538.xxx.workers.dev
   const hostFirst = host ? host.split(".")[0] : "";
 
   for (const m of managed) {
@@ -523,16 +678,17 @@ async function findManagedNodeByText(text, env) {
 
 async function showNodeDetail(chatId, node, env, msgId = null) {
   const alive = await getHealthyChildren(env);
-  const live = alive.find((a) =>
-    a.id.includes(node.script_name) ||
-    (node.url && a.url && a.url.includes(new URL(node.url).hostname)) ||
-    (node.url && a.id.includes(String(node.script_name || "").replace(/-/g, "")))
+  const live = alive.find(
+    (a) =>
+      a.id.includes(node.script_name) ||
+      (node.url && a.url && a.url.includes(new URL(node.url).hostname)) ||
+      (node.url && a.id.includes(String(node.script_name || "").replace(/-/g, "")))
   );
 
   const isOnline = !!live;
   const lastSeen = live?.lastSeen
     ? new Date(live.lastSeen).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })
-    : "هنوز آنلاین نشده";
+    : "هنوز همگام‌سازی نشده";
 
   const text =
     `${isOnline ? "🟢" : "🔴"} <b>جزئیات نود</b>\n\n` +
@@ -544,16 +700,14 @@ async function showNodeDetail(chatId, node, env, msgId = null) {
     `📦 نسخه: ${live?.version || "—"}\n` +
     `👥 فعال: ${live?.activeUsers ?? "—"}\n` +
     `📊 ظرفیت: ${live?.capacity ?? "—"}\n` +
-    `⏱ آخرین آنلاین: ${lastSeen}`;
+    `⏱ آخرین همگام‌سازی: ${lastSeen}`;
 
   const kb = [
     [
       { text: "♻️ نصب مجدد", callback_data: `update_child:${node.id}` },
       { text: "📈 اکانت", callback_data: `node_acc:${node.id}` },
     ],
-    [
-      { text: "🗑 حذف", callback_data: `del_node:${node.id}` },
-    ],
+    [{ text: "🗑 حذف", callback_data: `del_node:${node.id}` }],
     [
       { text: "🖥 همه نودها", callback_data: "nodes" },
       { text: "🔙 مدیریت", callback_data: "nodes_manage" },
@@ -605,13 +759,11 @@ async function showRenewPayInfo(chatId, tgUserId, panelUserId, planId, env, msgI
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
 
-
 async function showMyServiceDetail(chatId, tgUserId, panelUserId, env, msgId = null) {
   const user = await getUserById(env, panelUserId);
   if (!user) {
     return edit(chatId, msgId, "سرویس پیدا نشد.", env, [[{ text: "🔙", callback_data: "user_my_services" }]]);
   }
-  // امنیت: فقط صاحب
   const notes = String(user.notes || "");
   const name = String(user.name || "");
   const ok =
@@ -655,6 +807,8 @@ async function revokeUserUuid(chatId, tgUserId, panelUserId, env, msgId) {
 
   const newUuid = generateUuid();
   await upsertUser(env, { ...user, uuid: newUuid });
+  triggerSync(env);
+
   const base = (env.MOTHER_URL || env._SELF_URL || "").replace(/\/$/, "");
   const sub = `${base}/pull?token=${newUuid}`;
 
@@ -683,7 +837,6 @@ async function requestRenew(chatId, tgUserId, panelUserId, env, msgId) {
     ]);
   }
 
-  // state: تمدید این سرویس
   await setUserState(env, tgUserId, {
     step: "renew_select_plan",
     panelUserId,
@@ -753,9 +906,7 @@ async function showPendingOrders(chatId, env, msgId = null) {
     try {
       await edit(chatId, msgId, text, env, kb);
       return;
-    } catch (e) {
-      // پیام عکس بوده یا edit ممکن نیست
-    }
+    } catch (e) {}
   }
   return send(chatId, text, env, kb);
 }
@@ -766,7 +917,11 @@ async function setUserState(env, userId, data) {
 async function getUserState(env, userId) {
   const raw = await getShopSetting(env, `ustate:${userId}`, "");
   if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }
 async function clearUserState(env, userId) {
   await setShopSetting(env, `ustate:${userId}`, "");
@@ -777,11 +932,12 @@ async function showMyServices(chatId, tgUserId, env, msgId = null) {
   try {
     const r = await env.DB.prepare(
       "SELECT * FROM shop_orders WHERE user_id = ? AND status = 'approved' ORDER BY approved_at DESC"
-    ).bind(tgUserId).all();
+    )
+      .bind(tgUserId)
+      .all();
     orders = r.results || [];
   } catch {}
 
-  // اکانت‌های تست و shop که به این تلگرام‌آیدی وصل‌اند
   const allUsers = await getUsers(env);
   const linked = allUsers.filter((u) => {
     const n = String(u.name || "");
@@ -854,13 +1010,11 @@ async function showShopAdmin(chatId, env, msgId = null) {
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
 
-
 async function giveTestAccount(chatId, userId, env, msgId = null) {
   const cfg = await getShopConfig(env);
   if (!cfg.testEnabled) {
     return send(chatId, "اکانت تست فعلاً غیرفعال است.", env);
   }
-  // هر کاربر فقط یک‌بار
   const flag = await getShopSetting(env, `test_used:${userId}`, "0");
   if (flag === "1") {
     return send(chatId, "شما قبلاً اکانت تست دریافت کرده‌اید.", env);
@@ -872,11 +1026,21 @@ async function giveTestAccount(chatId, userId, env, msgId = null) {
   const quotaBytes = Math.floor(cfg.testQuotaMb * 1024 * 1024);
 
   await upsertUser(env, {
-    id, name: `test-${userId}`.slice(0, 32), uuid, enabled: true, expiry,
-    quotaBytes, dailyQuotaBytes: 0, speedLimitKBps: 0,
-    ipLimit: 1, cleanIp: "", blockAds: true, notes: "test-account",
+    id,
+    name: `test-${userId}`.slice(0, 32),
+    uuid,
+    enabled: true,
+    expiry,
+    quotaBytes,
+    dailyQuotaBytes: 0,
+    speedLimitKBps: 0,
+    ipLimit: 1,
+    cleanIp: "",
+    blockAds: true,
+    notes: "test-account",
   });
   await setShopSetting(env, `test_used:${userId}`, "1");
+  triggerSync(env);
 
   const subUrl = `${env.MOTHER_URL || env._SELF_URL}/pull?token=${uuid}`;
   const text =
@@ -911,7 +1075,6 @@ async function approveOrder(chatId, orderId, env, msgId) {
   let id;
 
   if (isRenew) {
-    // ---- تمدید: همان یوزر، همان UUID ----
     if (!panelUserId) {
       panelUserId = await getShopSetting(env, `order_renew_panel:${orderId}`, "");
     }
@@ -921,21 +1084,20 @@ async function approveOrder(chatId, orderId, env, msgId) {
     }
 
     id = existing.id;
-    uuid = existing.uuid; // حفظ UUID
+    uuid = existing.uuid;
 
     const base =
       existing.expiry && Date.parse(existing.expiry) > Date.now()
         ? Date.parse(existing.expiry)
         : Date.now();
-    const expiry =
-      plan.days > 0 ? new Date(base + plan.days * 86400000).toISOString() : null;
+    const expiry = plan.days > 0 ? new Date(base + plan.days * 86400000).toISOString() : null;
 
     const quotaBytes = plan.quota_gb > 0 ? Math.floor(plan.quota_gb * 1073741824) : 0;
     const dailyQuotaBytes = plan.daily_gb > 0 ? Math.floor(plan.daily_gb * 1073741824) : 0;
 
     await upsertUser(env, {
       ...existing,
-      uuid, // همان
+      uuid,
       enabled: true,
       expiry,
       quotaBytes: quotaBytes || existing.quotaBytes,
@@ -944,11 +1106,9 @@ async function approveOrder(chatId, orderId, env, msgId) {
       notes: `${existing.notes || ""} | renew:${orderId} | tg:${order.user_id}`.slice(0, 200),
     });
   } else {
-    // ---- خرید جدید ----
     id = generateId();
     uuid = generateUuid();
-    const expiry =
-      plan.days > 0 ? new Date(Date.now() + plan.days * 86400000).toISOString() : null;
+    const expiry = plan.days > 0 ? new Date(Date.now() + plan.days * 86400000).toISOString() : null;
     const quotaBytes = plan.quota_gb > 0 ? Math.floor(plan.quota_gb * 1073741824) : 0;
     const dailyQuotaBytes = plan.daily_gb > 0 ? Math.floor(plan.daily_gb * 1073741824) : 0;
     const name = `shop-${order.user_id}-${plan.name}`.slice(0, 32);
@@ -972,7 +1132,11 @@ async function approveOrder(chatId, orderId, env, msgId) {
 
   await env.DB.prepare(`
     UPDATE shop_orders SET status = 'approved', approved_at = ?, panel_user_id = ? WHERE id = ?
-  `).bind(Date.now(), panelUserId, orderId).run();
+  `)
+    .bind(Date.now(), panelUserId, orderId)
+    .run();
+
+  triggerSync(env);
 
   const baseUrl = (env.MOTHER_URL || env._SELF_URL || "").replace(/\/$/, "");
   const subUrl = `${baseUrl}/pull?token=${uuid}`;
@@ -1025,7 +1189,8 @@ async function rejectOrder(chatId, orderId, env, msgId) {
   const order = await env.DB.prepare("SELECT * FROM shop_orders WHERE id = ?").bind(orderId).first();
   if (!order) return edit(chatId, msgId, "سفارش پیدا نشد.", env);
   await env.DB.prepare("UPDATE shop_orders SET status = 'rejected' WHERE id = ?").bind(orderId).run();
-  await send(order.user_id,
+  await send(
+    order.user_id,
     `❌ سفارش <code>${orderId}</code> رد شد.\nدر صورت نیاز به پشتیبانی پیام دهید.`,
     env,
     [[{ text: "🏠 منو", callback_data: "user_home" }]]
@@ -1083,18 +1248,19 @@ async function handlePaymentScreenshot(msg, env) {
   await env.DB.prepare(`
     INSERT INTO shop_orders (id, user_id, username, plan_id, plan_name, price, status, created_at, panel_user_id)
     VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-  `).bind(
-    orderId,
-    userId,
-    msg.from.username || "",
-    plan.id,
-    `${isRenew ? "تمدید: " : ""}${plan.name}`,
-    plan.price,
-    Date.now(),
-    isRenew ? state.panelUserId : null
-  ).run();
+  `)
+    .bind(
+      orderId,
+      userId,
+      msg.from.username || "",
+      plan.id,
+      `${isRenew ? "تمدید: " : ""}${plan.name}`,
+      plan.price,
+      Date.now(),
+      isRenew ? state.panelUserId : null
+    )
+    .run();
 
-  // type را در notes/settings نگه می‌داریم اگر ستون type نداری
   await setShopSetting(env, `order_type:${orderId}`, orderType);
   if (isRenew) {
     await setShopSetting(env, `order_renew_panel:${orderId}`, state.panelUserId);
@@ -1103,7 +1269,10 @@ async function handlePaymentScreenshot(msg, env) {
   await clearUserState(env, userId);
 
   const photo = msg.photo[msg.photo.length - 1];
-  const adminIds = (env.ADMIN_IDS || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const adminIds = (env.ADMIN_IDS || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
 
   const caption =
     `${isRenew ? "♻️" : "🧾"} <b>${isRenew ? "درخواست تمدید" : "سفارش جدید"}</b>\n\n` +
@@ -1123,13 +1292,15 @@ async function handlePaymentScreenshot(msg, env) {
         caption,
         parse_mode: "HTML",
         reply_markup: {
-          inline_keyboard: [[
-            {
-              text: isRenew ? "✅ تأیید تمدید" : "✅ تأیید و ساخت اکانت",
-              callback_data: `order_approve:${orderId}`,
-            },
-            { text: "❌ رد", callback_data: `order_reject:${orderId}` },
-          ]],
+          inline_keyboard: [
+            [
+              {
+                text: isRenew ? "✅ تأیید تمدید" : "✅ تأیید و ساخت اکانت",
+                callback_data: `order_approve:${orderId}`,
+              },
+              { text: "❌ رد", callback_data: `order_reject:${orderId}` },
+            ],
+          ],
         },
       }),
     });
@@ -1146,7 +1317,6 @@ async function handlePaymentScreenshot(msg, env) {
   );
 }
 
-
 async function listPlans(env, onlyEnabled = true) {
   if (!(await d1Ready(env))) return [];
   const sql = onlyEnabled
@@ -1155,7 +1325,9 @@ async function listPlans(env, onlyEnabled = true) {
   try {
     const rows = await env.DB.prepare(sql).all();
     return rows.results || [];
-  } catch { return []; }
+  } catch {
+    return [];
+  }
 }
 
 async function showBuyPlans(chatId, env, msgId = null) {
@@ -1203,7 +1375,6 @@ async function showPayInfo(chatId, userId, planId, env, msgId = null) {
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
 
-
 async function showUserHome(chatId, env, msgId = null) {
   const cfg = await getShopConfig(env);
   const text = cfg.welcomeText || "به ربات خوش آمدید 👋";
@@ -1217,7 +1388,6 @@ async function showUserHome(chatId, env, msgId = null) {
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
 
-
 async function checkChannelMember(env, userId) {
   const cfg = await getShopConfig(env);
   if (!cfg.forceJoin || !cfg.channelId) return true;
@@ -1230,7 +1400,6 @@ async function checkChannelMember(env, userId) {
     const data = await res.json();
     if (!data.ok) {
       console.log("getChatMember fail:", JSON.stringify(data));
-      // اگر ربات ادمین نباشد یا کانال اشتباه باشد، برای امنیت قفل را رد نکن
       return false;
     }
     const status = data.result?.status;
@@ -1259,7 +1428,9 @@ async function getShopSetting(env, key, def = "") {
   try {
     const row = await env.DB.prepare("SELECT value FROM shop_settings WHERE key = ?").bind(key).first();
     return row?.value ?? def;
-  } catch { return def; }
+  } catch {
+    return def;
+  }
 }
 
 async function setShopSetting(env, key, value) {
@@ -1267,7 +1438,9 @@ async function setShopSetting(env, key, value) {
   await env.DB.prepare(`
     INSERT INTO shop_settings (key, value) VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
-  `).bind(key, String(value)).run();
+  `)
+    .bind(key, String(value))
+    .run();
 }
 
 async function getShopConfig(env) {
@@ -1276,7 +1449,7 @@ async function getShopConfig(env) {
     cardNumber: await getShopSetting(env, "card_number", ""),
     cardName: await getShopSetting(env, "card_name", ""),
     supportId: await getShopSetting(env, "support_id", ""),
-    channelId: await getShopSetting(env, "channel_id", ""), // مثل @mychannel یا -100...
+    channelId: await getShopSetting(env, "channel_id", ""),
     channelLink: await getShopSetting(env, "channel_link", ""),
     forceJoin: (await getShopSetting(env, "force_join", "0")) === "1",
     testEnabled: (await getShopSetting(env, "test_enabled", "1")) === "1",
@@ -1305,9 +1478,7 @@ async function expiryMenu(chatId, id, env, msgId) {
       { text: "۹۰ روز", callback_data: `expiry:${id}:90` },
       { text: "۱۸۰ روز", callback_data: `expiry:${id}:180` },
     ],
-    [
-      { text: "۳۶۵ روز", callback_data: `expiry:${id}:365` },
-    ],
+    [{ text: "۳۶۵ روز", callback_data: `expiry:${id}:365` }],
     [{ text: "✏️ ورود دستی", callback_data: `expirymanual:${id}` }],
     [{ text: "🔙 بازگشت", callback_data: `user:${id}` }],
   ];
@@ -1323,6 +1494,7 @@ async function setExpiry(chatId, id, days, env, msgId) {
     expiry = new Date(Date.now() + days * 86400000).toISOString();
   }
   await upsertUser(env, { ...user, expiry });
+  triggerSync(env);
   return showUser(chatId, id, env, msgId);
 }
 
@@ -1356,14 +1528,15 @@ async function confirmDeleteNode(chatId, nodeId, env, msgId) {
   ]);
 }
 
-
 async function getAccountRequestsToday(token, accountId) {
   try {
     const today = new Date();
     const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()))
-      .toISOString().slice(0, 10);
+      .toISOString()
+      .slice(0, 10);
     const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1))
-      .toISOString().slice(0, 10);
+      .toISOString()
+      .slice(0, 10);
 
     const gqlQuery = {
       query: `query {
@@ -1398,11 +1571,9 @@ async function showMotherAccountStatus(chatId, env, msgId) {
     const token = env.CF_TOKEN;
     const accountId = env.MOTHER_ACCOUNT_ID;
     if (!token || !accountId) {
-      return edit(chatId, msgId,
-        "❌ CF_TOKEN یا MOTHER_ACCOUNT_ID تنظیم نشده.",
-        env,
-        [[{ text: "🔙", callback_data: "nodes_manage" }]]
-      );
+      return edit(chatId, msgId, "❌ CF_TOKEN یا MOTHER_ACCOUNT_ID تنظیم نشده.", env, [
+        [{ text: "🔙", callback_data: "nodes_manage" }],
+      ]);
     }
 
     await edit(chatId, msgId, "⏳ در حال دریافت اطلاعات اکانت مادر...", env);
@@ -1479,7 +1650,6 @@ async function showNodeAccountStatus(chatId, nodeId, env, msgId) {
   }
 }
 
-
 async function doDeleteNode(chatId, nodeId, env, msgId) {
   await edit(chatId, msgId, "⏳ در حال حذف نود...", env);
   try {
@@ -1492,29 +1662,21 @@ async function doDeleteNode(chatId, nodeId, env, msgId) {
     const accountId = node.account_id;
     const scriptName = node.script_name;
 
-    // حذف Worker
-    const delRes = await cfFetch(`/accounts/${accountId}/workers/scripts/${scriptName}`, token, { method: "DELETE" });
-    // حتی اگر Worker از قبل حذف شده باشد، ادامه می‌دهیم
+    await cfFetch(`/accounts/${accountId}/workers/scripts/${scriptName}`, token, { method: "DELETE" });
 
-    // حذف D1
     if (node.db_id) {
       try {
         await cfFetch(`/accounts/${accountId}/d1/database/${node.db_id}`, token, { method: "DELETE" });
       } catch {}
     }
 
-    // حذف از دیتابیس پنل
     await removeChildByScriptName(env, scriptName);
     await removeManagedNode(env, nodeId);
 
-    return edit(chatId, msgId,
-      `✅ نود <code>${escape(scriptName)}</code> با موفقیت حذف شد.`,
-      env,
-      [
-        [{ text: "📊 وضعیت نودها", callback_data: "nodes" }],
-        [{ text: "🔙 مدیریت نودها", callback_data: "nodes_manage" }],
-      ]
-    );
+    return edit(chatId, msgId, `✅ نود <code>${escape(scriptName)}</code> با موفقیت حذف شد.`, env, [
+      [{ text: "📊 وضعیت نودها", callback_data: "nodes" }],
+      [{ text: "🔙 مدیریت نودها", callback_data: "nodes_manage" }],
+    ]);
   } catch (err) {
     return edit(chatId, msgId, `❌ خطا در حذف:\n<code>${escape(err.message)}</code>`, env, [
       [{ text: "🔙", callback_data: "nodes" }],
@@ -1522,20 +1684,16 @@ async function doDeleteNode(chatId, nodeId, env, msgId) {
   }
 }
 
-
-
 async function handleMessage(msg, env) {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const text = (msg.text || "").trim();
   const isAdminUser = isAdmin(userId, env);
 
-  // ----- اسکرین‌شات رسید پرداخت (کاربر عادی) -----
   if (msg.photo && msg.photo.length && !isAdminUser) {
     return handlePaymentScreenshot(msg, env);
   }
-  
-  // ===================== ادمین =====================
+
   if (isAdminUser) {
     const replyText = msg.reply_to_message?.text || "";
 
@@ -1554,23 +1712,31 @@ async function handleMessage(msg, env) {
       return showShopAdmin(chatId, env);
     }
 
-    // ----- ساخت کاربر -----
     if (replyText.includes("نام کاربر جدید را ارسال کنید")) {
       const name = text.slice(0, 32).trim();
       if (!name) return send(chatId, "❌ نام نمی‌تواند خالی باشد.", env);
       const id = generateId();
       const uuid = generateUuid();
       const ok = await upsertUser(env, {
-        id, name, uuid, enabled: true, expiry: null,
-        quotaBytes: 0, dailyQuotaBytes: 0, speedLimitKBps: 0,
-        ipLimit: 1, cleanIp: "", blockAds: true, notes: "created via telegram bot",
+        id,
+        name,
+        uuid,
+        enabled: true,
+        expiry: null,
+        quotaBytes: 0,
+        dailyQuotaBytes: 0,
+        speedLimitKBps: 0,
+        ipLimit: 1,
+        cleanIp: "",
+        blockAds: true,
+        notes: "created via telegram bot",
       });
       if (!ok) return send(chatId, "❌ خطا در ساخت کاربر", env);
+      triggerSync(env);
       await send(chatId, `✅ کاربر <b>${escape(name)}</b> ساخته شد\n🆔 <code>${id}</code>`, env);
       return showUser(chatId, id, env);
     }
 
-    // ----- تاریخ انقضا -----
     if (replyText.includes("تاریخ انقضا را ارسال کنید")) {
       const id = extractIdFromReply(replyText) || (replyText.match(/کاربر: (\S+)/) || [])[1];
       if (!id) return send(chatId, "❌ خطا در شناسایی کاربر", env);
@@ -1592,11 +1758,11 @@ async function handleMessage(msg, env) {
         return send(chatId, "❌ فرمت نامعتبر. مثال: <code>30</code> یا <code>2026-12-31</code>", env);
       }
       await upsertUser(env, { ...user, expiry });
+      triggerSync(env);
       await send(chatId, "✅ تاریخ انقضا تنظیم شد", env);
       return showUser(chatId, id, env);
     }
 
-    // ----- یادداشت -----
     if (replyText.includes("یادداشت جدید را ارسال کنید")) {
       const id = extractIdFromReply(replyText);
       if (!id) return send(chatId, "❌ خطا در شناسایی کاربر", env);
@@ -1607,7 +1773,6 @@ async function handleMessage(msg, env) {
       return showUser(chatId, id, env);
     }
 
-    // ----- حجم کل -----
     if (replyText.includes("حجم کل را به گیگابایت ارسال کنید")) {
       const id = extractIdFromReply(replyText);
       const gb = parseFloat(text.replace(",", "."));
@@ -1615,11 +1780,11 @@ async function handleMessage(msg, env) {
       const user = await getUserById(env, id);
       if (!user) return send(chatId, "❌ کاربر پیدا نشد", env);
       await upsertUser(env, { ...user, quotaBytes: gb === 0 ? 0 : Math.floor(gb * 1073741824) });
+      triggerSync(env);
       await send(chatId, "✅ حجم کل تنظیم شد", env);
       return showUser(chatId, id, env);
     }
 
-    // ----- حجم روزانه -----
     if (replyText.includes("حجم روزانه را به گیگابایت ارسال کنید")) {
       const id = extractIdFromReply(replyText);
       const gb = parseFloat(text.replace(",", "."));
@@ -1627,11 +1792,11 @@ async function handleMessage(msg, env) {
       const user = await getUserById(env, id);
       if (!user) return send(chatId, "❌ کاربر پیدا نشد", env);
       await upsertUser(env, { ...user, dailyQuotaBytes: gb === 0 ? 0 : Math.floor(gb * 1073741824) });
+      triggerSync(env);
       await send(chatId, "✅ حجم روزانه تنظیم شد", env);
       return showUser(chatId, id, env);
     }
 
-    // ----- محدودیت IP -----
     if (replyText.includes("محدودیت IP را ارسال کنید")) {
       const id = extractIdFromReply(replyText);
       const limit = parseInt(text);
@@ -1639,11 +1804,11 @@ async function handleMessage(msg, env) {
       const user = await getUserById(env, id);
       if (!user) return send(chatId, "❌ کاربر پیدا نشد", env);
       await upsertUser(env, { ...user, ipLimit: limit });
+      triggerSync(env);
       await send(chatId, "✅ محدودیت IP تنظیم شد", env);
       return showUser(chatId, id, env);
     }
 
-    // ----- ساخت نود -----
     if (replyText.includes("توکن API کلودفلر را ارسال کنید") || replyText.includes("توکن کلودفلر را ارسال کنید")) {
       const token = text.trim();
       if (!token || token.length < 30) return send(chatId, "❌ توکن نامعتبر است.", env);
@@ -1651,7 +1816,6 @@ async function handleMessage(msg, env) {
       return createCloudflareNode(chatId, token, env);
     }
 
-    // ----- حذف نود -----
     if (replyText.includes("نام نود و توکن را ارسال کنید")) {
       const parts = text.trim().split(/\s+/);
       if (parts.length < 2) {
@@ -1664,7 +1828,6 @@ async function handleMessage(msg, env) {
       return deleteCloudflareNode(chatId, scriptName, token, env);
     }
 
-    // ----- وضعیت اکانت CF -----
     if (replyText.includes("توکن را برای مشاهده وضعیت اکانت ارسال کنید")) {
       const token = text.trim();
       if (!token || token.length < 30) return send(chatId, "❌ توکن نامعتبر است.", env);
@@ -1672,9 +1835,7 @@ async function handleMessage(msg, env) {
       return showAccountStatus(chatId, token, env);
     }
 
-    // ----- تنظیمات فروش: کارت -----
     if (replyText.includes("شماره کارت و نام صاحب حساب را ارسال کنید")) {
-      // فرمت: 6037... علی رضایی
       const parts = text.trim().split(/\s+/);
       if (parts.length < 2) {
         return send(chatId, "❌ فرمت: <code>شماره‌کارت نام صاحب</code>", env);
@@ -1688,16 +1849,13 @@ async function handleMessage(msg, env) {
       return showShopAdmin(chatId, env);
     }
 
-    // ----- تنظیمات فروش: پشتیبانی -----
     if (replyText.includes("آیدی یا لینک پشتیبانی را ارسال کنید")) {
       await setShopSetting(env, "support_id", text.slice(0, 120));
       await send(chatId, "✅ پشتیبانی ذخیره شد.", env);
       return showShopAdmin(chatId, env);
     }
 
-    // ----- تنظیمات فروش: کانال -----
     if (replyText.includes("آیدی کانال را ارسال کنید")) {
-      // @channel یا -100...
       await setShopSetting(env, "channel_id", text.trim());
       await send(chatId, "✅ آیدی کانال ذخیره شد. اگر لینک عضویت هم دارید ارسال کنید یا از منو لینک را جدا تنظیم کنید.", env);
       return showShopAdmin(chatId, env);
@@ -1708,26 +1866,23 @@ async function handleMessage(msg, env) {
       return showShopAdmin(chatId, env);
     }
 
-    // ----- تنظیمات فروش: متن خوش‌آمد -----
     if (replyText.includes("متن خوش‌آمدگویی را ارسال کنید")) {
       await setShopSetting(env, "welcome_text", text.slice(0, 1000));
       await send(chatId, "✅ متن خوش‌آمد ذخیره شد.", env);
       return showShopAdmin(chatId, env);
     }
 
-    // ----- تنظیمات فروش: آموزش -----
     if (replyText.includes("متن آموزش استفاده را ارسال کنید")) {
       await setShopSetting(env, "guide_text", text.slice(0, 3000));
       await send(chatId, "✅ متن آموزش ذخیره شد.", env);
       return showShopAdmin(chatId, env);
     }
 
-    // ----- ساخت پلن -----
     if (replyText.includes("اطلاعات پلن را ارسال کنید")) {
-      // نام|روز|حجم‌GB|روزانه‌GB|قیمت|IP
       const parts = text.split("|").map((x) => x.trim());
       if (parts.length < 5) {
-        return send(chatId,
+        return send(
+          chatId,
           "❌ فرمت:\n<code>نام|روز|حجم‌کل‌GB|حجم‌روزانه‌GB|قیمت|IP</code>\nمثال:\n<code>برنزی|30|50|0|150000|2</code>",
           env
         );
@@ -1747,26 +1902,23 @@ async function handleMessage(msg, env) {
       await env.DB.prepare(`
         INSERT INTO shop_plans (id, name, days, quota_gb, daily_gb, price, ip_limit, enabled, sort_order)
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)
-      `).bind(plan.id, plan.name, plan.days, plan.quota_gb, plan.daily_gb, plan.price, plan.ip_limit).run();
+      `)
+        .bind(plan.id, plan.name, plan.days, plan.quota_gb, plan.daily_gb, plan.price, plan.ip_limit)
+        .run();
       await send(chatId, `✅ پلن <b>${escape(plan.name)}</b> ساخته شد.`, env);
       return showShopPlansAdmin(chatId, env);
     }
 
-    // ----- جستجوی نود (اسم یا آدرس) -----
-    // ----- جستجوی هوشمند -----
     if (text && !text.startsWith("/")) {
-      // 1) لینک vless یا UUID → کاربر پنل
       const uuid = extractUuidFromText(text);
       if (uuid) {
         const user = await getUserByUuid(env, uuid);
         if (user) return showUser(chatId, user.id, env);
       }
 
-      // 2) جستجوی کاربر (نام / id / ...)
       const found = await findUserByText(text, env);
       if (found) return showUser(chatId, found, env);
 
-      // 3) فقط اگر vless نبود، اسم یا آدرس نود
       const looksLikeVless = /^vless:\/\//i.test(text.trim());
       if (!looksLikeVless) {
         const node = await findManagedNodeByText(text, env);
@@ -1778,26 +1930,25 @@ async function handleMessage(msg, env) {
       return showMain(chatId, env);
     }
 
-    return send(chatId,
+    return send(
+      chatId,
       "از دکمه‌های شیشه‌ای استفاده کنید.\n" +
-      "می‌توانید UUID، لینک کانفیگ، <b>نام نود</b> یا <b>آدرس نود</b> بفرستید.\n/start",
+        "می‌توانید UUID، لینک کانفیگ، <b>نام نود</b> یا <b>آدرس نود</b> بفرستید.\n/start",
       env
     );
   }
 
-  // ===================== کاربر عادی =====================
+  // کاربر عادی
   const cfg = await getShopConfig(env);
 
   if (!cfg.enabled) {
     return send(chatId, "⛔️ ربات فعلاً در دسترس نیست.", env);
   }
 
-  // قفل کانال
   if (!(await checkChannelMember(env, userId))) {
     return sendForceJoin(chatId, env);
   }
 
-  // اگر منتظر رسید است و متن فرستاده
   const state = await getUserState(env, userId);
   if (state?.step === "waiting_receipt" || state?.step === "waiting_receipt_renew") {
     return send(
@@ -1807,7 +1958,6 @@ async function handleMessage(msg, env) {
       [[{ text: "🏠 منو", callback_data: "user_home" }]]
     );
   }
-
 
   if (text === "/start" || text === "/menu" || text === "منو" || !text) {
     return showUserHome(chatId, env);
@@ -1850,7 +2000,6 @@ async function handleCallback(cq, env) {
 
   await answer(cq.id, "", env);
 
-  // ========== دکمه‌های کاربر عادی (برای همه) ==========
   if (data === "user_home") return showUserHome(chatId, env, msgId);
 
   if (data === "user_buy") {
@@ -1883,9 +2032,7 @@ async function handleCallback(cq, env) {
 
   if (data === "user_support") {
     const cfg = await getShopConfig(env);
-    const t = cfg.supportId
-      ? `💬 پشتیبانی:\n${cfg.supportId}`
-      : "آیدی پشتیبانی تنظیم نشده.";
+    const t = cfg.supportId ? `💬 پشتیبانی:\n${cfg.supportId}` : "آیدی پشتیبانی تنظیم نشده.";
     return edit(chatId, msgId, t, env, [
       [{ text: "🔙 منو", callback_data: "user_home" }],
     ]);
@@ -1898,7 +2045,6 @@ async function handleCallback(cq, env) {
 
   if (data === "user_my_services") return showMyServices(chatId, userId, env, msgId);
 
-  // جزئیات سرویس / ریوک / تمدید (کاربر)
   if (data.startsWith("mysvc:")) {
     return showMyServiceDetail(chatId, userId, data.split(":")[1], env, msgId);
   }
@@ -1909,17 +2055,14 @@ async function handleCallback(cq, env) {
     return requestRenew(chatId, userId, data.split(":")[1], env, msgId);
   }
   if (data.startsWith("renew_plan:")) {
-    // renew_plan:PANEL_USER_ID:PLAN_ID
     const parts = data.split(":");
     const panelUserId = parts[1];
     const planId = parts[2];
     return showRenewPayInfo(chatId, userId, panelUserId, planId, env, msgId);
   }
 
-  // ========== از اینجا فقط ادمین ==========
   if (!admin) return;
 
-  // تمدید توسط ادمین
   if (data.startsWith("renew_do:")) {
     const parts = data.split(":");
     const pid = parts[1];
@@ -1936,6 +2079,7 @@ async function handleCallback(cq, env) {
         : Date.now();
     const expiry = new Date(base + days * 86400000).toISOString();
     await upsertUser(env, { ...user, expiry, enabled: true });
+    triggerSync(env);
     await edit(
       chatId,
       msgId,
@@ -1955,7 +2099,6 @@ async function handleCallback(cq, env) {
     return;
   }
 
-  // سفارش‌ها
   if (data.startsWith("order_approve:")) {
     return approveOrder(chatId, data.split(":")[1], env, msgId);
   }
@@ -1963,7 +2106,6 @@ async function handleCallback(cq, env) {
     return rejectOrder(chatId, data.split(":")[1], env, msgId);
   }
 
-  // تنظیمات فروش
   if (data === "shop_admin") return showShopAdmin(chatId, env, msgId);
 
   if (data === "shop_toggle") {
@@ -2048,7 +2190,6 @@ async function handleCallback(cq, env) {
     ]);
   }
 
-  // ----- اکانت تست -----
   if (data === "shop_test") {
     const cfg = await getShopConfig(env);
     const text =
@@ -2074,7 +2215,6 @@ async function handleCallback(cq, env) {
   if (data === "shop_test_toggle") {
     const cfg = await getShopConfig(env);
     await setShopSetting(env, "test_enabled", cfg.testEnabled ? "0" : "1");
-    // نمایش مجدد همان منو
     const cfg2 = await getShopConfig(env);
     const text =
       `🎁 <b>تنظیم اکانت تست</b>\n\n` +
@@ -2160,7 +2300,6 @@ async function handleCallback(cq, env) {
     return;
   }
 
-  // ----- منوی اصلی ادمین -----
   if (data === "main") return showMain(chatId, env, msgId);
   if (data === "status") return showStatus(chatId, env, msgId);
   if (data === "nodes") return showNodes(chatId, env, msgId);
@@ -2280,7 +2419,6 @@ async function handleCallback(cq, env) {
 
   if (data.startsWith("ads:")) return toggleAds(chatId, data.split(":")[1], env, msgId);
 
-  // Nodes
   if (data === "node_create") return showNodeCreate(chatId, env, msgId);
 
   if (data.startsWith("toggle_node:")) {
@@ -2350,13 +2488,10 @@ async function handleCallback(cq, env) {
 
 // ====================== UI ======================
 async function showMain(chatId, env, msgId = null) {
-  const [statusData, nodes] = await Promise.all([
-    getStatusData(env),
-    getHealthyChildren(env),
-  ]);
+  const [statusData, nodes] = await Promise.all([getStatusData(env), getHealthyChildren(env)]);
   const alive = nodes.length;
   const text =
-    `🎛️ <b>پنل مدیریت Mother</b>\n\n` +
+    `🎛️ <b>پنل مدیریت Mother (Push Mode)</b>\n\n` +
     `🤖 نسخه ربات: <code>${BOT_VERSION}</code>\n` +
     `🖥 نسخه پنل: <code>${VERSION}</code>\n` +
     `🖥 نودها: 🟢 ${alive} فعال\n\n` +
@@ -2377,7 +2512,7 @@ async function showMain(chatId, env, msgId = null) {
 
 async function showStatus(chatId, env, msgId = null) {
   const res = await getStatusData(env);
-  const realOnline = (res.live || []).filter(u => u.activeIPs > 0);
+  const realOnline = (res.live || []).filter((u) => u.activeIPs > 0);
   let liveText = "";
   if (realOnline.length) {
     liveText = "\n\n🟢 <b>کاربران واقعاً آنلاین:</b>\n";
@@ -2396,16 +2531,18 @@ async function showStatus(chatId, env, msgId = null) {
     `🖥 <b>نودها:</b> ${res.nodes}\n` +
     `📈 <b>ترافیک کل:</b> ${res.totalTrafficGB} GB` +
     liveText;
-  const kb = [[
-    { text: "🔄 بروزرسانی", callback_data: "status" },
-    { text: "🔙 بازگشت", callback_data: "main" },
-  ]];
+  const kb = [
+    [
+      { text: "🔄 بروزرسانی", callback_data: "status" },
+      { text: "🔙 بازگشت", callback_data: "main" },
+    ],
+  ];
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
 
 async function showUsers(chatId, page, env, msgId = null) {
   const users = await getUsers(env);
-  const full = await Promise.all(users.map(u => buildFullUser(env, u)));
+  const full = await Promise.all(users.map((u) => buildFullUser(env, u)));
   const perPage = 10;
   const totalPages = Math.max(1, Math.ceil(full.length / perPage));
   page = Math.max(0, Math.min(page, totalPages - 1));
@@ -2482,9 +2619,7 @@ async function showUser(chatId, id, env, msgId = null) {
       { text: u.enabled ? "🔴 غیرفعال" : "🟢 فعال", callback_data: `toggle:${u.id}` },
       { text: "🔄 رفرش", callback_data: `user:${u.id}` },
     ],
-    [
-      { text: "⏰ تاریخ انقضا", callback_data: `expirymenu:${u.id}` },
-    ],
+    [{ text: "⏰ تاریخ انقضا", callback_data: `expirymenu:${u.id}` }],
     [
       { text: "🌐 محدودیت IP", callback_data: `ipmenu:${u.id}` },
       { text: "⚡ سرعت", callback_data: `speedmenu:${u.id}` },
@@ -2510,12 +2645,19 @@ async function showUser(chatId, id, env, msgId = null) {
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
 
-// Submenus (same as before)
 async function ipLimitMenu(chatId, id, env, msgId) {
   const text = `🌐 <b>محدودیت IP همزمان</b>\n\nکاربر: <code>${id}</code>`;
   const kb = [
-    [{ text: "۱", callback_data: `iplimit:${id}:1` }, { text: "۲", callback_data: `iplimit:${id}:2` }, { text: "۳", callback_data: `iplimit:${id}:3` }],
-    [{ text: "۵", callback_data: `iplimit:${id}:5` }, { text: "۱۰", callback_data: `iplimit:${id}:10` }, { text: "۲۰", callback_data: `iplimit:${id}:20` }],
+    [
+      { text: "۱", callback_data: `iplimit:${id}:1` },
+      { text: "۲", callback_data: `iplimit:${id}:2` },
+      { text: "۳", callback_data: `iplimit:${id}:3` },
+    ],
+    [
+      { text: "۵", callback_data: `iplimit:${id}:5` },
+      { text: "۱۰", callback_data: `iplimit:${id}:10` },
+      { text: "۲۰", callback_data: `iplimit:${id}:20` },
+    ],
     [{ text: "✏️ ورود دستی", callback_data: `ipmanual:${id}` }],
     [{ text: "🔙 بازگشت", callback_data: `user:${id}` }],
   ];
@@ -2524,9 +2666,18 @@ async function ipLimitMenu(chatId, id, env, msgId) {
 async function speedMenu(chatId, id, env, msgId) {
   const text = `⚡ <b>محدودیت سرعت</b>\n\nکاربر: <code>${id}</code>`;
   const kb = [
-    [{ text: "∞ نامحدود", callback_data: `speed:${id}:0` }, { text: "۱۰۰", callback_data: `speed:${id}:100` }],
-    [{ text: "۲۰۰", callback_data: `speed:${id}:200` }, { text: "۵۰۰", callback_data: `speed:${id}:500` }],
-    [{ text: "۱ MB", callback_data: `speed:${id}:1024` }, { text: "۲ MB", callback_data: `speed:${id}:2048` }],
+    [
+      { text: "∞ نامحدود", callback_data: `speed:${id}:0` },
+      { text: "۱۰۰", callback_data: `speed:${id}:100` },
+    ],
+    [
+      { text: "۲۰۰", callback_data: `speed:${id}:200` },
+      { text: "۵۰۰", callback_data: `speed:${id}:500` },
+    ],
+    [
+      { text: "۱ MB", callback_data: `speed:${id}:1024` },
+      { text: "۲ MB", callback_data: `speed:${id}:2048` },
+    ],
     [{ text: "🔙 بازگشت", callback_data: `user:${id}` }],
   ];
   return edit(chatId, msgId, text, env, kb);
@@ -2534,9 +2685,18 @@ async function speedMenu(chatId, id, env, msgId) {
 async function quotaMenu(chatId, id, env, msgId) {
   const text = `📦 <b>حجم کل</b>\n\nکاربر: <code>${id}</code>`;
   const kb = [
-    [{ text: "∞ نامحدود", callback_data: `quota:${id}:0` }, { text: "۱ GB", callback_data: `quota:${id}:1073741824` }],
-    [{ text: "۵ GB", callback_data: `quota:${id}:5368709120` }, { text: "۱۰ GB", callback_data: `quota:${id}:10737418240` }],
-    [{ text: "۲۰ GB", callback_data: `quota:${id}:21474836480` }, { text: "۵۰ GB", callback_data: `quota:${id}:53687091200` }],
+    [
+      { text: "∞ نامحدود", callback_data: `quota:${id}:0` },
+      { text: "۱ GB", callback_data: `quota:${id}:1073741824` },
+    ],
+    [
+      { text: "۵ GB", callback_data: `quota:${id}:5368709120` },
+      { text: "۱۰ GB", callback_data: `quota:${id}:10737418240` },
+    ],
+    [
+      { text: "۲۰ GB", callback_data: `quota:${id}:21474836480` },
+      { text: "۵۰ GB", callback_data: `quota:${id}:53687091200` },
+    ],
     [{ text: "✏️ ورود دستی (گیگابایت)", callback_data: `quotamanual:${id}` }],
     [{ text: "🔙 بازگشت", callback_data: `user:${id}` }],
   ];
@@ -2545,26 +2705,36 @@ async function quotaMenu(chatId, id, env, msgId) {
 async function dailyMenu(chatId, id, env, msgId) {
   const text = `📅 <b>حجم روزانه</b>\n\nکاربر: <code>${id}</code>`;
   const kb = [
-    [{ text: "∞ نامحدود", callback_data: `daily:${id}:0` }, { text: "۵۰۰ MB", callback_data: `daily:${id}:524288000` }],
-    [{ text: "۱ GB", callback_data: `daily:${id}:1073741824` }, { text: "۲ GB", callback_data: `daily:${id}:2147483648` }],
-    [{ text: "۵ GB", callback_data: `daily:${id}:5368709120` }, { text: "۱۰ GB", callback_data: `daily:${id}:10737418240` }],
+    [
+      { text: "∞ نامحدود", callback_data: `daily:${id}:0` },
+      { text: "۵۰۰ MB", callback_data: `daily:${id}:524288000` },
+    ],
+    [
+      { text: "۱ GB", callback_data: `daily:${id}:1073741824` },
+      { text: "۲ GB", callback_data: `daily:${id}:2147483648` },
+    ],
+    [
+      { text: "۵ GB", callback_data: `daily:${id}:5368709120` },
+      { text: "۱۰ GB", callback_data: `daily:${id}:10737418240` },
+    ],
     [{ text: "✏️ ورود دستی (گیگابایت)", callback_data: `dailymanual:${id}` }],
     [{ text: "🔙 بازگشت", callback_data: `user:${id}` }],
   ];
   return edit(chatId, msgId, text, env, kb);
 }
 
-// Actions
 async function setField(chatId, id, fields, env, msgId) {
   const user = await getUserById(env, id);
   if (!user) return showUser(chatId, id, env, msgId);
   await upsertUser(env, { ...user, ...fields });
+  triggerSync(env);
   return showUser(chatId, id, env, msgId);
 }
 async function doToggle(chatId, id, env, msgId) {
   const user = await getUserById(env, id);
   if (!user) return showUser(chatId, id, env, msgId);
   await upsertUser(env, { ...user, enabled: !user.enabled });
+  triggerSync(env);
   return showUser(chatId, id, env, msgId);
 }
 async function toggleAds(chatId, id, env, msgId) {
@@ -2575,6 +2745,7 @@ async function toggleAds(chatId, id, env, msgId) {
 async function doReset(chatId, id, env, msgId) {
   const ok = await resetUsage(env, id);
   const text = ok ? "✅ حجم مصرف صفر شد" : "❌ خطا در ریست";
+  triggerSync(env);
   return edit(chatId, msgId, text, env, [[{ text: "🔙 جزئیات", callback_data: `user:${id}` }]]);
 }
 async function doClearIPs(chatId, id, env, msgId) {
@@ -2588,7 +2759,10 @@ async function showSub(chatId, id, env, msgId) {
   const url = `${env._SELF_URL || env.MOTHER_URL}/pull?token=${user.uuid}`;
   const text = `🔗 <b>لینک سابسکریپشن</b>\n\nکاربر: <b>${escape(user.name)}</b>\n\n<code>${url}</code>`;
   const kb = [
-    [{ text: "📱 دریافت QR Code", callback_data: `qr:${id}` }, { text: "🔙 جزئیات", callback_data: `user:${id}` }],
+    [
+      { text: "📱 دریافت QR Code", callback_data: `qr:${id}` },
+      { text: "🔙 جزئیات", callback_data: `user:${id}` },
+    ],
   ];
   return edit(chatId, msgId, text, env, kb);
 }
@@ -2610,14 +2784,17 @@ async function sendQR(chatId, id, env) {
 }
 async function confirmDelete(chatId, id, env, msgId) {
   const text = `⚠️ آیا از حذف کاربر <code>${id}</code> مطمئن هستید؟\n\nاین عمل غیرقابل بازگشت است.`;
-  const kb = [[
-    { text: "✅ بله، حذف شود", callback_data: `del:${id}` },
-    { text: "❌ انصراف", callback_data: `user:${id}` },
-  ]];
+  const kb = [
+    [
+      { text: "✅ بله، حذف شود", callback_data: `del:${id}` },
+      { text: "❌ انصراف", callback_data: `user:${id}` },
+    ],
+  ];
   return edit(chatId, msgId, text, env, kb);
 }
 async function doDelete(chatId, id, env, msgId) {
   const ok = await deleteUser(env, id);
+  triggerSync(env);
   const text = ok ? `✅ کاربر <code>${id}</code> حذف شد` : "❌ خطا در حذف";
   return edit(chatId, msgId, text, env, [[{ text: "🔙 لیست کاربران", callback_data: "users:0" }]]);
 }
@@ -2627,10 +2804,10 @@ async function showNodesManage(chatId, env, msgId = null) {
   const alive = await getHealthyChildren(env);
   const managed = await getManagedNodes(env);
   const text =
-    `🖥 <b>مدیریت نودها</b>\n\n` +
-    `🟢 آنلاین: ${alive.length}\n` +
+    `🖥 <b>مدیریت نودها (Push Mode)</b>\n\n` +
+    `🟢 آنلاین (آخرین همگام‌سازی < ۱۵ دقیقه): ${alive.length}\n` +
     `📦 ثبت‌شده: ${managed.length}\n\n` +
-    `از این بخش نودها را مدیریت کنید.`;
+    `از این بخش نودها را مدیریت کنید.\nهمگام‌سازی هر دقیقه توسط مادر انجام می‌شود.`;
   const kb = [
     [{ text: "📊 وضعیت / حذف / آپدیت نودها", callback_data: "nodes" }],
     [{ text: "➕ ساخت نود جدید", callback_data: "node_create" }],
@@ -2646,7 +2823,8 @@ async function showNodeCreate(chatId, env, msgId = null) {
     `➕ <b>ساخت نود جدید</b>\n\n` +
     `۱. با دکمه زیر توکن کلودفلر بساز\n` +
     `۲. بعد روی «ارسال توکن» بزن و توکن را بفرست\n\n` +
-    `⚠️ نود بچه روی اکانت مادر ساخته نمی‌شود.`;
+    `⚠️ نود بچه روی اکانت مادر ساخته نمی‌شود.\n` +
+    `نود باید endpoint /sync را پشتیبانی کند (معماری Push).`;
 
   const kb = [
     [{ text: "🔗 ساخت توکن کلودفلر", url: CF_TOKEN_URL }],
@@ -2660,22 +2838,22 @@ async function showNodes(chatId, env, msgId = null) {
   const alive = await getHealthyChildren(env);
   const managed = await getManagedNodes(env);
 
-  let text = `🖥 <b>وضعیت نودهای فرزند</b>\n\n`;
+  let text = `🖥 <b>وضعیت نودهای فرزند (Push)</b>\n\n`;
 
   if (!managed.length && !alive.length) {
     text += "هیچ نودی ثبت نشده است.";
   } else {
-    // اول نودهای مدیریت‌شده
     for (const m of managed) {
-      const live = alive.find(a =>
-        a.id.includes(m.script_name) ||
-        (m.url && a.id.includes(m.script_name.replace(/-/g, "")))
+      const live = alive.find(
+        (a) =>
+          a.id.includes(m.script_name) ||
+          (m.url && a.id.includes(m.script_name.replace(/-/g, "")))
       );
       const isOnline = !!live;
       const status = isOnline ? "🟢" : "🔴";
       const lastSeen = live?.lastSeen
         ? new Date(live.lastSeen).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })
-        : "هنوز آنلاین نشده";
+        : "هنوز همگام‌سازی نشده";
 
       text += `${status} <b>${escape(m.script_name)}</b>\n`;
       text += ` 🔗 <code>${escape(m.url || "—")}</code>\n`;
@@ -2684,13 +2862,12 @@ async function showNodes(chatId, env, msgId = null) {
         text += ` ظرفیت: ${live.capacity ?? "—"}\n`;
         text += ` کاربران فعال: ${live.activeUsers ?? 0}\n`;
       }
-      text += ` آخرین آنلاین: ${lastSeen}\n\n`;
+      text += ` آخرین همگام‌سازی: ${lastSeen}\n\n`;
     }
 
-    // نودهایی که heartbeat دادن ولی در managed نیستن
     for (const n of alive) {
-      const alreadyShown = managed.some(m =>
-        n.id.includes(m.script_name) || n.id.includes(m.script_name?.replace(/-/g, ""))
+      const alreadyShown = managed.some(
+        (m) => n.id.includes(m.script_name) || n.id.includes(m.script_name?.replace(/-/g, ""))
       );
       if (alreadyShown) continue;
       const lastSeen = n.lastSeen
@@ -2698,7 +2875,7 @@ async function showNodes(chatId, env, msgId = null) {
         : "—";
       text += `🟢 <b>${escape(n.id)}</b> (ثبت‌نشده)\n`;
       text += ` نسخه: ${n.version || "—"}\n`;
-      text += ` آخرین آنلاین: ${lastSeen}\n\n`;
+      text += ` آخرین همگام‌سازی: ${lastSeen}\n\n`;
     }
   }
 
@@ -2707,14 +2884,13 @@ async function showNodes(chatId, env, msgId = null) {
     const isLocked = m.is_disabled === 1;
     const toggleBtnText = isLocked ? "🔓 آنلاک" : "🔒 قفل";
 
-    // چیدمان تمیزتر در ۲ سطر برای هر نود
     kb.push([
       { text: `📈 ${m.script_name}`, callback_data: `node_acc:${m.id}` },
-      { text: toggleBtnText, callback_data: `toggle_node:${m.id}` } // اصلاح خطای node.id به m.id
+      { text: toggleBtnText, callback_data: `toggle_node:${m.id}` },
     ]);
     kb.push([
       { text: `♻️ نصب مجدد`, callback_data: `update_child:${m.id}` },
-      { text: `🗑 حذف`, callback_data: `del_node:${m.id}` }
+      { text: `🗑 حذف`, callback_data: `del_node:${m.id}` },
     ]);
   }
 
@@ -2738,16 +2914,16 @@ async function createCloudflareNode(chatId, token, env) {
 
     const motherAccountId = await getMotherAccountId(env);
     if (motherAccountId && motherAccountId === accountId) {
-      return send(chatId,
+      return send(
+        chatId,
         `❌ <b>خطا: ساخت نود بچه روی اکانت مادر ممنوع است!</b>\n\n` +
-        `نود مادر نباید در معرض دسترسی مستقیم کاربران قرار بگیرد و فیلتر نشود.\n` +
-        `لطفاً از اکانت Cloudflare دیگری استفاده کنید.`,
+          `نود مادر نباید در معرض دسترسی مستقیم کاربران قرار بگیرد و فیلتر نشود.\n` +
+          `لطفاً از اکانت Cloudflare دیگری استفاده کنید.`,
         env,
         [[{ text: "🔙 مدیریت نودها", callback_data: "nodes_manage" }]]
       );
     }
 
-    // دریافت زیردامنه workers.dev
     let accountSubdomain = null;
     try {
       const subRes = await cfFetch(`/accounts/${accountId}/workers/subdomain`, token);
@@ -2756,7 +2932,6 @@ async function createCloudflareNode(chatId, token, env) {
       }
     } catch {}
 
-    // اگر subdomain وجود نداشت، سعی می‌کنیم یکی بسازیم
     if (!accountSubdomain) {
       const randomSub = "saow" + Math.floor(1000 + Math.random() * 9000);
       try {
@@ -2767,7 +2942,6 @@ async function createCloudflareNode(chatId, token, env) {
         if (createRes.success && createRes.result?.subdomain) {
           accountSubdomain = createRes.result.subdomain;
         } else if (createRes.errors?.[0]?.code === 10036) {
-          // اکانت قبلاً subdomain داشته ولی GET موفق نبود → دوباره بخوان
           try {
             const retry = await cfFetch(`/accounts/${accountId}/workers/subdomain`, token);
             if (retry.success && retry.result?.subdomain) {
@@ -2779,21 +2953,21 @@ async function createCloudflareNode(chatId, token, env) {
     }
 
     if (!accountSubdomain) {
-      return send(chatId,
+      return send(
+        chatId,
         `❌ این اکانت هنوز زیردامنه <b>workers.dev</b> ندارد.\n\n` +
-        `لطفاً یک‌بار با همین اکانت وارد داشبورد Cloudflare شوید و به بخش <b>Workers & Pages</b> بروید تا subdomain ساخته شود، سپس دوباره توکن را بفرستید.\n\n` +
-        `لینک مستقیم:\n<code>https://dash.cloudflare.com/?to=/:account/workers</code>`,
+          `لطفاً یک‌بار با همین اکانت وارد داشبورد Cloudflare شوید و به بخش <b>Workers & Pages</b> بروید تا subdomain ساخته شود، سپس دوباره توکن را بفرستید.\n\n` +
+          `لینک مستقیم:\n<code>https://dash.cloudflare.com/?to=/:account/workers</code>`,
         env,
         [[{ text: "🔙 مدیریت نودها", callback_data: "nodes_manage" }]]
       );
     }
 
-    // دریافت کد child
     const codeRes = await fetch(CHILD_WORKER_URL);
     if (!codeRes.ok) return send(chatId, `❌ خطا در دریافت کد ورکر فرزند`, env);
     let workerCode = await codeRes.text();
 
-    // Fix MOTHER_URL
+    // سازگاری با کدهای قدیمی (MOTHER_URL دیگر لازم نیست اما binding را نگه می‌داریم)
     workerCode = workerCode.replace(
       /(?:const|let|var)\s+MOTHER_URL\s*=\s*[^;]+;?/,
       `let MOTHER_URL = null;`
@@ -2808,7 +2982,6 @@ async function createCloudflareNode(chatId, token, env) {
     const dbName = `saow-db-${randomNum}`;
     const nodeUrl = `https://${scriptName}.${accountSubdomain}.workers.dev`;
 
-    // ساخت D1
     const dbRes = await cfFetch(`/accounts/${accountId}/d1/database`, token, {
       method: "POST",
       body: JSON.stringify({ name: dbName }),
@@ -2826,6 +2999,7 @@ async function createCloudflareNode(chatId, token, env) {
       bindings: [
         { type: "d1", name: "DB", database_id: databaseId },
         { type: "plain_text", name: "MOTHER_URL", text: motherUrl },
+        { type: "plain_text", name: "API_SECRET", text: API_SECRET },
       ],
     };
 
@@ -2841,11 +3015,12 @@ async function createCloudflareNode(chatId, token, env) {
     const uploadJson = await uploadRes.json();
 
     if (!uploadJson.success) {
-      try { await cfFetch(`/accounts/${accountId}/d1/database/${databaseId}`, token, { method: "DELETE" }); } catch {}
+      try {
+        await cfFetch(`/accounts/${accountId}/d1/database/${databaseId}`, token, { method: "DELETE" });
+      } catch {}
       return send(chatId, `❌ خطا در آپلود ورکر:\n<code>${escape(JSON.stringify(uploadJson.errors || uploadJson))}</code>`, env);
     }
 
-    // فعال‌سازی subdomain ورکر
     try {
       await cfFetch(`/accounts/${accountId}/workers/scripts/${scriptName}/subdomain`, token, {
         method: "POST",
@@ -2853,10 +3028,8 @@ async function createCloudflareNode(chatId, token, env) {
       });
     } catch {}
 
-    // ست کردن Cron Trigger (هر ۳ دقیقه)
-    const cronOk = await setChildCron(token, accountId, scriptName);
+    // دیگر نیازی به Cron روی فرزند نیست (فرزند ساکت است)
 
-    // ذخیره در D1
     await saveManagedNode(env, {
       id: scriptName,
       script_name: scriptName,
@@ -2869,13 +3042,17 @@ async function createCloudflareNode(chatId, token, env) {
     });
     await saveCfAccount(env, { account_id: accountId, token, email: "", name: accountName });
 
+    // اولین sync را فوری انجام بده
+    triggerSync(env);
+
     const successText =
       `✅ <b>نود با موفقیت ساخته شد!</b>\n\n` +
       `📛 نام: <code>${scriptName}</code>\n` +
       `🗄 دیتابیس: <code>${dbName}</code>\n` +
       `🏷 اکانت: ${escape(accountName)}\n` +
       `🔗 آدرس نود:\n<code>${nodeUrl}</code>\n\n` +
-      `اگر نود تا چند دقیقه دیگر آنلاین نشد، روی دکمه «باز کردن نود» بزنید تا فعال شود.`;
+      `معماری Push فعال است. مادر هر دقیقه همگام‌سازی می‌کند.\n` +
+      `اگر نود تا چند دقیقه دیگر آنلاین نشد، یک‌بار URL نود را باز کنید تا Worker گرم شود.`;
 
     return send(chatId, successText, env, [
       [{ text: "🌐 باز کردن نود", url: nodeUrl }],
@@ -2901,19 +3078,22 @@ async function deleteCloudflareNode(chatId, scriptName, token, env) {
       return send(chatId, `❌ خطا در حذف نود:\n<code>${escape(JSON.stringify(delRes.errors || delRes))}</code>`, env);
     }
 
-    // حذف D1 مرتبط
     try {
       const dbsRes = await cfFetch(`/accounts/${accountId}/d1/database`, token);
       if (dbsRes.success && dbsRes.result) {
-        const match = dbsRes.result.find(db => db.name && db.name.includes(scriptName.replace("saow-child-", "saow-db-")));
+        const match = dbsRes.result.find(
+          (db) => db.name && db.name.includes(scriptName.replace("saow-child-", "saow-db-"))
+        );
         if (match) {
-          await cfFetch(`/accounts/${accountId}/d1/database/${match.uuid || match.id}`, token, { method: "DELETE" });
+          await cfFetch(`/accounts/${accountId}/d1/database/${match.uuid || match.id}`, token, {
+            method: "DELETE",
+          });
         }
       }
     } catch {}
 
-    // حذف از D1 پنل
     await removeManagedNode(env, scriptName);
+    await removeChildByScriptName(env, scriptName);
 
     return send(chatId, `✅ نود <code>${escape(scriptName)}</code> با موفقیت حذف شد.`, env, [
       [{ text: "📊 وضعیت نودها", callback_data: "nodes" }],
@@ -2940,8 +3120,12 @@ async function showAccountStatus(chatId, token, env) {
     let requestsToday = "—";
     try {
       const today = new Date();
-      const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate())).toISOString().slice(0, 10);
-      const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1)).toISOString().slice(0, 10);
+      const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()))
+        .toISOString()
+        .slice(0, 10);
+      const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1))
+        .toISOString()
+        .slice(0, 10);
       const gqlQuery = {
         query: `query {
           viewer {
@@ -2979,7 +3163,6 @@ async function showAccountStatus(chatId, token, env) {
   }
 }
 
-// ====================== Update Functions ======================
 async function doUpdateMother(chatId, env, msgId) {
   try {
     const token = env.CF_TOKEN;
@@ -2988,10 +3171,12 @@ async function doUpdateMother(chatId, env, msgId) {
     const selfUrl = (env.MOTHER_URL || env._SELF_URL || "").replace(/\/$/, "");
 
     if (!token || !accountId || !scriptName) {
-      return edit(chatId, msgId,
+      return edit(
+        chatId,
+        msgId,
         `❌ برای آپدیت مادر این متغیرها لازم است:\n` +
-        `• CF_TOKEN\n• MOTHER_ACCOUNT_ID\n• WORKER_NAME\n\n` +
-        `اگر پنل با اینستالر جدید ساخته نشده، این‌ها را دستی در Worker ست کن.`,
+          `• CF_TOKEN\n• MOTHER_ACCOUNT_ID\n• WORKER_NAME\n\n` +
+          `اگر پنل با اینستالر جدید ساخته نشده، این‌ها را دستی در Worker ست کن.`,
         env,
         [[{ text: "🔙", callback_data: "nodes_manage" }]]
       );
@@ -3006,13 +3191,11 @@ async function doUpdateMother(chatId, env, msgId) {
     const workerCode = await codeRes.text();
     if (!workerCode || workerCode.length < 500) throw new Error("کد گیت‌هاب نامعتبر است");
 
-    // حفظ bindings فعلی
     let existingBindings = [];
     try {
-      const settingsRes = await fetch(
-        `${CF_API}/accounts/${accountId}/workers/scripts/${scriptName}/settings`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
+      const settingsRes = await fetch(`${CF_API}/accounts/${accountId}/workers/scripts/${scriptName}/settings`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
       const settingsData = await settingsRes.json();
       if (settingsData.success && settingsData.result?.bindings) {
         existingBindings = settingsData.result.bindings;
@@ -3040,16 +3223,19 @@ async function doUpdateMother(chatId, env, msgId) {
     form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
     form.append("worker.js", new Blob([workerCode], { type: "application/javascript+module" }), "worker.js");
 
-    const uploadRes = await fetch(
-      `${CF_API}/accounts/${accountId}/workers/scripts/${scriptName}`,
-      { method: "PUT", headers: { Authorization: `Bearer ${token}` }, body: form }
-    );
+    const uploadRes = await fetch(`${CF_API}/accounts/${accountId}/workers/scripts/${scriptName}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    });
     const uploadData = await uploadRes.json();
     if (!uploadData.success) {
       throw new Error(uploadData.errors?.[0]?.message || JSON.stringify(uploadData));
     }
 
-    return edit(chatId, msgId,
+    return edit(
+      chatId,
+      msgId,
       `✅ <b>نود مادر آپدیت شد</b>\n\n📦 <code>${escape(scriptName)}</code>\n🌐 <code>${escape(selfUrl)}</code>`,
       env,
       [
@@ -3058,11 +3244,9 @@ async function doUpdateMother(chatId, env, msgId) {
       ]
     );
   } catch (err) {
-    return edit(chatId, msgId,
-      `❌ خطا در آپدیت مادر:\n<code>${escape(err.message)}</code>`,
-      env,
-      [[{ text: "🔙", callback_data: "nodes_manage" }]]
-    );
+    return edit(chatId, msgId, `❌ خطا در آپدیت مادر:\n<code>${escape(err.message)}</code>`, env, [
+      [{ text: "🔙", callback_data: "nodes_manage" }],
+    ]);
   }
 }
 
@@ -3082,39 +3266,29 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
     const oldDbId = node.db_id;
     const oldDbName = node.db_name;
 
-    // 1) حذف Worker
     try {
       await cfFetch(`/accounts/${accountId}/workers/scripts/${oldScript}`, token, { method: "DELETE" });
     } catch (e) {
       console.log("delete worker warning:", e?.message);
     }
 
-    // 2) حذف D1 با id ذخیره‌شده
     if (oldDbId) {
       try {
-        const delDb = await cfFetch(
-          `/accounts/${accountId}/d1/database/${oldDbId}`,
-          token,
-          { method: "DELETE" }
-        );
-        console.log("delete D1 by id:", delDb);
+        await cfFetch(`/accounts/${accountId}/d1/database/${oldDbId}`, token, { method: "DELETE" });
       } catch (e) {
         console.log("delete D1 by id failed:", e?.message);
       }
     }
 
-    // 3) اگر با id پاک نشد، با نام پیدا کن و پاک کن
     try {
       const dbsRes = await cfFetch(`/accounts/${accountId}/d1/database`, token);
       if (dbsRes.success && Array.isArray(dbsRes.result)) {
         for (const db of dbsRes.result) {
           const name = db.name || "";
           const id = db.uuid || db.id;
-          // همون db قبلی
           if (oldDbName && name === oldDbName) {
             await cfFetch(`/accounts/${accountId}/d1/database/${id}`, token, { method: "DELETE" });
           }
-          // یا هم‌نام اسکریپت
           if (name === oldScript || name === `saow-db-${oldScript.replace("saow-child-", "")}`) {
             await cfFetch(`/accounts/${accountId}/d1/database/${id}`, token, { method: "DELETE" });
           }
@@ -3127,7 +3301,6 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
     await removeChildByScriptName(env, oldScript);
     await removeManagedNode(env, nodeId);
 
-    // کمی صبر تا حذف در کلودفلر اعمال شود
     await new Promise((r) => setTimeout(r, 2000));
 
     await edit(chatId, msgId, "⏳ نود قدیمی حذف شد. در حال نصب نسخه جدید...", env);
@@ -3137,14 +3310,6 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
       [{ text: "🔙", callback_data: "nodes" }],
     ]);
   }
-}
-
-async function deleteCloudflareNodeInternal(scriptName, token, env) {
-  const accountsRes = await cfFetch("/accounts?per_page=5", token);
-  if (!accountsRes.success) return;
-  const accountId = accountsRes.result[0].id;
-  await cfFetch(`/accounts/${accountId}/workers/scripts/${scriptName}`, token, { method: "DELETE" });
-  await removeManagedNode(env, scriptName);
 }
 
 // ====================== D1 Helpers for Managed Nodes ======================
@@ -3157,30 +3322,29 @@ async function saveManagedNode(env, data) {
       script_name=excluded.script_name, account_id=excluded.account_id,
       db_id=excluded.db_id, db_name=excluded.db_name, token_encrypted=excluded.token_encrypted,
       url=excluded.url
-  `).bind(
-    data.id, data.script_name, data.account_id, data.db_id, data.db_name,
-    data.token_encrypted, data.url, data.created_at
-  ).run();
+  `)
+    .bind(
+      data.id,
+      data.script_name,
+      data.account_id,
+      data.db_id,
+      data.db_name,
+      data.token_encrypted,
+      data.url,
+      data.created_at
+    )
+    .run();
 }
 
 async function getManagedNodes(env) {
   try {
-    const { results } = await env.DB.prepare(
-      "SELECT * FROM managed_nodes ORDER BY id ASC"
-    ).all();
+    const { results } = await env.DB.prepare("SELECT * FROM managed_nodes ORDER BY id ASC").all();
     return results || [];
   } catch (err) {
-    // اگر ارور مربوط به عدم وجود ستون is_disabled بود، آن را خودکار می‌سازد
     if (err.message && err.message.includes("no such column: is_disabled")) {
       try {
-        await env.DB.prepare(
-          "ALTER TABLE managed_nodes ADD COLUMN is_disabled INTEGER DEFAULT 0;"
-        ).run();
-        
-        // تلاش مجدد برای دریافت نودها پس از ساخت ستون
-        const { results } = await env.DB.prepare(
-          "SELECT * FROM managed_nodes ORDER BY id ASC"
-        ).all();
+        await env.DB.prepare("ALTER TABLE managed_nodes ADD COLUMN is_disabled INTEGER DEFAULT 0;").run();
+        const { results } = await env.DB.prepare("SELECT * FROM managed_nodes ORDER BY id ASC").all();
         return results || [];
       } catch (alterErr) {
         console.error("خطا در اضافه کردن ستون is_disabled:", alterErr);
@@ -3195,7 +3359,9 @@ async function getManagedNode(env, id) {
   if (!(await d1Ready(env))) return null;
   try {
     return await env.DB.prepare("SELECT * FROM managed_nodes WHERE id = ?").bind(id).first();
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 async function removeManagedNode(env, id) {
@@ -3211,11 +3377,12 @@ async function saveCfAccount(env, data) {
     INSERT INTO cf_accounts (account_id, token, email, name, updated_at)
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(account_id) DO UPDATE SET token=excluded.token, email=excluded.email, name=excluded.name, updated_at=excluded.updated_at
-  `).bind(data.account_id, data.token, data.email || "", data.name || "", Date.now()).run();
+  `)
+    .bind(data.account_id, data.token, data.email || "", data.name || "", Date.now())
+    .run();
 }
 
 async function getMotherAccountId(env) {
-  // می‌توانید account_id مادر را در env یا جدول ذخیره کنید
   return env.MOTHER_ACCOUNT_ID || null;
 }
 
@@ -3284,7 +3451,6 @@ async function d1Ready(env) {
       )`),
     ]);
 
-    // alters for older tables
     const alters = [
       `ALTER TABLE users ADD COLUMN speed_limit_kbps INTEGER DEFAULT 0`,
       `ALTER TABLE users ADD COLUMN daily_quota_bytes INTEGER DEFAULT 0`,
@@ -3300,7 +3466,9 @@ async function d1Ready(env) {
     ];
 
     for (const sql of alters) {
-      try { await env.DB.prepare(sql).run(); } catch {}
+      try {
+        await env.DB.prepare(sql).run();
+      } catch {}
     }
 
     dbInitialized = true;
@@ -3322,7 +3490,7 @@ function generateUuid() {
   const b = crypto.getRandomValues(new Uint8Array(16));
   b[6] = (b[6] & 0x0f) | 0x40;
   b[8] = (b[8] & 0x3f) | 0x80;
-  const h = [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+  const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
@@ -3343,29 +3511,44 @@ async function getUsers(env) {
   try {
     const rows = await env.DB.prepare("SELECT * FROM users").all();
     return (rows.results || []).map(mapUserRow);
-  } catch { return []; }
+  } catch {
+    return [];
+  }
 }
 async function getUserByUuid(env, uuid) {
   if (!(await d1Ready(env))) return null;
   try {
     const row = await env.DB.prepare("SELECT * FROM users WHERE uuid = ? COLLATE NOCASE").bind(uuid).first();
     return row ? mapUserRow(row) : null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 async function getUserById(env, id) {
   if (!(await d1Ready(env))) return null;
   try {
     const row = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
     return row ? mapUserRow(row) : null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 function mapUserRow(row) {
   return {
-    id: row.id, name: row.name, uuid: row.uuid, enabled: !!row.enabled, expiry: row.expiry,
-    quotaBytes: row.quota_bytes || 0, dailyQuotaBytes: row.daily_quota_bytes || 0,
-    speedLimitKBps: row.speed_limit_kbps || 0, ipLimit: row.ip_limit || 1,
-    cleanIp: row.clean_ip || "", blockAds: !!row.block_ads, notes: row.notes || "",
-    createdAt: row.created_at || 0, updatedAt: row.updated_at || 0,
+    id: row.id,
+    name: row.name,
+    uuid: row.uuid,
+    enabled: !!row.enabled,
+    expiry: row.expiry,
+    quotaBytes: row.quota_bytes || 0,
+    dailyQuotaBytes: row.daily_quota_bytes || 0,
+    speedLimitKBps: row.speed_limit_kbps || 0,
+    ipLimit: row.ip_limit || 1,
+    cleanIp: row.clean_ip || "",
+    blockAds: !!row.block_ads,
+    notes: row.notes || "",
+    createdAt: row.created_at || 0,
+    updatedAt: row.updated_at || 0,
   };
 }
 async function upsertUser(env, data) {
@@ -3381,11 +3564,24 @@ async function upsertUser(env, data) {
         quota_bytes=excluded.quota_bytes, daily_quota_bytes=excluded.daily_quota_bytes,
         speed_limit_kbps=excluded.speed_limit_kbps, ip_limit=excluded.ip_limit,
         clean_ip=excluded.clean_ip, block_ads=excluded.block_ads, notes=excluded.notes, updated_at=excluded.updated_at
-    `).bind(
-      data.id, data.name, data.uuid, data.enabled ? 1 : 0, data.expiry || null,
-      data.quotaBytes || 0, data.dailyQuotaBytes || 0, data.speedLimitKBps || 0,
-      data.ipLimit ?? 1, data.cleanIp || "", data.blockAds ? 1 : 0, data.notes || "", now, now
-    ).run();
+    `)
+      .bind(
+        data.id,
+        data.name,
+        data.uuid,
+        data.enabled ? 1 : 0,
+        data.expiry || null,
+        data.quotaBytes || 0,
+        data.dailyQuotaBytes || 0,
+        data.speedLimitKBps || 0,
+        data.ipLimit ?? 1,
+        data.cleanIp || "",
+        data.blockAds ? 1 : 0,
+        data.notes || "",
+        now,
+        now
+      )
+      .run();
     return true;
   } catch (e) {
     console.error("upsertUser", e);
@@ -3402,7 +3598,9 @@ async function deleteUser(env, id) {
       env.DB.prepare("DELETE FROM active_ips WHERE user_id = ?").bind(id),
     ]);
     return true;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 async function resetUsage(env, userId) {
   if (!(await d1Ready(env))) return false;
@@ -3412,7 +3610,9 @@ async function resetUsage(env, userId) {
       env.DB.prepare("DELETE FROM usage_daily WHERE user_id = ?").bind(userId),
     ]);
     return true;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 async function addUsage(env, userId, up, down) {
   if (!(await d1Ready(env)) || up + down <= 0) return;
@@ -3438,52 +3638,22 @@ async function getUsage(env, userId) {
     if (!(await d1Ready(env))) return { up: 0, down: 0, total: 0 };
     const row = await env.DB.prepare("SELECT up, down, total FROM usage WHERE user_id = ?").bind(userId).first();
     return row || { up: 0, down: 0, total: 0 };
-  } catch { return { up: 0, down: 0, total: 0 }; }
+  } catch {
+    return { up: 0, down: 0, total: 0 };
+  }
 }
 async function getDailyUsage(env, userId) {
   try {
     if (!(await d1Ready(env))) return { up: 0, down: 0, total: 0 };
     const row = await env.DB.prepare("SELECT up, down, total FROM usage_daily WHERE user_id = ? AND day = ?")
-      .bind(userId, todayKey()).first();
+      .bind(userId, todayKey())
+      .first();
     return row || { up: 0, down: 0, total: 0 };
-  } catch { return { up: 0, down: 0, total: 0 }; }
-}
-async function registerChild(env, data) {
-  if (!(await d1Ready(env))) return false;
-  const now = Date.now();
-
-  // استخراج نام اسکریپت از child_id (مثلاً child-saow-child-56448-...)
-  const scriptName = (data.id || "").replace(/^child-/, "").split("-workers-dev")[0] || data.id;
-
-  const managed = await env.DB.prepare(
-    "SELECT is_disabled FROM managed_nodes WHERE script_name = ? OR script_name LIKE ?"
-  ).bind(scriptName, `%${scriptName}%`).first();
-
-  if (managed && managed.is_disabled === 1) {
-    await env.DB.prepare(
-      "UPDATE children SET healthy = 0, last_seen = ? WHERE id LIKE ?"
-    ).bind(now, `%${data.id || scriptName}%`).run();
-    return false;
-  }
-
-  try {
-    await env.DB.prepare(`
-      INSERT INTO children (id, url, version, capacity, last_seen, active_users, healthy, meta)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        url = CASE WHEN excluded.url != '' THEN excluded.url ELSE children.url END,
-        version = excluded.version, capacity = excluded.capacity,
-        last_seen = excluded.last_seen, active_users = excluded.active_users, healthy = 1
-    `).bind(
-      data.id, data.url || "", data.version || "", data.capacity || 50,
-      now, data.active || 0, JSON.stringify(data.meta || {})
-    ).run();
-    return true;
-  } catch (e) {
-    console.error("registerChild error", e);
-    return false;
+  } catch {
+    return { up: 0, down: 0, total: 0 };
   }
 }
+
 async function getHealthyChildren(env) {
   try {
     if (!(await d1Ready(env))) return [];
@@ -3491,73 +3661,65 @@ async function getHealthyChildren(env) {
     const now = Date.now();
     const rows = await env.DB.prepare(`
       SELECT * FROM children WHERE last_seen > ? ORDER BY active_users ASC
-    `).bind(now - NODE_TTL).all();
-    return (rows.results || []).map(r => ({
-      id: r.id, url: r.url, version: r.version, capacity: r.capacity,
-      lastSeen: r.last_seen, activeUsers: r.active_users,
+    `)
+      .bind(now - NODE_TTL)
+      .all();
+    return (rows.results || []).map((r) => ({
+      id: r.id,
+      url: r.url,
+      version: r.version,
+      capacity: r.capacity,
+      lastSeen: r.last_seen,
+      activeUsers: r.active_users,
     }));
-  } catch { return []; }
-}
-
-// IP limit
-async function touchAndCheckIpLimit(env, user, clientIp, childId = "") {
-  const limit = Number(user.ipLimit) > 0 ? Number(user.ipLimit) : 0;
-  if (!limit || !clientIp) return { ok: true, online: 0 };
-  if (!(await d1Ready(env))) return { ok: true, online: 0 };
-  const now = Date.now();
-  try {
-    await env.DB.prepare("DELETE FROM active_ips WHERE user_id = ? AND last_seen < ?")
-      .bind(user.id, now - IP_IDLE_MS).run();
-    const existing = await env.DB.prepare("SELECT ip FROM active_ips WHERE user_id = ? AND ip = ?")
-      .bind(user.id, clientIp).first();
-    if (existing) {
-      await env.DB.prepare("UPDATE active_ips SET last_seen = ?, child_id = ? WHERE user_id = ? AND ip = ?")
-        .bind(now, childId || "", user.id, clientIp).run();
-    } else {
-      const cntRow = await env.DB.prepare("SELECT COUNT(*) AS c FROM active_ips WHERE user_id = ?").bind(user.id).first();
-      const online = (cntRow && cntRow.c) || 0;
-      if (online >= limit) return { ok: false, online, reason: "ip-limit" };
-      await env.DB.prepare(`
-        INSERT INTO active_ips (user_id, ip, last_seen, child_id) VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id, ip) DO UPDATE SET last_seen = excluded.last_seen, child_id = excluded.child_id
-      `).bind(user.id, clientIp, now, childId || "").run();
-    }
-    const finalCnt = await env.DB.prepare("SELECT COUNT(*) AS c FROM active_ips WHERE user_id = ?").bind(user.id).first();
-    return { ok: true, online: (finalCnt && finalCnt.c) || 1 };
   } catch {
-    return { ok: true, online: 0 };
+    return [];
   }
 }
+
 async function getActiveIPCount(env, userId) {
   if (!(await d1Ready(env))) return 0;
   try {
     const now = Date.now();
     await env.DB.prepare("DELETE FROM active_ips WHERE user_id = ? AND last_seen < ?")
-      .bind(userId, now - IP_IDLE_MS).run();
+      .bind(userId, now - IP_IDLE_MS)
+      .run();
     const row = await env.DB.prepare("SELECT COUNT(*) AS c FROM active_ips WHERE user_id = ?").bind(userId).first();
     return (row && row.c) || 0;
-  } catch { return 0; }
+  } catch {
+    return 0;
+  }
 }
 async function listActiveIps(env, userId) {
   if (!(await d1Ready(env))) return [];
   try {
     const now = Date.now();
     await env.DB.prepare("DELETE FROM active_ips WHERE user_id = ? AND last_seen < ?")
-      .bind(userId, now - IP_IDLE_MS).run();
-    const rows = await env.DB.prepare("SELECT ip, last_seen, child_id FROM active_ips WHERE user_id = ? ORDER BY last_seen DESC")
-      .bind(userId).all();
-    return (rows.results || []).map(r => ({
-      ip: r.ip, lastSeen: r.last_seen,
-      ageSec: Math.floor((now - r.last_seen) / 1000), childId: r.child_id || "",
+      .bind(userId, now - IP_IDLE_MS)
+      .run();
+    const rows = await env.DB.prepare(
+      "SELECT ip, last_seen, child_id FROM active_ips WHERE user_id = ? ORDER BY last_seen DESC"
+    )
+      .bind(userId)
+      .all();
+    return (rows.results || []).map((r) => ({
+      ip: r.ip,
+      lastSeen: r.last_seen,
+      ageSec: Math.floor((now - r.last_seen) / 1000),
+      childId: r.child_id || "",
     }));
-  } catch { return []; }
+  } catch {
+    return [];
+  }
 }
 async function clearActiveIps(env, userId) {
   if (!(await d1Ready(env))) return false;
   try {
     await env.DB.prepare("DELETE FROM active_ips WHERE user_id = ?").bind(userId).run();
     return true;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 async function buildFullUser(env, user) {
@@ -3576,7 +3738,10 @@ async function buildFullUser(env, user) {
     ...user,
     status,
     usage: {
-      total: total.total || 0, up: total.up || 0, down: total.down || 0, daily: daily.total || 0,
+      total: total.total || 0,
+      up: total.up || 0,
+      down: total.down || 0,
+      daily: daily.total || 0,
       totalGB: +((total.total || 0) / 1073741824).toFixed(3),
       dailyGB: +((daily.total || 0) / 1073741824).toFixed(3),
     },
@@ -3588,51 +3753,76 @@ async function buildFullUser(env, user) {
 
 async function getStatusData(env) {
   const users = await getUsers(env);
-  const full = await Promise.all(users.map(u => buildFullUser(env, u)));
+  const full = await Promise.all(users.map((u) => buildFullUser(env, u)));
   const nodes = await getHealthyChildren(env);
   const totalTraffic = full.reduce((s, u) => s + (u.usage.total || 0), 0);
   return {
     version: VERSION,
     users: full.length,
-    activeUsers: full.filter(u => u.status === "active").length,
-    onlineUsers: full.filter(u => u.activeIPs > 0).length,
+    activeUsers: full.filter((u) => u.status === "active").length,
+    onlineUsers: full.filter((u) => u.activeIPs > 0).length,
     nodes: nodes.length,
     totalTrafficGB: +(totalTraffic / 1073741824).toFixed(3),
-    live: full.map(u => ({
-      id: u.id, name: u.name, status: u.status, activeIPs: u.activeIPs,
-      usageGB: u.usage.totalGB, ipLimit: u.ipLimit,
+    live: full.map((u) => ({
+      id: u.id,
+      name: u.name,
+      status: u.status,
+      activeIPs: u.activeIPs,
+      usageGB: u.usage.totalGB,
+      ipLimit: u.ipLimit,
     })),
   };
 }
 
-// Domains / IRCF / Subscription (same logic as original mother)
+// Domains / IRCF / Subscription
 const DOMAINS_URL = "https://raw.githubusercontent.com/isfwic10-arch/cf-domains/refs/heads/main/domains.txt";
 const DOMAINS_TTL_MS = 30 * 60 * 1000;
-let domainsList = null, domainsListAt = 0, domainsLoading = null;
+let domainsList = null,
+  domainsListAt = 0,
+  domainsLoading = null;
 const IRCF_DOMAINS = [
-  { domain: "ipv4.ircf.space", name: "ipv4" }, { domain: "mci.ircf.space", name: "mci" },
-  { domain: "mtn.ircf.space", name: "mtn" }, { domain: "mkh.ircf.space", name: "mkh" },
-  { domain: "rtl.ircf.space", name: "rtl" }, { domain: "hwb.ircf.space", name: "hwb" },
-  { domain: "ast.ircf.space", name: "ast" }, { domain: "sht.ircf.space", name: "sht" },
-  { domain: "prs.ircf.space", name: "prs" }, { domain: "mbt.ircf.space", name: "mbt" },
-  { domain: "ask.ircf.space", name: "ask" }, { domain: "rsp.ircf.space", name: "rsp" },
-  { domain: "afn.ircf.space", name: "afn" }, { domain: "ztl.ircf.space", name: "ztl" },
-  { domain: "psm.ircf.space", name: "psm" }, { domain: "arx.ircf.space", name: "arx" },
-  { domain: "smt.ircf.space", name: "smt" }, { domain: "shm.ircf.space", name: "shm" },
-  { domain: "fnv.ircf.space", name: "fnv" }, { domain: "dbn.ircf.space", name: "dbn" },
-  { domain: "apt.ircf.space", name: "apt" }, { domain: "fnp.ircf.space", name: "fnp" },
-  { domain: "ryn.ircf.space", name: "ryn" }, { domain: "sbn.ircf.space", name: "sbn" },
-  { domain: "ptk.ircf.space", name: "ptk" }, { domain: "atc.ircf.space", name: "atc" },
+  { domain: "ipv4.ircf.space", name: "ipv4" },
+  { domain: "mci.ircf.space", name: "mci" },
+  { domain: "mtn.ircf.space", name: "mtn" },
+  { domain: "mkh.ircf.space", name: "mkh" },
+  { domain: "rtl.ircf.space", name: "rtl" },
+  { domain: "hwb.ircf.space", name: "hwb" },
+  { domain: "ast.ircf.space", name: "ast" },
+  { domain: "sht.ircf.space", name: "sht" },
+  { domain: "prs.ircf.space", name: "prs" },
+  { domain: "mbt.ircf.space", name: "mbt" },
+  { domain: "ask.ircf.space", name: "ask" },
+  { domain: "rsp.ircf.space", name: "rsp" },
+  { domain: "afn.ircf.space", name: "afn" },
+  { domain: "ztl.ircf.space", name: "ztl" },
+  { domain: "psm.ircf.space", name: "psm" },
+  { domain: "arx.ircf.space", name: "arx" },
+  { domain: "smt.ircf.space", name: "smt" },
+  { domain: "shm.ircf.space", name: "shm" },
+  { domain: "fnv.ircf.space", name: "fnv" },
+  { domain: "dbn.ircf.space", name: "dbn" },
+  { domain: "apt.ircf.space", name: "apt" },
+  { domain: "fnp.ircf.space", name: "fnp" },
+  { domain: "ryn.ircf.space", name: "ryn" },
+  { domain: "sbn.ircf.space", name: "sbn" },
+  { domain: "ptk.ircf.space", name: "ptk" },
+  { domain: "atc.ircf.space", name: "atc" },
 ];
 const IRCF_CACHE_TTL = 5 * 60 * 1000;
-let ircfCache = null, ircfCacheAt = 0, ircfLoading = null;
+let ircfCache = null,
+  ircfCacheAt = 0,
+  ircfLoading = null;
 
 function parseDomainsText(text) {
-  const list = []; const seen = new Set();
-  for (let p of String(text || "").replace(/\r/g, "\n").split(/[\n,;]+/)) {
+  const list = [];
+  const seen = new Set();
+  for (let p of String(text || "")
+    .replace(/\r/g, "\n")
+    .split(/[\n,;]+/)) {
     p = p.trim().toLowerCase().replace(/^\.+|\.+$/g, "");
     if (p.length >= 3 && p.length <= 253 && !/[^a-z0-9.:-]/i.test(p) && !seen.has(p)) {
-      seen.add(p); list.push(p);
+      seen.add(p);
+      list.push(p);
     }
   }
   return list;
@@ -3646,40 +3836,60 @@ async function ensureDomainsList() {
       const r = await fetch(DOMAINS_URL, { cf: { cacheTtl: 1800, cacheEverything: true } });
       if (r.ok) {
         const list = parseDomainsText(await r.text());
-        if (list.length) { domainsList = list; domainsListAt = Date.now(); return list; }
+        if (list.length) {
+          domainsList = list;
+          domainsListAt = Date.now();
+          return list;
+        }
       }
     } catch {}
     return domainsList || [];
   })();
-  try { return await domainsLoading; } finally { domainsLoading = null; }
+  try {
+    return await domainsLoading;
+  } finally {
+    domainsLoading = null;
+  }
 }
 async function resolveDomain(domain) {
   try {
     const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=A`, {
-      headers: { Accept: "application/dns-json" }, cf: { cacheTtl: 300, cacheEverything: true },
+      headers: { Accept: "application/dns-json" },
+      cf: { cacheTtl: 300, cacheEverything: true },
     });
     if (!res.ok) return null;
     const data = await res.json();
-    const answers = (data.Answer || []).filter(a => a.type === 1 && a.data);
+    const answers = (data.Answer || []).filter((a) => a.type === 1 && a.data);
     if (!answers.length) return null;
     return answers[Math.floor(Math.random() * answers.length)].data;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 async function ensureIrcfResolved() {
   const now = Date.now();
   if (ircfCache && now - ircfCacheAt < IRCF_CACHE_TTL) return ircfCache;
   if (ircfLoading) return ircfLoading;
   ircfLoading = (async () => {
-    const results = await Promise.all(IRCF_DOMAINS.map(async item => {
-      const ip = await resolveDomain(item.domain);
-      return { ...item, ip };
-    }));
+    const results = await Promise.all(
+      IRCF_DOMAINS.map(async (item) => {
+        const ip = await resolveDomain(item.domain);
+        return { ...item, ip };
+      })
+    );
     const map = {};
     for (const r of results) if (r.ip) map[r.domain] = r.ip;
-    if (Object.keys(map).length >= 2) { ircfCache = map; ircfCacheAt = Date.now(); }
+    if (Object.keys(map).length >= 2) {
+      ircfCache = map;
+      ircfCacheAt = Date.now();
+    }
     return ircfCache || map;
   })();
-  try { return await ircfLoading; } finally { ircfLoading = null; }
+  try {
+    return await ircfLoading;
+  } finally {
+    ircfLoading = null;
+  }
 }
 
 function formatBytesShort(n) {
@@ -3696,7 +3906,14 @@ function daysRemaining(expiry) {
 }
 function buildVlessLink({ ip, port, uuid, host, path, name, fp = "chrome" }) {
   const qs = new URLSearchParams({
-    security: "tls", sni: host, fp, type: "ws", path: path || "/", host, encryption: "none", alpn: "http/1.1",
+    security: "tls",
+    sni: host,
+    fp,
+    type: "ws",
+    path: path || "/",
+    host,
+    encryption: "none",
+    alpn: "http/1.1",
   });
   return `vless://${uuid}@${ip}:${port}?${qs.toString()}#${encodeURIComponent(name)}`;
 }
@@ -3722,16 +3939,16 @@ async function generateSubscription(env, user, motherHost) {
     return links.join("\n");
   }
 
-  // ---- انتخاب نود معتبر ----
   const rawManaged = await getManagedNodes(env);
-  
-  // 🟢 تغییر اصلی: فیلتر کردن نودهای قفل‌شده (is_disabled === 1)
-  const managed = rawManaged.filter(m => m.is_disabled !== 1);
-  
+  const managed = rawManaged.filter((m) => m.is_disabled !== 1);
   const alive = await getHealthyChildren(env);
 
   function hostFromUrl(u) {
-    try { return new URL(u).hostname; } catch { return null; }
+    try {
+      return new URL(u).hostname;
+    } catch {
+      return null;
+    }
   }
 
   function isAliveMatch(m, a) {
@@ -3747,22 +3964,19 @@ async function generateSubscription(env, user, motherHost) {
 
   let selectedUrl = null;
 
-  // 1) managed فعال که آنلاین است
   for (const m of managed) {
     if (!m.url) continue;
     if (alive.some((a) => isAliveMatch(m, a))) {
-        selectedUrl = m.url;
-        break;
+      selectedUrl = m.url;
+      break;
     }
   }
 
-  // 2) اگر هیچ managed آنلاینی نبود، اولین managed فعال با url
   if (!selectedUrl) {
     const withUrl = managed.find((m) => m.url);
     if (withUrl) selectedUrl = withUrl.url;
   }
 
-  // 3) سازگاری: اگر managed خالی بود از alive
   if (!selectedUrl && alive.length && alive[0].url) {
     selectedUrl = alive[0].url;
   }
@@ -3779,55 +3993,65 @@ async function generateSubscription(env, user, motherHost) {
   }
 
   const activeCount = await getActiveIPCount(env, user.id);
-  links.push(buildVlessLink({
-    ip: "127.0.0.1",
-    port: 1,
-    uuid: user.uuid,
-    host: motherHost,
-    path: "/",
-    name: `📋 ${formatBytesShort(total.total)} / ${user.quotaBytes > 0 ? formatBytesShort(user.quotaBytes) : "∞"} | ${daysRemaining(user.expiry)}d | IP:${activeCount}/${user.ipLimit}`,
-  }));
+  links.push(
+    buildVlessLink({
+      ip: "127.0.0.1",
+      port: 1,
+      uuid: user.uuid,
+      host: motherHost,
+      path: "/",
+      name: `📋 ${formatBytesShort(total.total)} / ${user.quotaBytes > 0 ? formatBytesShort(user.quotaBytes) : "∞"} | ${daysRemaining(user.expiry)}d | IP:${activeCount}/${user.ipLimit}`,
+    })
+  );
 
   let gh = [];
-  try { gh = await ensureDomainsList(); } catch {}
+  try {
+    gh = await ensureDomainsList();
+  } catch {}
   const preferred = (gh || []).slice(0, 3);
   const ports = [443, 8443, 2053];
   const fps = ["chrome", "firefox", "safari"];
   for (let i = 0; i < preferred.length; i++) {
-    links.push(buildVlessLink({
-      ip: preferred[i],
-      port: ports[i % ports.length],
-      uuid: user.uuid,
-      host: childHost,
-      path: `/?u=${user.id}`,
-      name: `⭐ ${base} | P${i + 1}`,
-      fp: fps[i % fps.length],
-    }));
+    links.push(
+      buildVlessLink({
+        ip: preferred[i],
+        port: ports[i % ports.length],
+        uuid: user.uuid,
+        host: childHost,
+        path: `/?u=${user.id}`,
+        name: `⭐ ${base} | P${i + 1}`,
+        fp: fps[i % fps.length],
+      })
+    );
   }
 
   let resolved = {};
-  try { resolved = await ensureIrcfResolved(); } catch {}
+  try {
+    resolved = await ensureIrcfResolved();
+  } catch {}
   let idx = 0;
   const ircfFps = ["chrome", "firefox", "safari", "edge", "random"];
   for (const item of IRCF_DOMAINS) {
     const ip = resolved[item.domain];
     if (!ip) continue;
-    links.push(buildVlessLink({
-      ip,
-      port: 443,
-      uuid: user.uuid,
-      host: childHost,
-      path: `/?u=${user.id}`,
-      name: `⚡ ${base} | ${item.name}`,
-      fp: ircfFps[idx % ircfFps.length],
-    }));
+    links.push(
+      buildVlessLink({
+        ip,
+        port: 443,
+        uuid: user.uuid,
+        host: childHost,
+        path: `/?u=${user.id}`,
+        name: `⚡ ${base} | ${item.name}`,
+        fp: ircfFps[idx % ircfFps.length],
+      })
+    );
     idx++;
   }
 
   return links.join("\n");
 }
 
-// ====================== API for Child Nodes ======================
+// ====================== API (دیگر برای گزارش از فرزند استفاده نمی‌شود) ======================
 async function handleApi(request, env, path) {
   try {
     if (request.method === "OPTIONS") {
@@ -3840,154 +4064,12 @@ async function handleApi(request, env, path) {
       });
     }
 
-    if (path === "/node/report" && request.method === "POST") {
-        const body = await request.json();
-        const { type, child_id, uuid } = body;
+    // در معماری جدید فرزند هیچ درخواستی به مادر نمی‌زند.
+    // اگر هنوز درخواست قدیمی آمد، رد می‌کنیم.
+    if (path === "/node/report") {
+      return json({ ok: false, err: "push-mode: children must not initiate requests" }, 403);
+    }
 
-        // ---- فقط نودهای ثبت‌شده در managed_nodes مجاز هستند ----
-        const managedNodes = await getManagedNodes(env);
-        const matchedNode = managedNodes.find(m =>
-            child_id?.includes(m.script_name) ||
-            (m.url && child_id?.includes(String(m.script_name || "").replace(/-/g, ""))) ||
-            (m.script_name && child_id?.includes(m.script_name.replace(/-/g, "")))
-        );
-
-        // نود ناشناس یا حذف‌شده → کاملاً رد
-        if (!matchedNode) {
-            if (type === "heartbeat") {
-            // حتی heartbeat را هم قبول نکن (در children ذخیره نشود)
-            return json({ ok: false, reason: "unknown node" }, 403);
-            }
-            // connect / usage / disconnect
-            return json({
-            ok: false,
-            action: "close",
-            enabled: false,
-            reason: "Node is not registered"
-            }, 403);
-        }
-
-        // نود قفل‌شده
-        if (matchedNode.is_disabled === 1) {
-            if (type === "connect" || type === "usage") {
-            return json({
-                ok: false,
-                action: "close",
-                enabled: false,
-                reason: "Node is disabled by admin"
-            });
-            }
-            if (type === "heartbeat") {
-            return json({ ok: true, status: "disabled" });
-            }
-        }
-
-        // ---- از اینجا به بعد فقط نودهای معتبر ----
-
-        if (type === "heartbeat") {
-            const ok = await registerChild(env, {
-            id: child_id,
-            url: body.url || "",
-            version: body.version || "",
-            capacity: body.capacity || 50,
-            active: body.active || 0,
-            meta: body.meta || {},
-            });
-            return json({ ok: !!ok });
-        }
-
-        let user = null;
-        if (uuid) {
-            user = await getUserByUuid(env, uuid);
-        }
-
-        if (!user) {
-            return json({ ok: false, action: "close", reason: "user not found", enabled: false }, 404);
-        }
-
-        if (type === "connect") {
-            const ipCheck = await touchAndCheckIpLimit(env, user, body.ip, child_id);
-            if (!ipCheck.ok) return json({ ok: true, action: "close", reason: "IP limit exceeded", enabled: false });
-            if (!user.enabled) return json({ ok: true, action: "close", reason: "disabled", enabled: false });
-
-            const total = await getUsage(env, user.id);
-            const daily = await getDailyUsage(env, user.id);
-
-            if (user.quotaBytes > 0 && total.total >= user.quotaBytes) {
-            return json({ ok: true, action: "close", reason: "quota exceeded", enabled: false });
-            }
-            if (user.dailyQuotaBytes > 0 && daily.total >= user.dailyQuotaBytes) {
-            return json({ ok: true, action: "close", reason: "daily quota exceeded", enabled: false });
-            }
-
-            return json({
-            ok: true,
-            enabled: true,
-            online: ipCheck.online,
-            config: {
-                enabled: user.enabled,
-                speedLimitKBps: user.speedLimitKBps,
-                blockAds: user.blockAds,
-                ipLimit: user.ipLimit,
-                quotaBytes: user.quotaBytes,
-                dailyQuotaBytes: user.dailyQuotaBytes
-            },
-            });
-        }
-
-        if (type === "disconnect") {
-            if ((body.up || 0) + (body.down || 0) > 0) {
-            await addUsage(env, user.id, body.up || 0, body.down || 0);
-            }
-            return json({ ok: true });
-        }
-
-        if (type === "usage") {
-            const up = body.up || 0, down = body.down || 0;
-            if (up + down > 0) await addUsage(env, user.id, up, down);
-            if (body.ip) await touchAndCheckIpLimit(env, user, body.ip, child_id);
-
-            const total = await getUsage(env, user.id);
-            const daily = await getDailyUsage(env, user.id);
-
-            let action = "continue", reason = "", enabled = user.enabled;
-
-            if (!user.enabled) {
-            action = "close";
-            reason = "disabled";
-            enabled = false;
-            } else if (user.quotaBytes > 0 && total.total >= user.quotaBytes) {
-            action = "close";
-            reason = "quota exceeded";
-            await upsertUser(env, { ...user, enabled: false, notes: "Auto disabled: quota exceeded" });
-            enabled = false;
-            } else if (user.dailyQuotaBytes > 0 && daily.total >= user.dailyQuotaBytes) {
-            action = "close";
-            reason = "daily quota exceeded";
-            enabled = false;
-            }
-
-            return json({
-            ok: true,
-            action,
-            reason,
-            enabled,
-            usage: { total: total.total, daily: daily.total },
-            config: {
-                enabled,
-                speedLimitKBps: user.speedLimitKBps,
-                blockAds: user.blockAds,
-                ipLimit: user.ipLimit,
-                quotaBytes: user.quotaBytes,
-                dailyQuotaBytes: user.dailyQuotaBytes
-            },
-            });
-        }
-
-        return json({ ok: false, err: "unknown type" }, 400);
-        }
-
-    // بقیه مسیرهای API برای سازگاری (اختیاری)
     const authErr = requireAuth(request);
     if (authErr) return authErr;
 
@@ -4008,7 +4090,7 @@ async function handleApi(request, env, path) {
         return json({ ok: true, user: await buildFullUser(env, user) });
       }
       const users = await getUsers(env);
-      const list = await Promise.all(users.map(u => buildFullUser(env, u)));
+      const list = await Promise.all(users.map((u) => buildFullUser(env, u)));
       return json({ ok: true, users: list, total: list.length, version: VERSION });
     }
 
@@ -4020,51 +4102,16 @@ async function handleApi(request, env, path) {
 }
 
 // ====================== Helpers ======================
-
-/**
- * ست کردن Cron Trigger برای نود فرزند
- * هر ۳ دقیقه یک‌بار heartbeat می‌فرستد
- */
-async function setChildCron(token, accountId, scriptName) {
-  try {
-    const res = await fetch(
-      `${CF_API}/accounts/${accountId}/workers/scripts/${scriptName}/schedules`,
-      {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          schedules: [
-            { cron: "*/3 * * * *" }   // هر ۳ دقیقه
-          ],
-        }),
-      }
-    );
-    const data = await res.json();
-    if (!data.success) {
-      console.log("setChildCron failed:", JSON.stringify(data.errors || data));
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.log("setChildCron error:", e?.message);
-    return false;
-  }
-}
-
 async function serveStatusPage(request, env) {
   try {
     const res = await fetch(STATUS_HTML_URL, {
-      headers: { "User-Agent": "Saow-Mother/3.5" },
+      headers: { "User-Agent": "Saow-Mother/3.6" },
       cf: { cacheTtl: 300, cacheEverything: true },
     });
     if (!res.ok) throw new Error("fetch status html failed");
 
     let html = await res.text();
 
-    // تزریق نسخه
     const inject = `<script>window.__SAOW_VERSION__=${JSON.stringify(VERSION)};</script>`;
     if (html.includes("</head>")) {
       html = html.replace("</head>", inject + "</head>");
@@ -4080,13 +4127,12 @@ async function serveStatusPage(request, env) {
       },
     });
   } catch (e) {
-    // fallback ساده
     return new Response(
       `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><title>Saow Panel</title></head>
        <body style="background:#05060f;color:#e2e8f0;font-family:system-ui;display:grid;place-items:center;min-height:100vh;margin:0">
          <div style="text-align:center">
            <h1 style="font-size:2.5rem;letter-spacing:.15em">SAOW</h1>
-           <p>Mother Panel</p>
+           <p>Mother Panel (Push Mode)</p>
            <p style="opacity:.7">Version: <b>${VERSION}</b></p>
          </div>
        </body></html>`,
@@ -4101,19 +4147,13 @@ async function serveStatusPage(request, env) {
 async function removeChildByScriptName(env, scriptName) {
   if (!(await d1Ready(env)) || !scriptName) return;
   try {
-    // idهای heartbeat شبیه: child-saow-child-84598-isfwic1-workers-dev
-    await env.DB.prepare(
-      `DELETE FROM children WHERE id LIKE ? OR id LIKE ? OR url LIKE ?`
-    ).bind(
-      `%${scriptName}%`,
-      `%${scriptName.replace(/-/g, "")}%`,
-      `%${scriptName}%`
-    ).run();
+    await env.DB.prepare(`DELETE FROM children WHERE id LIKE ? OR id LIKE ? OR url LIKE ?`)
+      .bind(`%${scriptName}%`, `%${scriptName.replace(/-/g, "")}%`, `%${scriptName}%`)
+      .run();
   } catch (e) {
     console.log("removeChildByScriptName:", e?.message);
   }
 }
-
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -4142,27 +4182,44 @@ async function cfFetch(path, token, options = {}) {
 
 async function send(chatId, text, env, keyboard = null, forceReply = false) {
   const body = {
-    chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true,
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
   };
   if (forceReply) body.reply_markup = { force_reply: true, selective: true };
   else if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
   await fetch(`${TG}/bot${env.BOT_TOKEN}/sendMessage`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 async function edit(chatId, msgId, text, env, keyboard = null) {
-  const body = { chat_id: chatId, message_id: msgId, text, parse_mode: "HTML", disable_web_page_preview: true };
+  const body = {
+    chat_id: chatId,
+    message_id: msgId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
   if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
   await fetch(`${TG}/bot${env.BOT_TOKEN}/editMessageText`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 async function answer(id, text, env, alert = false) {
   await fetch(`${TG}/bot${env.BOT_TOKEN}/answerCallbackQuery`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ callback_query_id: id, text: text || "", show_alert: alert }),
   });
 }
 function escape(s) {
-  return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
