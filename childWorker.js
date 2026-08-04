@@ -1,25 +1,29 @@
-// child-worker.js — v3.13
-// Autonomous edge node with shared Cache API for user config.
-// Reports to mother ONLY on meaningful events.
+// child-worker.js — v3.14
+// Autonomous edge + fast sync for important events (disable / delete / IP limit)
+// No spam on every websocket; throttled connect + short shared cache
 
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-3.13';
+const VERSION = 'saow-node-3.14';
 let MOTHER_URL = null;
 const API_SECRET = 'saow-pan2';
 
 // ─── Reporting policy ───────────────────────────────────────────────────────
 const HEARTBEAT_MIN_INTERVAL_MS = 60 * 1000;
-const REPORT_MIN_INTERVAL_MS    = 1000;
+const REPORT_MIN_INTERVAL_MS    = 800;
 const REPORT_THRESHOLD          = 50 * 1024 * 1024; // 50 MB
 const QUOTA_REPORT_RATIO        = 0.85;
 const FINAL_USAGE_ON_CLOSE      = true;
 
-// ─── Caching ────────────────────────────────────────────────────────────────
-const USER_CACHE_TTL     = 15 * 60;   // seconds (for Cache-Control)
-const NEGATIVE_CACHE_TTL =  2 * 60;   // seconds
-const ATTEMPT_COOLDOWN_MS = 8 * 1000;
-const SILENCE_TTL_MS     = 30 * 60 * 1000;
+// connect فقط یک‌بار هر N ثانیه برای هر uuid+ip (جلوگیری از سیل)
+const CONNECT_THROTTLE_MS       = 3 * 60 * 1000; // 3 دقیقه
+
+// ─── Caching (کوتاه‌تر = همگام‌سازی سریع‌تر disable/delete) ────────────────
+const USER_CACHE_TTL            = 90;   // ثانیه — مثبت (قبلاً ۹۰۰)
+const NEGATIVE_CACHE_TTL        = 45;   // ثانیه — منفی (حذف‌شده / غیرفعال)
+const ATTEMPT_COOLDOWN_MS       = 5 * 1000;
+const SILENCE_TTL_MS            = 30 * 60 * 1000;
+const LOCAL_MAX_CONNS           = 32;   // سقف محلی همزمان (نه ipLimit)
 
 const STATUS_HTML_URL = 'https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/node-status.html';
 const ADGUARD_DNS_HOST = 'dns.adguard.com';
@@ -82,7 +86,7 @@ async function ensureBlocklist() {
     for (const url of BLOCKLIST_URLS) {
       try {
         const r = await fetch(url, {
-          headers: { 'User-Agent': 'cf-child/3.13' },
+          headers: { 'User-Agent': 'cf-child/3.14' },
           cf: { cacheTtl: 3600, cacheEverything: true },
         });
         if (!r.ok) continue;
@@ -183,8 +187,9 @@ function getLimiter(uuid, kbps) {
   return entry.limiter;
 }
 
-const activeConns     = new Map(); // uuid → concurrent count (per-isolate, best-effort)
-const recentAttempts  = new Map();
+const activeConns      = new Map(); // uuid → count (per-isolate)
+const recentAttempts   = new Map(); // uuid → last attempt ts
+const recentConnects   = new Map(); // `${uuid}|${ip}` → last connect report ts
 
 function authHeaders() {
   return {
@@ -253,24 +258,40 @@ async function reportToMother(payload) {
   return p;
 }
 
-// ─── User config with shared Cache API ──────────────────────────────────────
+// ─── Shared Cache API helpers ───────────────────────────────────────────────
+function cacheKeyFor(uuid) {
+  return new Request(`https://saow-cache.internal/user-config/${uuid}`);
+}
+
+async function putUserCache(uuid, cfg, negative, ctx) {
+  try {
+    const body = JSON.stringify({ cfg, ts: Date.now(), negative: !!negative });
+    const ttl = negative ? NEGATIVE_CACHE_TTL : USER_CACHE_TTL;
+    const response = new Response(body, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': `public, max-age=${ttl}`,
+      },
+    });
+    const p = caches.default.put(cacheKeyFor(uuid), response);
+    if (ctx?.waitUntil) ctx.waitUntil(p);
+    else p.catch(() => {});
+  } catch {}
+}
+
 async function getUserConfig(uuid, ctx) {
   if (isSilenced()) return null;
 
-  const cacheKey = new Request(`https://saow-cache.internal/user-config/${uuid}`);
-  const cache = caches.default;
-
-  // 1) Try shared edge cache first
+  // 1) shared cache
   try {
-    const hit = await cache.match(cacheKey);
+    const hit = await caches.default.match(cacheKeyFor(uuid));
     if (hit) {
       const data = await hit.json();
-      // data = { cfg, ts, negative }
-      return data.cfg; // already null if negative
+      return data.cfg; // null if negative
     }
   } catch {}
 
-  // 2) Cache miss → ask mother
+  // 2) mother
   try {
     const res = await fetch(`${MOTHER_URL}/api/users?uuid=${encodeURIComponent(uuid)}`, {
       headers: authHeaders(),
@@ -288,39 +309,27 @@ async function getUserConfig(uuid, ctx) {
 
     if (res.ok && data?.ok && data.user) {
       const u = data.user;
-      cfg = {
-        enabled:          u.enabled !== false,
-        speedLimitKBps:   u.speedLimitKBps || 0,
-        blockAds:         u.blockAds !== false,
-        ipLimit:          u.ipLimit || 1,
-        quotaBytes:       u.quotaBytes || 0,
-        dailyQuotaBytes:  u.dailyQuotaBytes || 0,
-      };
-      if (cfg.enabled === false) {
+      // status از buildFullUser ممکن است disabled/expired/quota باشد
+      const status = u.status || (u.enabled === false ? 'disabled' : 'active');
+      if (status === 'disabled' || status === 'expired' ||
+          status === 'quota-exceeded' || status === 'daily-quota-exceeded' ||
+          u.enabled === false) {
         cfg = null;
+        negative = true;
       } else {
+        cfg = {
+          enabled: true,
+          speedLimitKBps: u.speedLimitKBps || 0,
+          blockAds: u.blockAds !== false,
+          ipLimit: u.ipLimit || 1,
+          quotaBytes: u.quotaBytes || 0,
+          dailyQuotaBytes: u.dailyQuotaBytes || 0,
+        };
         negative = false;
       }
     }
 
-    // 3) Store in shared Cache API
-    const body = JSON.stringify({ cfg, ts: Date.now(), negative });
-    const ttl = negative ? NEGATIVE_CACHE_TTL : USER_CACHE_TTL;
-    const response = new Response(body, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': `public, max-age=${ttl}`,
-      },
-    });
-
-    const putPromise = cache.put(cacheKey, response);
-    if (ctx && ctx.waitUntil) {
-      ctx.waitUntil(putPromise);
-    } else {
-      // fire-and-forget
-      putPromise.catch(() => {});
-    }
-
+    await putUserCache(uuid, cfg, negative, ctx);
     return cfg;
   } catch (e) {
     console.log('getUserConfig failed', e?.message);
@@ -328,7 +337,12 @@ async function getUserConfig(uuid, ctx) {
   }
 }
 
-// ─── VLESS header parser ────────────────────────────────────────────────────
+/** باطل کردن فوری کش (بعد از action=close از مادر) */
+async function invalidateUserCache(uuid, ctx) {
+  await putUserCache(uuid, null, true, ctx);
+}
+
+// ─── VLESS header ───────────────────────────────────────────────────────────
 function parseVlessHeader(buffer) {
   const view = new DataView(buffer);
   if (buffer.byteLength < 19 || view.getUint8(0) !== 0) return { ok: false };
@@ -371,7 +385,7 @@ function parseVlessHeader(buffer) {
   };
 }
 
-// ─── Core WebSocket handler ─────────────────────────────────────────────────
+// ─── Core WebSocket ─────────────────────────────────────────────────────────
 async function handleVlessWebSocket(request, ctx) {
   if ((request.headers.get('Upgrade') || '').toLowerCase() !== 'websocket') {
     return new Response('Expected Upgrade: websocket', { status: 426 });
@@ -428,6 +442,24 @@ async function handleVlessWebSocket(request, ctx) {
     try { server.send(new Uint8Array([0x00, 0x00])); } catch {}
   };
 
+  const applyMotherConfig = (res) => {
+    if (!res) return true;
+    if (res.action === 'close' || res.enabled === false) {
+      if (userUuid) ctx.waitUntil(invalidateUserCache(userUuid, ctx));
+      return false;
+    }
+    if (res.config) {
+      currentConfig = { ...currentConfig, ...res.config };
+      if (currentConfig.enabled === false) {
+        ctx.waitUntil(invalidateUserCache(userUuid, ctx));
+        return false;
+      }
+      limiter = getLimiter(userUuid, currentConfig.speedLimitKBps || 0);
+      ctx.waitUntil(putUserCache(userUuid, currentConfig, false, ctx));
+    }
+    return true;
+  };
+
   const maybeReportUsage = async () => {
     if (isSilenced()) return false;
 
@@ -448,29 +480,32 @@ async function handleVlessWebSocket(request, ctx) {
       up: bytesUp,
       down: bytesDown,
     });
+    return applyMotherConfig(res);
+  };
 
-    if (!res || !res.ok) return true;
-    if (res.action === 'close' || res.enabled === false) return false;
-
-    // Mother can push updated config
-    if (res.config) {
-      currentConfig = { ...currentConfig, ...res.config };
-      limiter = getLimiter(userUuid, currentConfig.speedLimitKBps || 0);
-
-      // also refresh shared cache
-      try {
-        const cacheKey = new Request(`https://saow-cache.internal/user-config/${userUuid}`);
-        const body = JSON.stringify({ cfg: currentConfig, ts: Date.now(), negative: false });
-        const response = new Response(body, {
-          headers: {
-            'Content-Type': 'application/json',
-            'Cache-Control': `public, max-age=${USER_CACHE_TTL}`,
-          },
-        });
-        ctx.waitUntil(caches.default.put(cacheKey, response));
-      } catch {}
+  /** connect throttled: حداکثر یک‌بار هر CONNECT_THROTTLE_MS برای uuid+ip */
+  const maybeReportConnect = async () => {
+    const key = `${userUuid}|${clientIP}`;
+    const last = recentConnects.get(key) || 0;
+    if (Date.now() - last < CONNECT_THROTTLE_MS) {
+      return { ok: true, skipped: true }; // از کش محلی استفاده کن
     }
-    return true;
+    recentConnects.set(key, Date.now());
+
+    const res = await reportToMother({
+      type: 'connect',
+      child_id: childId,
+      uuid: userUuid,
+      ip: clientIP,
+    });
+
+    // fail-open اگر مادر جواب نداد (شبکه)
+    if (!res) return { ok: true, skipped: false, fromMother: false };
+
+    if (!applyMotherConfig(res)) {
+      return { ok: false, reason: res.reason || 'mother rejected' };
+    }
+    return { ok: true, skipped: false, fromMother: true, online: res.online };
   };
 
   server.addEventListener('message', async (event) => {
@@ -494,20 +529,26 @@ async function handleVlessWebSocket(request, ctx) {
         }
         recentAttempts.set(userUuid, Date.now());
 
-        // ─── Config from shared Cache API (or mother on miss) ──────────────
+        // 1) کانفیگ از کش مشترک یا مادر
         currentConfig = await getUserConfig(userUuid, ctx);
-        if (!currentConfig || currentConfig.enabled === false) {
+        if (!currentConfig) {
           return safeClose('disabled');
         }
 
-        // ─── Local concurrent limit (best-effort per isolate) ──────────────
-        const current = activeConns.get(userUuid) || 0;
-        if (currentConfig.ipLimit > 0 && current >= currentConfig.ipLimit) {
-          return safeClose('ip limit');
+        // 2) سقف محلی همزمان (جلوگیری از انفجار Isolate)
+        const localCount = activeConns.get(userUuid) || 0;
+        if (localCount >= LOCAL_MAX_CONNS) {
+          return safeClose('local conn limit');
         }
-        activeConns.set(userUuid, current + 1);
-        joined = true;
 
+        // 3) گزارش connect throttled → مادر IP limit و وضعیت لحظه‌ای را چک می‌کند
+        const connectRes = await maybeReportConnect();
+        if (!connectRes.ok) {
+          return safeClose(connectRes.reason || 'rejected');
+        }
+
+        activeConns.set(userUuid, localCount + 1);
+        joined = true;
         limiter = getLimiter(userUuid, currentConfig.speedLimitKBps || 0);
 
         if (parsed.cmd !== 1) return safeClose('only TCP');
@@ -582,11 +623,11 @@ async function handleVlessWebSocket(request, ctx) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ─── Status page ────────────────────────────────────────────────────────────
+// ─── Status / Heartbeat / Entry ─────────────────────────────────────────────
 async function serveStatusPage(request, childId) {
   try {
     const res = await fetch(STATUS_HTML_URL, {
-      headers: { 'User-Agent': 'cf-child/3.13' },
+      headers: { 'User-Agent': 'cf-child/3.14' },
       cf: { cacheTtl: 300, cacheEverything: true },
     });
     if (!res.ok) throw new Error('fetch status html failed');
@@ -615,15 +656,11 @@ async function serveStatusPage(request, childId) {
            <p style="opacity:.5;font-size:0.85rem">${childId}</p>
          </div>
        </body></html>`,
-      {
-        status: 200,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-      }
+      { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
     );
   }
 }
 
-// ─── Heartbeat ──────────────────────────────────────────────────────────────
 function sendHeartbeat(ctx, childId, hostname) {
   if (isSilenced()) return;
   ctx.waitUntil(reportToMother({
@@ -635,10 +672,9 @@ function sendHeartbeat(ctx, childId, hostname) {
   }));
 }
 
-// ─── Entrypoint ─────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
-    if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || "";
+    if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || '';
 
     const url = new URL(request.url);
     const path = url.pathname;
@@ -665,9 +701,7 @@ export default {
       return handleVlessWebSocket(request, ctx);
     }
 
-    if (path === '/') {
-      return serveStatusPage(request, childId);
-    }
+    if (path === '/') return serveStatusPage(request, childId);
 
     if (path === '/version') {
       return new Response(JSON.stringify({
@@ -682,7 +716,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || "";
+    if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || '';
     if (isSilenced()) return;
 
     const hostname = env.CHILD_HOSTNAME || env.WORKER_NAME || 'unknown';
