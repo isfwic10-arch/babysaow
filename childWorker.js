@@ -1,7 +1,7 @@
-// child-worker.js — v4.9.2-push (optimized D1 + speed limit)
+// child-worker.js — v4.9.3-push (optimized D1 + speed limit + revoke on sync)
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-4.9.2-push';
+const VERSION = 'saow-node-4.9.3-push';
 const API_SECRET = 'saow-pan2';
 let MOTHER_URL = null;
 
@@ -31,6 +31,8 @@ const BLOCKLIST_TTL_MS = 6 * 60 * 60 * 1000;
 // ====================== In-memory ======================
 let usersByUuid = new Map();
 const activeConns = new Map();
+/** uuid -> Set<{ close: Function }> */
+const activeSessions = new Map();
 const limiters = new Map();
 const ipCache = new Map(); // `${userId}|${ip}` -> { at, ok }
 
@@ -209,13 +211,11 @@ async function tryAcquireIp(env, userId, ip, limit) {
   try {
     await ensureDb(env);
 
-    // یک نوشتن: upsert
     await env.DB.prepare(`
       INSERT INTO node_active_ips (user_id, ip, last_seen) VALUES (?, ?, ?)
       ON CONFLICT(user_id, ip) DO UPDATE SET last_seen = excluded.last_seen
     `).bind(userId, ipStr, now).run();
 
-    // cleanup فقط گاهی (کاهش شدید خواندن/نوشتن)
     if (Math.random() < IP_CLEANUP_PROB) {
       await env.DB.prepare(
         `DELETE FROM node_active_ips WHERE user_id = ? AND last_seen < ?`
@@ -236,7 +236,6 @@ async function tryAcquireIp(env, userId, ip, limit) {
     }
 
     ipCache.set(key, { at: now, ok: true });
-    // جلوگیری از رشد بی‌نهایت کش isolate
     if (ipCache.size > 500) {
       const first = ipCache.keys().next().value;
       ipCache.delete(first);
@@ -306,7 +305,6 @@ function createRateLimiter(kbps) {
   const bytesPerSec = kbps > 0 ? kbps * 1024 : 0;
   if (!bytesPerSec) return { enabled: false, async take() {} };
 
-  // burst بزرگ‌تر = آپلود نرم‌تر، کمتر قطع
   const burst = Math.max(bytesPerSec * 2, 64 * 1024);
   let tokens = burst;
   let last = Date.now();
@@ -509,9 +507,35 @@ async function handleSync(request, env) {
       blockAds: u.blockAds !== false,
     });
   }
+
   usersByUuid = newMap;
   lastSyncAt = Date.now();
-  ipCache.clear(); // بعد از sync کش IP را تازه کن
+  ipCache.clear();
+
+  // قطع اجباری کاربرانی که دیگر در لیست نیستند / غیرفعال / منقضی
+  for (const [uuid, sessions] of [...activeSessions.entries()]) {
+    const cfg = usersByUuid.get(uuid);
+    const shouldDrop = !cfg || !cfg.enabled || isExpired(cfg.expiry);
+    if (shouldDrop) {
+      for (const s of sessions) {
+        try { s.close(); } catch {}
+      }
+      activeSessions.delete(uuid);
+      activeConns.delete(uuid);
+    }
+  }
+
+  // اگر کل نود قفل شده، همه سشن‌ها را ببند
+  if (nodeDisabled) {
+    for (const [uuid, sessions] of [...activeSessions.entries()]) {
+      for (const s of sessions) {
+        try { s.close(); } catch {}
+      }
+      activeSessions.delete(uuid);
+      activeConns.delete(uuid);
+    }
+  }
+
   await saveUsersToDb(env, users, nodeDisabled);
 
   const usageReport = await dbLoadAndClearUsage(env);
@@ -562,6 +586,7 @@ async function handleVlessWebSocket(request, env, ctx) {
   let remoteSocket = null;
   let remoteWriter = null;
   let limiter = { enabled: false, async take() {} };
+  let sessionRef = null;
 
   const flushUsage = () => {
     if (!userId || bytesUp + bytesDown === 0) return;
@@ -584,7 +609,11 @@ async function handleVlessWebSocket(request, env, ctx) {
     if (userUuid && joined) {
       activeConns.set(userUuid, Math.max(0, (activeConns.get(userUuid) || 1) - 1));
       if (userId) flushUsage();
-      // ❌ دیگر dbClearIp روی close نداریم → بار D1 خیلی کمتر
+      if (sessionRef && activeSessions.has(userUuid)) {
+        const set = activeSessions.get(userUuid);
+        set.delete(sessionRef);
+        if (set.size === 0) activeSessions.delete(userUuid);
+      }
     }
     try { remoteWriter?.releaseLock(); } catch {}
     try { remoteSocket?.close(); } catch {}
@@ -610,8 +639,12 @@ async function handleVlessWebSocket(request, env, ctx) {
   const processChunk = async (chunk) => {
     if (closed || !(chunk instanceof Uint8Array) || chunk.byteLength === 0) return;
 
-    // بعد از اتصال
+    // بعد از اتصال — ترافیک عادی
     if (remoteWriter) {
+      // اگر در همین isolate کاربر revoke شده، قطع کن
+      if (userUuid && !getUserByUuid(userUuid)) {
+        return safeClose('revoked');
+      }
       try {
         if (limiter.enabled) await limiter.take(chunk.byteLength);
         bytesUp += chunk.byteLength;
@@ -624,7 +657,7 @@ async function handleVlessWebSocket(request, env, ctx) {
       return;
     }
 
-    // هدر
+    // هدر VLESS
     const buf = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
     const parsed = parseVlessHeader(buf);
     if (!parsed.ok) return safeClose('bad header');
@@ -654,9 +687,15 @@ async function handleVlessWebSocket(request, env, ctx) {
       await sleep(SOFT_REJECT_DELAY_MS);
       return safeClose('ip limit');
     }
+
     joined = true;
     activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
     limiter = getLimiter(userUuid, cfg.speedLimitKBps || 0);
+
+    // ثبت سشن برای قطع بعد از sync
+    sessionRef = { close: () => safeClose('revoked') };
+    if (!activeSessions.has(userUuid)) activeSessions.set(userUuid, new Set());
+    activeSessions.get(userUuid).add(sessionRef);
 
     let host = parsed.address;
     let port = parsed.port;
@@ -690,6 +729,10 @@ async function handleVlessWebSocket(request, env, ctx) {
         .pipeTo(new WritableStream({
           async write(remoteChunk) {
             if (server.readyState !== 1) return;
+            if (userUuid && !getUserByUuid(userUuid)) {
+              safeClose('revoked');
+              return;
+            }
             if (limiter.enabled) await limiter.take(remoteChunk.byteLength);
             bytesDown += remoteChunk.byteLength;
             sessionBytes += remoteChunk.byteLength;
