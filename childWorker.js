@@ -1,9 +1,16 @@
 // child-worker.js — v3.11 (با حالت سکوت در صورت رد شدن توسط مادر)
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-3.11';
+const VERSION = 'saow-node-3.12';
 let MOTHER_URL = null;
 const API_SECRET = 'saow-pan2';
+
+
+const HEARTBEAT_MIN_INTERVAL_MS = 60 * 1000; // حداقل ۱ دقیقه
+const REPORT_MIN_INTERVAL_MS = 1000;         // سقف کلی: حداکثر ~۱ report/sec (قابل تنظیم)
+let lastHeartbeatAt = 0;
+let lastReportAt = 0;
+let reportQueueTail = Promise.resolve();
 
 const REPORT_THRESHOLD = 30 * 1024 * 1024;   // ۳۰ مگابایت
 const USER_CACHE_TTL = 8 * 60 * 1000;        // ۸ دقیقه
@@ -203,30 +210,52 @@ function isNodeRejection(status, data) {
 
 async function reportToMother(payload) {
   if (!MOTHER_URL) return null;
-  if (isSilenced()) return null; // سکوت کامل
+  if (isSilenced()) return null;
 
-  try {
-    const res = await fetch(`${MOTHER_URL}/api/node/report`, {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify(payload),
-    });
+  // throttle سخت برای heartbeat
+  if (payload?.type === 'heartbeat') {
+    const now = Date.now();
+    if (now - lastHeartbeatAt < HEARTBEAT_MIN_INTERVAL_MS) return null;
+    lastHeartbeatAt = now;
+  }
 
-    let data = null;
-    try { data = await res.json(); } catch {}
+  // throttle نرم برای همه reportها (جلوگیری از burst)
+  const now = Date.now();
+  const wait = Math.max(0, REPORT_MIN_INTERVAL_MS - (now - lastReportAt));
+  lastReportAt = now + wait;
 
-    if (isNodeRejection(res.status, data)) {
-      enterSilence(`report ${payload.type} → ${res.status}`);
+  const run = async () => {
+    if (wait) await new Promise(r => setTimeout(r, wait));
+    if (isSilenced()) return null;
+
+    try {
+      const res = await fetch(`${MOTHER_URL}/api/node/report`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(payload),
+      });
+
+      let data = null;
+      try { data = await res.json(); } catch {}
+
+      if (isNodeRejection(res.status, data)) {
+        enterSilence(`report ${payload.type} → ${res.status}`);
+        return null;
+      }
+      if (!res.ok) return null;
+      return data;
+    } catch (e) {
+      console.log('reportToMother failed', e?.message);
       return null;
     }
+  };
 
-    if (!res.ok) return null;
-    return data;
-  } catch (e) {
-    console.log('reportToMother failed', e?.message);
-    return null;
-  }
+  // serialize کردن reportها تا هم‌زمان شلیک نشوند
+  const p = reportQueueTail.then(run, run);
+  reportQueueTail = p.catch(() => null);
+  return p;
 }
+
 
 async function getUserConfig(uuid) {
   if (isSilenced()) return null;
