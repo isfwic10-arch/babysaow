@@ -1,34 +1,16 @@
-// child-worker.js — v3.14
-// Autonomous edge + fast sync for important events (disable / delete / IP limit)
-// No spam on every websocket; throttled connect + short shared cache
-
+// child-worker.js — v4.0-push (Push + State Exchange)
+// فرزند هرگز درخواست آغاز نمی‌کند. فقط به POST /sync از مادر پاسخ می‌دهد.
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-3.14';
-let MOTHER_URL = null;
+const VERSION = 'saow-node-4.0-push';
 const API_SECRET = 'saow-pan2';
 
-// ─── Reporting policy ───────────────────────────────────────────────────────
-const HEARTBEAT_MIN_INTERVAL_MS = 60 * 1000;
-const REPORT_MIN_INTERVAL_MS    = 800;
-const REPORT_THRESHOLD          = 50 * 1024 * 1024; // 50 MB
-const QUOTA_REPORT_RATIO        = 0.85;
-const FINAL_USAGE_ON_CLOSE      = true;
-
-// connect فقط یک‌بار هر N ثانیه برای هر uuid+ip (جلوگیری از سیل)
-const CONNECT_THROTTLE_MS       = 3 * 60 * 1000; // 3 دقیقه
-
-// ─── Caching (کوتاه‌تر = همگام‌سازی سریع‌تر disable/delete) ────────────────
-const USER_CACHE_TTL            = 90;   // ثانیه — مثبت (قبلاً ۹۰۰)
-const NEGATIVE_CACHE_TTL        = 45;   // ثانیه — منفی (حذف‌شده / غیرفعال)
-const ATTEMPT_COOLDOWN_MS       = 5 * 1000;
-const SILENCE_TTL_MS            = 30 * 60 * 1000;
-const LOCAL_MAX_CONNS           = 32;   // سقف محلی همزمان (نه ipLimit)
-
+const REPORT_THRESHOLD = 30 * 1024 * 1024; // برای ردیابی محلی (دلتا)
+const USER_CACHE_TTL = 20 * 60 * 1000;     // اگر sync نیاید، کش قدیمی تا ۲۰ دقیقه معتبر بماند
 const STATUS_HTML_URL = 'https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/node-status.html';
+
 const ADGUARD_DNS_HOST = 'dns.adguard.com';
 const ADGUARD_DNS_PORT = 53;
-
 const AD_HOST_SUFFIXES = [
   'doubleclick.net', 'googleadservices.com', 'googlesyndication.com',
   'googletagmanager.com', 'googletagservices.com', 'google-analytics.com',
@@ -37,31 +19,181 @@ const AD_HOST_SUFFIXES = [
   'taboola.com', 'outbrain.com', 'moatads.com', 'criteo.com', 'hotjar.com',
   'adform.net', 'pubmatic.com', 'openx.net',
 ];
-
 const BLOCKLIST_URLS = [
   'https://small.oisd.nl/domainswild2',
   'https://raw.githubusercontent.com/sjhgvr/oisd/main/domainswild2_small.txt',
 ];
 const BLOCKLIST_TTL_MS = 6 * 60 * 60 * 1000;
 
+// ====================== State (محلی) ======================
+/** @type {Map<string, UserConfig>} uuid -> config */
+let usersByUuid = new Map();
+/** @type {Map<string, string>} uuid -> user_id */
+let uuidToId = new Map();
+/** @type {Map<string, UsageDelta>} user_id -> {up, down} */
+let usageDelta = new Map();
+/** @type {Map<string, Set<string>>} user_id -> Set of active IPs */
+let activeIpsByUser = new Map();
+/** @type {Map<string, number>} uuid -> concurrent WS count */
+const activeConns = new Map();
+
+let nodeDisabled = false;
+let lastSyncAt = 0;
+let childId = 'child-unknown';
+
 let blockSet = null;
 let blockSetAt = 0;
 let blockSetLoading = null;
 
-// ─── Global silence ─────────────────────────────────────────────────────────
-let silenceUntil = 0;
-function isSilenced() { return Date.now() < silenceUntil; }
-function enterSilence(reason = '') {
-  silenceUntil = Date.now() + SILENCE_TTL_MS;
-  console.log('SILENCE ON:', reason, 'until', new Date(silenceUntil).toISOString());
+// ====================== Types (JSDoc) ======================
+/**
+ * @typedef {Object} UserConfig
+ * @property {string} id
+ * @property {string} uuid
+ * @property {string} [name]
+ * @property {boolean} enabled
+ * @property {string|null} expiry
+ * @property {number} quotaBytes
+ * @property {number} dailyQuotaBytes
+ * @property {number} speedLimitKBps
+ * @property {number} ipLimit
+ * @property {boolean} blockAds
+ */
+
+/**
+ * @typedef {Object} UsageDelta
+ * @property {number} up
+ * @property {number} down
+ */
+
+// ====================== Helpers ======================
+function generateChildId(url) {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return 'child-' + hostname.replace(/[^a-z0-9.-]/g, '').replace(/\./g, '-');
+  } catch {
+    return 'child-unknown';
+  }
 }
 
-// ─── Ad-blocking ────────────────────────────────────────────────────────────
+function getClientIP(request) {
+  return (
+    request.headers.get('CF-Connecting-IP') ||
+    request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
+    '0.0.0.0'
+  );
+}
+
+function extractSecret(request) {
+  const h = request.headers;
+  const auth = h.get('authorization') || '';
+  if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
+  return (h.get('x-mother-secret') || h.get('x-api-key') || h.get('x-secret') || '').trim();
+}
+
+function requireMotherAuth(request) {
+  const secret = extractSecret(request);
+  return secret && secret === API_SECRET;
+}
+
+function isExpired(expiry) {
+  if (!expiry) return false;
+  const t = Date.parse(expiry);
+  return Number.isFinite(t) && Date.now() > t;
+}
+
+function getUserByUuid(uuid) {
+  if (!uuid) return null;
+  const cfg = usersByUuid.get(String(uuid).toLowerCase());
+  if (!cfg) return null;
+  if (!cfg.enabled) return null;
+  if (isExpired(cfg.expiry)) return null;
+  return cfg;
+}
+
+function addUsageDelta(userId, up, down) {
+  if (!userId || (up + down) <= 0) return;
+  const cur = usageDelta.get(userId) || { up: 0, down: 0 };
+  cur.up += up;
+  cur.down += down;
+  usageDelta.set(userId, cur);
+}
+
+function touchActiveIp(userId, ip) {
+  if (!userId || !ip) return;
+  let set = activeIpsByUser.get(userId);
+  if (!set) {
+    set = new Set();
+    activeIpsByUser.set(userId, set);
+  }
+  set.add(ip);
+}
+
+function clearActiveIp(userId, ip) {
+  if (!userId || !ip) return;
+  const set = activeIpsByUser.get(userId);
+  if (set) {
+    set.delete(ip);
+    if (set.size === 0) activeIpsByUser.delete(userId);
+  }
+}
+
+function countActiveIps(userId) {
+  const set = activeIpsByUser.get(userId);
+  return set ? set.size : 0;
+}
+
+// ====================== Rate Limiter ======================
+function createRateLimiter(kbps) {
+  const bytesPerSec = kbps > 0 ? kbps * 1024 : 0;
+  if (!bytesPerSec) return { enabled: false, async take() {} };
+  const burst = Math.max(bytesPerSec, 32 * 1024);
+  let tokens = burst;
+  let last = Date.now();
+  let tail = Promise.resolve();
+  const doTake = async (n) => {
+    n = Math.max(0, n | 0);
+    if (!n) return;
+    for (;;) {
+      const now = Date.now();
+      tokens = Math.min(burst, tokens + ((now - last) / 1000) * bytesPerSec);
+      last = now;
+      if (tokens >= n) {
+        tokens -= n;
+        return;
+      }
+      const need = n - tokens;
+      const waitMs = Math.min(200, Math.max(8, Math.ceil((need / bytesPerSec) * 1000)));
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  };
+  return {
+    enabled: true,
+    take(n) {
+      const run = tail.then(() => doTake(n));
+      tail = run.catch(() => {});
+      return run;
+    },
+  };
+}
+
+const limiters = new Map();
+function getLimiter(uuid, kbps) {
+  if (!kbps || kbps <= 0) return { enabled: false, async take() {} };
+  let entry = limiters.get(uuid);
+  if (!entry || entry.kbps !== kbps) {
+    entry = { kbps, limiter: createRateLimiter(kbps) };
+    limiters.set(uuid, entry);
+  }
+  return entry.limiter;
+}
+
+// ====================== Ad Block ======================
 function isAdHostLocal(host) {
   const h = String(host || '').toLowerCase().replace(/\.$/, '');
   if (!h) return false;
   if (/(^|\.)ads?\d*\./.test(h) || /(^|\.)adserver\./.test(h) || /(^|\.)tracking\./.test(h)) return true;
-  return AD_HOST_SUFFIXES.some(s => h === s || h.endsWith('.' + s));
+  return AD_HOST_SUFFIXES.some((s) => h === s || h.endsWith('.' + s));
 }
 
 function parseBlocklistText(text) {
@@ -86,7 +218,7 @@ async function ensureBlocklist() {
     for (const url of BLOCKLIST_URLS) {
       try {
         const r = await fetch(url, {
-          headers: { 'User-Agent': 'cf-child/3.14' },
+          headers: { 'User-Agent': 'cf-child/4.0-push' },
           cf: { cacheTtl: 3600, cacheEverything: true },
         });
         if (!r.ok) continue;
@@ -104,8 +236,11 @@ async function ensureBlocklist() {
     }
     return blockSet;
   })();
-  try { return await blockSetLoading; }
-  finally { blockSetLoading = null; }
+  try {
+    return await blockSetLoading;
+  } finally {
+    blockSetLoading = null;
+  }
 }
 
 function hostInBlockset(host, set) {
@@ -130,219 +265,7 @@ async function isAdHost(host) {
   }
 }
 
-// ─── Utilities ──────────────────────────────────────────────────────────────
-function generateChildId(url) {
-  try {
-    const hostname = new URL(url).hostname.toLowerCase();
-    return 'child-' + hostname.replace(/[^a-z0-9.-]/g, '').replace(/\./g, '-');
-  } catch {
-    return 'child-unknown';
-  }
-}
-
-function getClientIP(request) {
-  return request.headers.get('CF-Connecting-IP') ||
-         request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
-         '0.0.0.0';
-}
-
-function createRateLimiter(kbps) {
-  const bytesPerSec = (kbps > 0) ? kbps * 1024 : 0;
-  if (!bytesPerSec) return { enabled: false, async take() {} };
-  const burst = Math.max(bytesPerSec, 32 * 1024);
-  let tokens = burst;
-  let last = Date.now();
-  let tail = Promise.resolve();
-  const doTake = async (n) => {
-    n = Math.max(0, n | 0);
-    if (!n) return;
-    for (;;) {
-      const now = Date.now();
-      tokens = Math.min(burst, tokens + ((now - last) / 1000) * bytesPerSec);
-      last = now;
-      if (tokens >= n) { tokens -= n; return; }
-      const need = n - tokens;
-      const waitMs = Math.min(200, Math.max(8, Math.ceil((need / bytesPerSec) * 1000)));
-      await new Promise(r => setTimeout(r, waitMs));
-    }
-  };
-  return {
-    enabled: true,
-    take(n) {
-      const run = tail.then(() => doTake(n));
-      tail = run.catch(() => {});
-      return run;
-    },
-  };
-}
-
-const limiters = new Map();
-function getLimiter(uuid, kbps) {
-  if (!kbps || kbps <= 0) return { enabled: false, async take() {} };
-  let entry = limiters.get(uuid);
-  if (!entry || entry.kbps !== kbps) {
-    entry = { kbps, limiter: createRateLimiter(kbps) };
-    limiters.set(uuid, entry);
-  }
-  return entry.limiter;
-}
-
-const activeConns      = new Map(); // uuid → count (per-isolate)
-const recentAttempts   = new Map(); // uuid → last attempt ts
-const recentConnects   = new Map(); // `${uuid}|${ip}` → last connect report ts
-
-function authHeaders() {
-  return {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${API_SECRET}`,
-    'X-API-Key': API_SECRET,
-  };
-}
-
-function isNodeRejection(status, data) {
-  if (status === 401 || status === 403) return true;
-  if (!data) return false;
-  const reason = String(data.reason || data.err || '').toLowerCase();
-  return (
-    reason.includes('unknown node') ||
-    reason.includes('not registered') ||
-    reason.includes('node is not registered') ||
-    reason.includes('unauthorized')
-  );
-}
-
-// ─── Reporting ──────────────────────────────────────────────────────────────
-let lastHeartbeatAt = 0;
-let lastReportAt    = 0;
-let reportQueueTail = Promise.resolve();
-
-async function reportToMother(payload) {
-  if (!MOTHER_URL) return null;
-  if (isSilenced()) return null;
-
-  if (payload?.type === 'heartbeat') {
-    const now = Date.now();
-    if (now - lastHeartbeatAt < HEARTBEAT_MIN_INTERVAL_MS) return null;
-    lastHeartbeatAt = now;
-  }
-
-  const now = Date.now();
-  const wait = Math.max(0, REPORT_MIN_INTERVAL_MS - (now - lastReportAt));
-  lastReportAt = now + wait;
-
-  const run = async () => {
-    if (wait) await new Promise(r => setTimeout(r, wait));
-    if (isSilenced()) return null;
-    try {
-      const res = await fetch(`${MOTHER_URL}/api/node/report`, {
-        method: 'POST',
-        headers: authHeaders(),
-        body: JSON.stringify(payload),
-      });
-      let data = null;
-      try { data = await res.json(); } catch {}
-      if (isNodeRejection(res.status, data)) {
-        enterSilence(`report ${payload.type} → ${res.status}`);
-        return null;
-      }
-      if (!res.ok) return null;
-      return data;
-    } catch (e) {
-      console.log('reportToMother failed', e?.message);
-      return null;
-    }
-  };
-
-  const p = reportQueueTail.then(run, run);
-  reportQueueTail = p.catch(() => null);
-  return p;
-}
-
-// ─── Shared Cache API helpers ───────────────────────────────────────────────
-function cacheKeyFor(uuid) {
-  return new Request(`https://saow-cache.internal/user-config/${uuid}`);
-}
-
-async function putUserCache(uuid, cfg, negative, ctx) {
-  try {
-    const body = JSON.stringify({ cfg, ts: Date.now(), negative: !!negative });
-    const ttl = negative ? NEGATIVE_CACHE_TTL : USER_CACHE_TTL;
-    const response = new Response(body, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': `public, max-age=${ttl}`,
-      },
-    });
-    const p = caches.default.put(cacheKeyFor(uuid), response);
-    if (ctx?.waitUntil) ctx.waitUntil(p);
-    else p.catch(() => {});
-  } catch {}
-}
-
-async function getUserConfig(uuid, ctx) {
-  if (isSilenced()) return null;
-
-  // 1) shared cache
-  try {
-    const hit = await caches.default.match(cacheKeyFor(uuid));
-    if (hit) {
-      const data = await hit.json();
-      return data.cfg; // null if negative
-    }
-  } catch {}
-
-  // 2) mother
-  try {
-    const res = await fetch(`${MOTHER_URL}/api/users?uuid=${encodeURIComponent(uuid)}`, {
-      headers: authHeaders(),
-    });
-    let data = null;
-    try { data = await res.json(); } catch {}
-
-    if (isNodeRejection(res.status, data)) {
-      enterSilence(`getUserConfig → ${res.status}`);
-      return null;
-    }
-
-    let cfg = null;
-    let negative = true;
-
-    if (res.ok && data?.ok && data.user) {
-      const u = data.user;
-      // status از buildFullUser ممکن است disabled/expired/quota باشد
-      const status = u.status || (u.enabled === false ? 'disabled' : 'active');
-      if (status === 'disabled' || status === 'expired' ||
-          status === 'quota-exceeded' || status === 'daily-quota-exceeded' ||
-          u.enabled === false) {
-        cfg = null;
-        negative = true;
-      } else {
-        cfg = {
-          enabled: true,
-          speedLimitKBps: u.speedLimitKBps || 0,
-          blockAds: u.blockAds !== false,
-          ipLimit: u.ipLimit || 1,
-          quotaBytes: u.quotaBytes || 0,
-          dailyQuotaBytes: u.dailyQuotaBytes || 0,
-        };
-        negative = false;
-      }
-    }
-
-    await putUserCache(uuid, cfg, negative, ctx);
-    return cfg;
-  } catch (e) {
-    console.log('getUserConfig failed', e?.message);
-    return null;
-  }
-}
-
-/** باطل کردن فوری کش (بعد از action=close از مادر) */
-async function invalidateUserCache(uuid, ctx) {
-  await putUserCache(uuid, null, true, ctx);
-}
-
-// ─── VLESS header ───────────────────────────────────────────────────────────
+// ====================== VLESS Header ======================
 function parseVlessHeader(buffer) {
   const view = new DataView(buffer);
   if (buffer.byteLength < 19 || view.getUint8(0) !== 0) return { ok: false };
@@ -351,17 +274,21 @@ function parseVlessHeader(buffer) {
   const addonLen = view.getUint8(offset);
   offset += 1 + addonLen;
   if (offset + 4 > buffer.byteLength) return { ok: false };
-  const cmd = view.getUint8(offset); offset += 1;
+  const cmd = view.getUint8(offset);
+  offset += 1;
   if (cmd !== 1 && cmd !== 2) return { ok: false };
-  const port = view.getUint16(offset); offset += 2;
-  const atype = view.getUint8(offset); offset += 1;
+  const port = view.getUint16(offset);
+  offset += 2;
+  const atype = view.getUint8(offset);
+  offset += 1;
   let address = '';
   if (atype === 1) {
     if (offset + 4 > buffer.byteLength) return { ok: false };
     address = Array.from(new Uint8Array(buffer, offset, 4)).join('.');
     offset += 4;
   } else if (atype === 2) {
-    const dlen = view.getUint8(offset); offset += 1;
+    const dlen = view.getUint8(offset);
+    offset += 1;
     if (offset + dlen > buffer.byteLength) return { ok: false };
     address = new TextDecoder().decode(new Uint8Array(buffer, offset, dlen));
     offset += dlen;
@@ -373,25 +300,152 @@ function parseVlessHeader(buffer) {
     offset += 16;
   } else return { ok: false };
 
-  const uuidHex = Array.from(uuidBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  const uuidHex = Array.from(uuidBytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
   const uuid = [
-    uuidHex.slice(0, 8), uuidHex.slice(8, 12), uuidHex.slice(12, 16),
-    uuidHex.slice(16, 20), uuidHex.slice(20),
+    uuidHex.slice(0, 8),
+    uuidHex.slice(8, 12),
+    uuidHex.slice(12, 16),
+    uuidHex.slice(16, 20),
+    uuidHex.slice(20),
   ].join('-');
 
   return {
-    ok: true, cmd, address, port, uuid,
+    ok: true,
+    cmd,
+    address,
+    port,
+    uuid,
     rest: buffer.byteLength > offset ? buffer.slice(offset) : null,
   };
 }
 
-// ─── Core WebSocket ─────────────────────────────────────────────────────────
+// ====================== Sync Handler (تنها نقطه ارتباط با مادر) ======================
+async function handleSync(request) {
+  if (!requireMotherAuth(request)) {
+    return new Response(JSON.stringify({ ok: false, reason: 'unauthorized' }), {
+      status: 403,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ ok: false, reason: 'invalid json' }), {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  if (body?.type !== 'full_sync') {
+    return new Response(JSON.stringify({ ok: false, reason: 'unknown type' }), {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  // ---- اعمال وضعیت نود ----
+  nodeDisabled = !!(body.node && body.node.disabled);
+
+  // ---- جایگزینی کامل لیست کاربران ----
+  const newMap = new Map();
+  const newUuidToId = new Map();
+  const users = Array.isArray(body.users) ? body.users : [];
+
+  for (const u of users) {
+    if (!u || !u.uuid || !u.id) continue;
+    const uuid = String(u.uuid).toLowerCase();
+    const cfg = {
+      id: String(u.id),
+      uuid,
+      name: u.name || '',
+      enabled: u.enabled !== false,
+      expiry: u.expiry || null,
+      quotaBytes: Number(u.quotaBytes) || 0,
+      dailyQuotaBytes: Number(u.dailyQuotaBytes) || 0,
+      speedLimitKBps: Number(u.speedLimitKBps) || 0,
+      ipLimit: Number(u.ipLimit) > 0 ? Number(u.ipLimit) : 1,
+      blockAds: u.blockAds !== false,
+    };
+    newMap.set(uuid, cfg);
+    newUuidToId.set(uuid, cfg.id);
+  }
+
+  usersByUuid = newMap;
+  uuidToId = newUuidToId;
+  lastSyncAt = Date.now();
+
+  // ---- ساخت گزارش پاسخ (دلتا + وضعیت فعلی) ----
+  const usageReport = [];
+  for (const [userId, delta] of usageDelta.entries()) {
+    if (delta.up + delta.down > 0) {
+      usageReport.push({
+        user_id: userId,
+        up: delta.up,
+        down: delta.down,
+      });
+    }
+  }
+  // بعد از ارسال، دلتاها را صفر می‌کنیم
+  usageDelta = new Map();
+
+  const activeIpsReport = [];
+  for (const [userId, ipSet] of activeIpsByUser.entries()) {
+    if (ipSet.size > 0) {
+      activeIpsReport.push({
+        user_id: userId,
+        ips: Array.from(ipSet),
+      });
+    }
+  }
+
+  let activeUsersCount = 0;
+  for (const c of activeConns.values()) {
+    if (c > 0) activeUsersCount++;
+  }
+
+  const report = {
+    ok: true,
+    child_id: childId,
+    version: VERSION,
+    capacity: 64,
+    active_users: activeUsersCount,
+    healthy: !nodeDisabled,
+    last_sync_received: lastSyncAt,
+    usage: usageReport,
+    active_ips: activeIpsReport,
+    meta: {
+      users_loaded: usersByUuid.size,
+      node_disabled: nodeDisabled,
+    },
+  };
+
+  return new Response(JSON.stringify(report), {
+    status: 200,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    },
+  });
+}
+
+// ====================== VLESS WebSocket Handler ======================
 async function handleVlessWebSocket(request, ctx) {
   if ((request.headers.get('Upgrade') || '').toLowerCase() !== 'websocket') {
     return new Response('Expected Upgrade: websocket', { status: 426 });
   }
-  if (isSilenced()) {
-    return new Response('Node silenced', { status: 503 });
+
+  if (nodeDisabled) {
+    return new Response('Node disabled by mother', { status: 503 });
+  }
+
+  // اگر خیلی وقت است sync نیامده، می‌توانی fail-open یا fail-closed باشی.
+  // اینجا fail-open کوتاه‌مدت می‌کنیم (تا USER_CACHE_TTL).
+  if (lastSyncAt && Date.now() - lastSyncAt > USER_CACHE_TTL) {
+    // هنوز از آخرین config استفاده می‌کنیم (fail-open)
   }
 
   const pair = new WebSocketPair();
@@ -406,12 +460,12 @@ async function handleVlessWebSocket(request, ctx) {
   let bytesUp = 0;
   let bytesDown = 0;
   let sessionBytes = 0;
-  let lastReported = 0;
+  let lastReportedLocal = 0;
   let userUuid = null;
+  let userId = null;
   let clientIP = getClientIP(request);
   let limiter = { enabled: false, async take() {} };
   let currentConfig = null;
-  let childId = generateChildId(request.url);
 
   const safeClose = (reason = '') => {
     if (closed) return;
@@ -419,93 +473,42 @@ async function handleVlessWebSocket(request, ctx) {
 
     if (userUuid && joined) {
       activeConns.set(userUuid, Math.max(0, (activeConns.get(userUuid) || 1) - 1));
-
-      if (FINAL_USAGE_ON_CLOSE && sessionBytes > 0) {
-        ctx.waitUntil(reportToMother({
-          type: 'usage',
-          child_id: childId,
-          uuid: userUuid,
-          ip: clientIP,
-          up: bytesUp,
-          down: bytesDown,
-          final: true,
-        }));
+      if (userId) {
+        // باقی‌مانده مصرف را به دلتا اضافه کن
+        if (bytesUp + bytesDown > 0) {
+          addUsageDelta(userId, bytesUp, bytesDown);
+        }
+        clearActiveIp(userId, clientIP);
       }
     }
 
-    try { server.close(1000, reason); } catch {}
-    try { remoteWriter?.close(); } catch {}
-    try { remoteSocket?.close(); } catch {}
+    try {
+      server.close(1000, reason);
+    } catch {}
+    try {
+      remoteWriter?.close();
+    } catch {}
+    try {
+      remoteSocket?.close();
+    } catch {}
   };
 
   const sendResponse = () => {
-    try { server.send(new Uint8Array([0x00, 0x00])); } catch {}
+    try {
+      server.send(new Uint8Array([0x00, 0x00]));
+    } catch {}
   };
 
-  const applyMotherConfig = (res) => {
-    if (!res) return true;
-    if (res.action === 'close' || res.enabled === false) {
-      if (userUuid) ctx.waitUntil(invalidateUserCache(userUuid, ctx));
-      return false;
+  // مصرف را محلی جمع می‌کنیم؛ در sync بعدی به مادر گزارش می‌شود
+  const maybeAccumulate = () => {
+    if (sessionBytes - lastReportedLocal < REPORT_THRESHOLD) return true;
+    if (userId) {
+      addUsageDelta(userId, bytesUp, bytesDown);
+      bytesUp = 0;
+      bytesDown = 0;
     }
-    if (res.config) {
-      currentConfig = { ...currentConfig, ...res.config };
-      if (currentConfig.enabled === false) {
-        ctx.waitUntil(invalidateUserCache(userUuid, ctx));
-        return false;
-      }
-      limiter = getLimiter(userUuid, currentConfig.speedLimitKBps || 0);
-      ctx.waitUntil(putUserCache(userUuid, currentConfig, false, ctx));
-    }
+    lastReportedLocal = sessionBytes;
     return true;
-  };
-
-  const maybeReportUsage = async () => {
-    if (isSilenced()) return false;
-
-    const needBySize = sessionBytes - lastReported >= REPORT_THRESHOLD;
-    const total = bytesUp + bytesDown;
-    const needByQuota =
-      (currentConfig?.quotaBytes > 0 && total >= currentConfig.quotaBytes * QUOTA_REPORT_RATIO) ||
-      (currentConfig?.dailyQuotaBytes > 0 && total >= currentConfig.dailyQuotaBytes * QUOTA_REPORT_RATIO);
-
-    if (!needBySize && !needByQuota) return true;
-
-    lastReported = sessionBytes;
-    const res = await reportToMother({
-      type: 'usage',
-      child_id: childId,
-      uuid: userUuid,
-      ip: clientIP,
-      up: bytesUp,
-      down: bytesDown,
-    });
-    return applyMotherConfig(res);
-  };
-
-  /** connect throttled: حداکثر یک‌بار هر CONNECT_THROTTLE_MS برای uuid+ip */
-  const maybeReportConnect = async () => {
-    const key = `${userUuid}|${clientIP}`;
-    const last = recentConnects.get(key) || 0;
-    if (Date.now() - last < CONNECT_THROTTLE_MS) {
-      return { ok: true, skipped: true }; // از کش محلی استفاده کن
-    }
-    recentConnects.set(key, Date.now());
-
-    const res = await reportToMother({
-      type: 'connect',
-      child_id: childId,
-      uuid: userUuid,
-      ip: clientIP,
-    });
-
-    // fail-open اگر مادر جواب نداد (شبکه)
-    if (!res) return { ok: true, skipped: false, fromMother: false };
-
-    if (!applyMotherConfig(res)) {
-      return { ok: false, reason: res.reason || 'mother rejected' };
-    }
-    return { ok: true, skipped: false, fromMother: true, online: res.online };
   };
 
   server.addEventListener('message', async (event) => {
@@ -519,36 +522,28 @@ async function handleVlessWebSocket(request, ctx) {
         const parsed = parseVlessHeader(data);
         if (!parsed.ok) return safeClose('bad header');
         headerParsed = true;
-        userUuid = parsed.uuid;
+        userUuid = parsed.uuid.toLowerCase();
 
-        if (isSilenced()) return safeClose('silenced');
+        if (nodeDisabled) return safeClose('node disabled');
 
-        const lastAttempt = recentAttempts.get(userUuid) || 0;
-        if (Date.now() - lastAttempt < ATTEMPT_COOLDOWN_MS) {
-          return safeClose('rate limited');
-        }
-        recentAttempts.set(userUuid, Date.now());
-
-        // 1) کانفیگ از کش مشترک یا مادر
-        currentConfig = await getUserConfig(userUuid, ctx);
+        currentConfig = getUserByUuid(userUuid);
         if (!currentConfig) {
-          return safeClose('disabled');
+          return safeClose('user not found or disabled');
         }
 
-        // 2) سقف محلی همزمان (جلوگیری از انفجار Isolate)
-        const localCount = activeConns.get(userUuid) || 0;
-        if (localCount >= LOCAL_MAX_CONNS) {
-          return safeClose('local conn limit');
+        userId = currentConfig.id;
+
+        // محدودیت IP همزمان (محلی)
+        const currentIps = countActiveIps(userId);
+        // اگر این IP قبلاً ثبت شده باشد، مشکلی نیست
+        const already = activeIpsByUser.get(userId)?.has(clientIP);
+        if (!already && currentIps >= (currentConfig.ipLimit || 1)) {
+          return safeClose('ip limit');
         }
 
-        // 3) گزارش connect throttled → مادر IP limit و وضعیت لحظه‌ای را چک می‌کند
-        const connectRes = await maybeReportConnect();
-        if (!connectRes.ok) {
-          return safeClose(connectRes.reason || 'rejected');
-        }
-
-        activeConns.set(userUuid, localCount + 1);
         joined = true;
+        touchActiveIp(userId, clientIP);
+        activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
         limiter = getLimiter(userUuid, currentConfig.speedLimitKBps || 0);
 
         if (parsed.cmd !== 1) return safeClose('only TCP');
@@ -556,11 +551,10 @@ async function handleVlessWebSocket(request, ctx) {
         let dstHost = parsed.address;
         let dstPort = parsed.port;
 
-        if (currentConfig.blockAds && await isAdHost(dstHost)) {
+        if (currentConfig.blockAds && (await isAdHost(dstHost))) {
           sendResponse();
           return safeClose('ad blocked');
         }
-
         if (dstPort === 53) {
           dstHost = ADGUARD_DNS_HOST;
           dstPort = ADGUARD_DNS_PORT;
@@ -585,7 +579,7 @@ async function handleVlessWebSocket(request, ctx) {
                 const { done, value } = await reader.read();
                 if (done) break;
                 if (value && value.byteLength) {
-                  if (!(await maybeReportUsage())) return safeClose('quota');
+                  maybeAccumulate();
                   await limiter.take(value.byteLength);
                   bytesDown += value.byteLength;
                   sessionBytes += value.byteLength;
@@ -606,7 +600,7 @@ async function handleVlessWebSocket(request, ctx) {
       }
 
       if (remoteWriter && data.byteLength > 0) {
-        if (!(await maybeReportUsage())) return safeClose('quota');
+        maybeAccumulate();
         await limiter.take(data.byteLength);
         bytesUp += data.byteLength;
         sessionBytes += data.byteLength;
@@ -623,21 +617,23 @@ async function handleVlessWebSocket(request, ctx) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ─── Status / Heartbeat / Entry ─────────────────────────────────────────────
-async function serveStatusPage(request, childId) {
+// ====================== Status Page ======================
+async function serveStatusPage(request, id) {
   try {
     const res = await fetch(STATUS_HTML_URL, {
-      headers: { 'User-Agent': 'cf-child/3.14' },
+      headers: { 'User-Agent': 'cf-child/4.0-push' },
       cf: { cacheTtl: 300, cacheEverything: true },
     });
     if (!res.ok) throw new Error('fetch status html failed');
+
     let html = await res.text();
-    const inject = `<script>window.__SAOW_VERSION__=${JSON.stringify(VERSION)};window.__SAOW_CHILD_ID__=${JSON.stringify(childId)};</script>`;
+    const inject = `<script>window.__SAOW_VERSION__=${JSON.stringify(VERSION)};window.__SAOW_CHILD_ID__=${JSON.stringify(id)};</script>`;
     if (html.includes('</head>')) {
       html = html.replace('</head>', inject + '</head>');
     } else {
       html = inject + html;
     }
+
     return new Response(html, {
       status: 200,
       headers: {
@@ -651,84 +647,83 @@ async function serveStatusPage(request, childId) {
        <body style="background:#05060f;color:#e2e8f0;font-family:system-ui;display:grid;place-items:center;min-height:100vh;margin:0">
          <div style="text-align:center">
            <h1 style="font-size:2.5rem;letter-spacing:.15em">SAOW</h1>
-           <p>Edge Node</p>
+           <p>Edge Node (Push Mode)</p>
            <p style="opacity:.7">Version: <b>${VERSION}</b></p>
-           <p style="opacity:.5;font-size:0.85rem">${childId}</p>
+           <p style="opacity:.5;font-size:0.85rem">${id}</p>
+           <p style="opacity:.5;font-size:0.8rem">Last sync: ${lastSyncAt ? new Date(lastSyncAt).toISOString() : 'never'}</p>
          </div>
        </body></html>`,
-      { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+      {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      }
     );
   }
 }
 
-function sendHeartbeat(ctx, childId, hostname) {
-  if (isSilenced()) return;
-  ctx.waitUntil(reportToMother({
-    type: 'heartbeat',
-    child_id: childId,
-    url: `https://${hostname}`,
-    version: VERSION,
-    active: activeConns.size,
-  }));
-}
-
+// ====================== Main Entry ======================
 export default {
   async fetch(request, env, ctx) {
-    if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || '';
-
     const url = new URL(request.url);
     const path = url.pathname;
-    const childId = generateChildId(request.url);
+    childId = generateChildId(request.url);
     const isWs = (request.headers.get('Upgrade') || '').toLowerCase() === 'websocket';
 
+    // ---- تنها نقطه ورود مادر ----
+    if (request.method === 'POST' && (path === '/sync' || path === '/sync/')) {
+      return handleSync(request);
+    }
+
     if (path === '/health') {
-      sendHeartbeat(ctx, childId, url.hostname);
-      return new Response(JSON.stringify({
-        ok: true,
-        id: childId,
-        version: VERSION,
-        activeUsers: activeConns.size,
-        silenced: isSilenced(),
-        silenceUntil: silenceUntil || null,
-      }), { headers: { 'content-type': 'application/json' } });
+      let activeUsersCount = 0;
+      for (const c of activeConns.values()) if (c > 0) activeUsersCount++;
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          id: childId,
+          version: VERSION,
+          mode: 'push',
+          activeUsers: activeUsersCount,
+          usersLoaded: usersByUuid.size,
+          nodeDisabled,
+          lastSyncAt: lastSyncAt || null,
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
     }
 
     if (isWs) {
-      if (isSilenced()) {
-        return new Response('Node temporarily unavailable', { status: 503 });
+      if (nodeDisabled) {
+        return new Response('Node disabled', { status: 503 });
       }
       ctx.waitUntil(ensureBlocklist());
       return handleVlessWebSocket(request, ctx);
     }
 
-    if (path === '/') return serveStatusPage(request, childId);
+    if (path === '/') {
+      return serveStatusPage(request, childId);
+    }
 
     if (path === '/version') {
-      return new Response(JSON.stringify({
-        version: VERSION,
-        role: 'node',
-        id: childId,
-        silenced: isSilenced(),
-      }), { headers: { 'content-type': 'application/json' } });
+      return new Response(
+        JSON.stringify({
+          version: VERSION,
+          role: 'node',
+          mode: 'push',
+          id: childId,
+          nodeDisabled,
+          lastSyncAt: lastSyncAt || null,
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
     }
 
     return new Response('Not Found', { status: 404 });
   },
 
+  // دیگر نیازی به scheduled نیست (فرزند ساکت است)
+  // اگر Cron روی این Worker تنظیم شده باشد، کاری انجام نمی‌دهد.
   async scheduled(event, env, ctx) {
-    if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || '';
-    if (isSilenced()) return;
-
-    const hostname = env.CHILD_HOSTNAME || env.WORKER_NAME || 'unknown';
-    const childId = 'child-' + String(hostname).toLowerCase().replace(/[^a-z0-9.-]/g, '').replace(/\./g, '-');
-
-    ctx.waitUntil(reportToMother({
-      type: 'heartbeat',
-      child_id: childId,
-      url: env.CHILD_URL || `https://${hostname}`,
-      version: VERSION,
-      active: activeConns.size,
-    }));
-    ctx.waitUntil(ensureBlocklist());
+    // no-op in push mode
   },
 };
