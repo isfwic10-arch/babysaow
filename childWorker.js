@@ -1,13 +1,15 @@
-// child-worker.js — v4.0-push (Push + State Exchange)
-// فرزند هرگز درخواست آغاز نمی‌کند. فقط به POST /sync از مادر پاسخ می‌دهد.
+// child-worker.js — v4.3-push (Push + D1 full state exchange)
+// فرزند ساکت است. فقط به POST /sync پاسخ می‌دهد.
+// کاربران، IPهای فعال و مصرف همگی در D1 ذخیره می‌شوند تا بین isolateها از دست نروند.
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-4.0-push';
+const VERSION = 'saow-node-4.4-push';
 const API_SECRET = 'saow-pan2';
+let MOTHER_URL = null;
 
-const REPORT_THRESHOLD = 30 * 1024 * 1024; // برای ردیابی محلی (دلتا)
-const USER_CACHE_TTL = 20 * 60 * 1000;     // اگر sync نیاید، کش قدیمی تا ۲۰ دقیقه معتبر بماند
+const REPORT_THRESHOLD = 2 * 1024 * 1024; // هر ۲ مگابایت یک‌بار در D1 بنویس
 const STATUS_HTML_URL = 'https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/node-status.html';
+const IP_IDLE_MS = 10 * 60 * 1000; // IP بدون فعالیت بعد از ۱۰ دقیقه پاک می‌شود
 
 const ADGUARD_DNS_HOST = 'dns.adguard.com';
 const ADGUARD_DNS_PORT = 53;
@@ -25,46 +27,237 @@ const BLOCKLIST_URLS = [
 ];
 const BLOCKLIST_TTL_MS = 6 * 60 * 60 * 1000;
 
-// ====================== State (محلی) ======================
-/** @type {Map<string, UserConfig>} uuid -> config */
+// ====================== In-memory (per isolate, cache) ======================
 let usersByUuid = new Map();
-/** @type {Map<string, string>} uuid -> user_id */
-let uuidToId = new Map();
-/** @type {Map<string, UsageDelta>} user_id -> {up, down} */
-let usageDelta = new Map();
-/** @type {Map<string, Set<string>>} user_id -> Set of active IPs */
-let activeIpsByUser = new Map();
-/** @type {Map<string, number>} uuid -> concurrent WS count */
+let usageDelta = new Map(); // فقط برای جمع موقت داخل همان اتصال
 const activeConns = new Map();
 
 let nodeDisabled = false;
 let lastSyncAt = 0;
 let childId = 'child-unknown';
+let dbReady = false;
+let _env = null;
 
 let blockSet = null;
 let blockSetAt = 0;
 let blockSetLoading = null;
 
-// ====================== Types (JSDoc) ======================
-/**
- * @typedef {Object} UserConfig
- * @property {string} id
- * @property {string} uuid
- * @property {string} [name]
- * @property {boolean} enabled
- * @property {string|null} expiry
- * @property {number} quotaBytes
- * @property {number} dailyQuotaBytes
- * @property {number} speedLimitKBps
- * @property {number} ipLimit
- * @property {boolean} blockAds
- */
+// ====================== D1 ======================
+async function ensureDb(env) {
+  if (!env?.DB) return false;
+  if (dbReady) return true;
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS node_state (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at INTEGER
+      )`),
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS node_users (
+        uuid TEXT PRIMARY KEY,
+        id TEXT,
+        name TEXT,
+        enabled INTEGER DEFAULT 1,
+        expiry TEXT,
+        quota_bytes INTEGER DEFAULT 0,
+        daily_quota_bytes INTEGER DEFAULT 0,
+        speed_limit_kbps INTEGER DEFAULT 0,
+        ip_limit INTEGER DEFAULT 1,
+        block_ads INTEGER DEFAULT 1
+      )`),
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS node_active_ips (
+        user_id TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        last_seen INTEGER NOT NULL,
+        PRIMARY KEY (user_id, ip)
+      )`),
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS node_usage_delta (
+        user_id TEXT PRIMARY KEY,
+        up INTEGER DEFAULT 0,
+        down INTEGER DEFAULT 0
+      )`),
+    ]);
+    dbReady = true;
+    return true;
+  } catch (e) {
+    console.log('ensureDb:', e?.message);
+    return false;
+  }
+}
 
-/**
- * @typedef {Object} UsageDelta
- * @property {number} up
- * @property {number} down
- */
+async function saveUsersToDb(env, users, disabled) {
+  if (!(await ensureDb(env))) return;
+  try {
+    const stmts = [
+      env.DB.prepare('DELETE FROM node_users'),
+      env.DB.prepare(
+        `INSERT INTO node_state (key, value, updated_at) VALUES ('node_disabled', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`
+      ).bind(disabled ? '1' : '0', Date.now()),
+      env.DB.prepare(
+        `INSERT INTO node_state (key, value, updated_at) VALUES ('last_sync', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`
+      ).bind(String(Date.now()), Date.now()),
+    ];
+    for (const u of users) {
+      if (!u?.uuid || !u?.id) continue;
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO node_users
+           (uuid, id, name, enabled, expiry, quota_bytes, daily_quota_bytes, speed_limit_kbps, ip_limit, block_ads)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          String(u.uuid).toLowerCase(),
+          String(u.id),
+          u.name || '',
+          u.enabled === false ? 0 : 1,
+          u.expiry || null,
+          Number(u.quotaBytes) || 0,
+          Number(u.dailyQuotaBytes) || 0,
+          Number(u.speedLimitKBps) || 0,
+          Number(u.ipLimit) > 0 ? Number(u.ipLimit) : 1,
+          u.blockAds === false ? 0 : 1
+        )
+      );
+    }
+    await env.DB.batch(stmts);
+  } catch (e) {
+    console.log('saveUsersToDb:', e?.message);
+  }
+}
+
+async function loadUsersFromDb(env) {
+  if (!(await ensureDb(env))) return false;
+  try {
+    const rows = await env.DB.prepare('SELECT * FROM node_users').all();
+    const list = rows.results || [];
+    if (!list.length) return false;
+
+    const newMap = new Map();
+    for (const r of list) {
+      const uuid = String(r.uuid).toLowerCase();
+      newMap.set(uuid, {
+        id: String(r.id),
+        uuid,
+        name: r.name || '',
+        enabled: !!r.enabled,
+        expiry: r.expiry || null,
+        quotaBytes: r.quota_bytes || 0,
+        dailyQuotaBytes: r.daily_quota_bytes || 0,
+        speedLimitKBps: r.speed_limit_kbps || 0,
+        ipLimit: r.ip_limit || 1,
+        blockAds: !!r.block_ads,
+      });
+    }
+    usersByUuid = newMap;
+
+    const dis = await env.DB.prepare(`SELECT value FROM node_state WHERE key='node_disabled'`).first();
+    nodeDisabled = dis?.value === '1';
+    const ls = await env.DB.prepare(`SELECT value FROM node_state WHERE key='last_sync'`).first();
+    lastSyncAt = ls?.value ? Number(ls.value) : Date.now();
+    return true;
+  } catch (e) {
+    console.log('loadUsersFromDb:', e?.message);
+    return false;
+  }
+}
+
+async function ensureUsersLoaded(env) {
+  if (usersByUuid.size > 0 && lastSyncAt > 0) return;
+  await loadUsersFromDb(env || _env);
+}
+
+async function dbTouchIp(env, userId, ip) {
+  if (!env?.DB || !userId || !ip) return;
+  try {
+    await ensureDb(env);
+    await env.DB.prepare(`
+      INSERT INTO node_active_ips (user_id, ip, last_seen) VALUES (?, ?, ?)
+      ON CONFLICT(user_id, ip) DO UPDATE SET last_seen = excluded.last_seen
+    `).bind(userId, String(ip), Date.now()).run();
+  } catch (e) {
+    console.log('dbTouchIp:', e?.message);
+  }
+}
+
+async function dbClearIp(env, userId, ip) {
+  if (!env?.DB || !userId || !ip) return;
+  try {
+    await ensureDb(env);
+    await env.DB.prepare(`DELETE FROM node_active_ips WHERE user_id = ? AND ip = ?`)
+      .bind(userId, String(ip)).run();
+  } catch {}
+}
+
+async function dbCountIps(env, userId) {
+  if (!env?.DB || !userId) return 0;
+  try {
+    await ensureDb(env);
+    const cutoff = Date.now() - IP_IDLE_MS;
+    await env.DB.prepare(`DELETE FROM node_active_ips WHERE user_id = ? AND last_seen < ?`)
+      .bind(userId, cutoff).run();
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM node_active_ips WHERE user_id = ?`
+    ).bind(userId).first();
+    return row?.c || 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function dbAddUsage(env, userId, up, down) {
+  if (!env?.DB || !userId || up + down <= 0) return;
+  try {
+    await ensureDb(env);
+    await env.DB.prepare(`
+      INSERT INTO node_usage_delta (user_id, up, down) VALUES (?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        up = up + excluded.up,
+        down = down + excluded.down
+    `).bind(userId, up, down).run();
+  } catch (e) {
+    console.log('dbAddUsage:', e?.message);
+  }
+}
+
+async function dbLoadActiveIps(env) {
+  if (!env?.DB) return [];
+  try {
+    await ensureDb(env);
+    const cutoff = Date.now() - IP_IDLE_MS;
+    await env.DB.prepare(`DELETE FROM node_active_ips WHERE last_seen < ?`).bind(cutoff).run();
+    const rows = await env.DB.prepare(`SELECT user_id, ip FROM node_active_ips`).all();
+    const map = new Map();
+    for (const r of rows.results || []) {
+      if (!map.has(r.user_id)) map.set(r.user_id, []);
+      map.get(r.user_id).push(r.ip);
+    }
+    return Array.from(map.entries()).map(([user_id, ips]) => ({ user_id, ips }));
+  } catch {
+    return [];
+  }
+}
+
+async function dbLoadAndClearUsage(env) {
+  if (!env?.DB) return [];
+  try {
+    await ensureDb(env);
+    const rows = await env.DB.prepare(
+      `SELECT user_id, up, down FROM node_usage_delta WHERE up + down > 0`
+    ).all();
+    const list = (rows.results || []).map((r) => ({
+      user_id: r.user_id,
+      up: Number(r.up) || 0,
+      down: Number(r.down) || 0,
+    }));
+    if (list.length) {
+      await env.DB.prepare(`DELETE FROM node_usage_delta`).run();
+    }
+    return list;
+  } catch {
+    return [];
+  }
+}
 
 // ====================== Helpers ======================
 function generateChildId(url) {
@@ -109,38 +302,6 @@ function getUserByUuid(uuid) {
   if (!cfg.enabled) return null;
   if (isExpired(cfg.expiry)) return null;
   return cfg;
-}
-
-function addUsageDelta(userId, up, down) {
-  if (!userId || (up + down) <= 0) return;
-  const cur = usageDelta.get(userId) || { up: 0, down: 0 };
-  cur.up += up;
-  cur.down += down;
-  usageDelta.set(userId, cur);
-}
-
-function touchActiveIp(userId, ip) {
-  if (!userId || !ip) return;
-  let set = activeIpsByUser.get(userId);
-  if (!set) {
-    set = new Set();
-    activeIpsByUser.set(userId, set);
-  }
-  set.add(ip);
-}
-
-function clearActiveIp(userId, ip) {
-  if (!userId || !ip) return;
-  const set = activeIpsByUser.get(userId);
-  if (set) {
-    set.delete(ip);
-    if (set.size === 0) activeIpsByUser.delete(userId);
-  }
-}
-
-function countActiveIps(userId) {
-  const set = activeIpsByUser.get(userId);
-  return set ? set.size : 0;
 }
 
 // ====================== Rate Limiter ======================
@@ -218,7 +379,7 @@ async function ensureBlocklist() {
     for (const url of BLOCKLIST_URLS) {
       try {
         const r = await fetch(url, {
-          headers: { 'User-Agent': 'cf-child/4.0-push' },
+          headers: { 'User-Agent': 'cf-child/4.3-push' },
           cf: { cacheTtl: 3600, cacheEverything: true },
         });
         if (!r.ok) continue;
@@ -265,7 +426,7 @@ async function isAdHost(host) {
   }
 }
 
-// ====================== VLESS Header ======================
+// ====================== VLESS ======================
 function parseVlessHeader(buffer) {
   const view = new DataView(buffer);
   if (buffer.byteLength < 19 || view.getUint8(0) !== 0) return { ok: false };
@@ -300,33 +461,23 @@ function parseVlessHeader(buffer) {
     offset += 16;
   } else return { ok: false };
 
-  const uuidHex = Array.from(uuidBytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+  const uuidHex = Array.from(uuidBytes).map((b) => b.toString(16).padStart(2, '0')).join('');
   const uuid = [
-    uuidHex.slice(0, 8),
-    uuidHex.slice(8, 12),
-    uuidHex.slice(12, 16),
-    uuidHex.slice(16, 20),
-    uuidHex.slice(20),
+    uuidHex.slice(0, 8), uuidHex.slice(8, 12), uuidHex.slice(12, 16),
+    uuidHex.slice(16, 20), uuidHex.slice(20),
   ].join('-');
 
   return {
-    ok: true,
-    cmd,
-    address,
-    port,
-    uuid,
+    ok: true, cmd, address, port, uuid,
     rest: buffer.byteLength > offset ? buffer.slice(offset) : null,
   };
 }
 
-// ====================== Sync Handler (تنها نقطه ارتباط با مادر) ======================
-async function handleSync(request) {
+// ====================== Sync (تنها نقطه ارتباط با مادر) ======================
+async function handleSync(request, env) {
   if (!requireMotherAuth(request)) {
     return new Response(JSON.stringify({ ok: false, reason: 'unauthorized' }), {
-      status: 403,
-      headers: { 'content-type': 'application/json' },
+      status: 403, headers: { 'content-type': 'application/json' },
     });
   }
 
@@ -335,30 +486,25 @@ async function handleSync(request) {
     body = await request.json();
   } catch {
     return new Response(JSON.stringify({ ok: false, reason: 'invalid json' }), {
-      status: 400,
-      headers: { 'content-type': 'application/json' },
+      status: 400, headers: { 'content-type': 'application/json' },
     });
   }
 
   if (body?.type !== 'full_sync') {
     return new Response(JSON.stringify({ ok: false, reason: 'unknown type' }), {
-      status: 400,
-      headers: { 'content-type': 'application/json' },
+      status: 400, headers: { 'content-type': 'application/json' },
     });
   }
 
-  // ---- اعمال وضعیت نود ----
   nodeDisabled = !!(body.node && body.node.disabled);
-
-  // ---- جایگزینی کامل لیست کاربران ----
-  const newMap = new Map();
-  const newUuidToId = new Map();
   const users = Array.isArray(body.users) ? body.users : [];
+  console.log('SYNC received users:', users.length);
 
+  const newMap = new Map();
   for (const u of users) {
-    if (!u || !u.uuid || !u.id) continue;
+    if (!u?.uuid || !u?.id) continue;
     const uuid = String(u.uuid).toLowerCase();
-    const cfg = {
+    newMap.set(uuid, {
       id: String(u.id),
       uuid,
       name: u.name || '',
@@ -369,42 +515,22 @@ async function handleSync(request) {
       speedLimitKBps: Number(u.speedLimitKBps) || 0,
       ipLimit: Number(u.ipLimit) > 0 ? Number(u.ipLimit) : 1,
       blockAds: u.blockAds !== false,
-    };
-    newMap.set(uuid, cfg);
-    newUuidToId.set(uuid, cfg.id);
+    });
   }
-
   usersByUuid = newMap;
-  uuidToId = newUuidToId;
   lastSyncAt = Date.now();
 
-  // ---- ساخت گزارش پاسخ (دلتا + وضعیت فعلی) ----
-  const usageReport = [];
-  for (const [userId, delta] of usageDelta.entries()) {
-    if (delta.up + delta.down > 0) {
-      usageReport.push({
-        user_id: userId,
-        up: delta.up,
-        down: delta.down,
-      });
-    }
-  }
-  // بعد از ارسال، دلتاها را صفر می‌کنیم
-  usageDelta = new Map();
+  await saveUsersToDb(env, users, nodeDisabled);
 
-  const activeIpsReport = [];
-  for (const [userId, ipSet] of activeIpsByUser.entries()) {
-    if (ipSet.size > 0) {
-      activeIpsReport.push({
-        user_id: userId,
-        ips: Array.from(ipSet),
-      });
-    }
-  }
+  // از D1 بخوان (نه از حافظه isolate)
+  const usageReport = await dbLoadAndClearUsage(env);
+  const activeIpsReport = await dbLoadActiveIps(env);
 
   let activeUsersCount = 0;
-  for (const c of activeConns.values()) {
-    if (c > 0) activeUsersCount++;
+  for (const c of activeConns.values()) if (c > 0) activeUsersCount++;
+  // اگر از D1 IP داریم، حداقل آن را هم حساب کن
+  if (activeIpsReport.length > activeUsersCount) {
+    activeUsersCount = activeIpsReport.length;
   }
 
   const report = {
@@ -420,6 +546,8 @@ async function handleSync(request) {
     meta: {
       users_loaded: usersByUuid.size,
       node_disabled: nodeDisabled,
+      usage_entries: usageReport.length,
+      ip_entries: activeIpsReport.length,
     },
   };
 
@@ -432,26 +560,23 @@ async function handleSync(request) {
   });
 }
 
-// ====================== VLESS WebSocket Handler ======================
-async function handleVlessWebSocket(request, ctx) {
+// ====================== VLESS WebSocket ======================
+async function handleVlessWebSocket(request, env, ctx) {
   if ((request.headers.get('Upgrade') || '').toLowerCase() !== 'websocket') {
     return new Response('Expected Upgrade: websocket', { status: 426 });
   }
 
+  await ensureUsersLoaded(env);
+
   if (nodeDisabled) {
     return new Response('Node disabled by mother', { status: 503 });
-  }
-
-  // اگر خیلی وقت است sync نیامده، می‌توانی fail-open یا fail-closed باشی.
-  // اینجا fail-open کوتاه‌مدت می‌کنیم (تا USER_CACHE_TTL).
-  if (lastSyncAt && Date.now() - lastSyncAt > USER_CACHE_TTL) {
-    // هنوز از آخرین config استفاده می‌کنیم (fail-open)
   }
 
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   server.accept();
 
+  const envRef = env;
   let remoteSocket = null;
   let remoteWriter = null;
   let headerParsed = false;
@@ -465,50 +590,44 @@ async function handleVlessWebSocket(request, ctx) {
   let userId = null;
   let clientIP = getClientIP(request);
   let limiter = { enabled: false, async take() {} };
-  let currentConfig = null;
+
+  const flushUsage = () => {
+    if (userId && bytesUp + bytesDown > 0) {
+      const up = bytesUp;
+      const down = bytesDown;
+      bytesUp = 0;
+      bytesDown = 0;
+      // fire-and-forget به D1
+      dbAddUsage(envRef, userId, up, down).catch(() => {});
+    }
+  };
 
   const safeClose = (reason = '') => {
     if (closed) return;
     closed = true;
+    if (reason) console.log('WS close:', reason, userUuid || '');
 
     if (userUuid && joined) {
       activeConns.set(userUuid, Math.max(0, (activeConns.get(userUuid) || 1) - 1));
       if (userId) {
-        // باقی‌مانده مصرف را به دلتا اضافه کن
-        if (bytesUp + bytesDown > 0) {
-          addUsageDelta(userId, bytesUp, bytesDown);
-        }
-        clearActiveIp(userId, clientIP);
+        flushUsage();
+        dbClearIp(envRef, userId, clientIP).catch(() => {});
       }
     }
 
-    try {
-      server.close(1000, reason);
-    } catch {}
-    try {
-      remoteWriter?.close();
-    } catch {}
-    try {
-      remoteSocket?.close();
-    } catch {}
+    try { server.close(1000, reason); } catch {}
+    try { remoteWriter?.close(); } catch {}
+    try { remoteSocket?.close(); } catch {}
   };
 
   const sendResponse = () => {
-    try {
-      server.send(new Uint8Array([0x00, 0x00]));
-    } catch {}
+    try { server.send(new Uint8Array([0x00, 0x00])); } catch {}
   };
 
-  // مصرف را محلی جمع می‌کنیم؛ در sync بعدی به مادر گزارش می‌شود
   const maybeAccumulate = () => {
-    if (sessionBytes - lastReportedLocal < REPORT_THRESHOLD) return true;
-    if (userId) {
-      addUsageDelta(userId, bytesUp, bytesDown);
-      bytesUp = 0;
-      bytesDown = 0;
-    }
+    if (sessionBytes - lastReportedLocal < REPORT_THRESHOLD) return;
+    flushUsage();
     lastReportedLocal = sessionBytes;
-    return true;
   };
 
   server.addEventListener('message', async (event) => {
@@ -518,7 +637,7 @@ async function handleVlessWebSocket(request, ctx) {
       if (typeof data === 'string') data = new TextEncoder().encode(data).buffer;
       if (!(data instanceof ArrayBuffer)) data = new Uint8Array(data).buffer;
 
-      if (!headerParsed) {
+            if (!headerParsed) {
         const parsed = parseVlessHeader(data);
         if (!parsed.ok) return safeClose('bad header');
         headerParsed = true;
@@ -526,35 +645,100 @@ async function handleVlessWebSocket(request, ctx) {
 
         if (nodeDisabled) return safeClose('node disabled');
 
-        currentConfig = getUserByUuid(userUuid);
-        if (!currentConfig) {
-          return safeClose('user not found or disabled');
-        }
+        const currentConfig = getUserByUuid(userUuid);
+        if (!currentConfig) return safeClose('user not found or disabled');
 
         userId = currentConfig.id;
 
-        // محدودیت IP همزمان (محلی)
-        const currentIps = countActiveIps(userId);
-        // اگر این IP قبلاً ثبت شده باشد، مشکلی نیست
-        const already = activeIpsByUser.get(userId)?.has(clientIP);
-        if (!already && currentIps >= (currentConfig.ipLimit || 1)) {
+        // محدودیت IP از D1
+        const currentIps = await dbCountIps(envRef, userId);
+        let ipAlreadyExists = false;
+        try {
+          const row = await envRef.DB.prepare(
+            `SELECT 1 AS x FROM node_active_ips WHERE user_id = ? AND ip = ?`
+          ).bind(userId, clientIP).first();
+          ipAlreadyExists = !!row;
+        } catch {}
+
+        if (!ipAlreadyExists && currentIps >= (currentConfig.ipLimit || 1)) {
           return safeClose('ip limit');
         }
 
         joined = true;
-        touchActiveIp(userId, clientIP);
         activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
+        ctx.waitUntil(dbTouchIp(envRef, userId, clientIP));
         limiter = getLimiter(userUuid, currentConfig.speedLimitKBps || 0);
-
-        if (parsed.cmd !== 1) return safeClose('only TCP');
 
         let dstHost = parsed.address;
         let dstPort = parsed.port;
 
+        // ---------- UDP (cmd = 2) ----------
+        if (parsed.cmd === 2) {
+          // فقط تلاش برای DNS؛ بقیه UDP پشتیبانی نمی‌شود
+          const isDns =
+            dstPort === 53 ||
+            dstHost === '1.1.1.1' ||
+            dstHost === '1.0.0.1' ||
+            dstHost === '8.8.8.8' ||
+            dstHost === '8.8.4.4' ||
+            dstHost === 'dns.google' ||
+            dstHost === 'dns.google.com';
+
+          if (isDns) {
+            dstHost = ADGUARD_DNS_HOST;
+            dstPort = ADGUARD_DNS_PORT;
+            try {
+              remoteSocket = connect({ hostname: dstHost, port: dstPort });
+              remoteWriter = remoteSocket.writable.getWriter();
+              const reader = remoteSocket.readable.getReader();
+              sendResponse();
+
+              if (parsed.rest && parsed.rest.byteLength > 0) {
+                // ساده‌سازی: داده UDP را مستقیم می‌فرستیم
+                await remoteWriter.write(new Uint8Array(parsed.rest));
+              }
+
+              (async () => {
+                try {
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (value && value.byteLength) {
+                      try {
+                        server.send(value);
+                      } catch {
+                        return safeClose('ws send fail');
+                      }
+                    }
+                  }
+                } catch {}
+                safeClose();
+              })();
+              return;
+            } catch {
+              sendResponse();
+              return safeClose('udp dns fail');
+            }
+          }
+
+          // UDP غیر DNS
+          sendResponse();
+          return safeClose('udp not supported');
+        }
+
+        // ---------- فقط TCP ----------
+        if (parsed.cmd !== 1) {
+          sendResponse();
+          return safeClose('only TCP');
+        }
+
+        // بلاک تبلیغات
         if (currentConfig.blockAds && (await isAdHost(dstHost))) {
           sendResponse();
           return safeClose('ad blocked');
         }
+
+        // DNS روی پورت ۵۳ → AdGuard
         if (dstPort === 53) {
           dstHost = ADGUARD_DNS_HOST;
           dstPort = ADGUARD_DNS_PORT;
@@ -593,7 +777,7 @@ async function handleVlessWebSocket(request, ctx) {
             } catch {}
             safeClose();
           })();
-        } catch (e) {
+        } catch {
           safeClose('connect fail');
         }
         return;
@@ -617,64 +801,54 @@ async function handleVlessWebSocket(request, ctx) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ====================== Status Page ======================
+// ====================== Status ======================
 async function serveStatusPage(request, id) {
   try {
     const res = await fetch(STATUS_HTML_URL, {
-      headers: { 'User-Agent': 'cf-child/4.0-push' },
+      headers: { 'User-Agent': 'cf-child/4.3-push' },
       cf: { cacheTtl: 300, cacheEverything: true },
     });
-    if (!res.ok) throw new Error('fetch status html failed');
-
+    if (!res.ok) throw new Error('fetch failed');
     let html = await res.text();
     const inject = `<script>window.__SAOW_VERSION__=${JSON.stringify(VERSION)};window.__SAOW_CHILD_ID__=${JSON.stringify(id)};</script>`;
-    if (html.includes('</head>')) {
-      html = html.replace('</head>', inject + '</head>');
-    } else {
-      html = inject + html;
-    }
-
+    html = html.includes('</head>') ? html.replace('</head>', inject + '</head>') : inject + html;
     return new Response(html, {
       status: 200,
-      headers: {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'public, max-age=60',
-      },
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=60' },
     });
-  } catch (e) {
+  } catch {
     return new Response(
       `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><title>Saow Node</title></head>
        <body style="background:#05060f;color:#e2e8f0;font-family:system-ui;display:grid;place-items:center;min-height:100vh;margin:0">
          <div style="text-align:center">
-           <h1 style="font-size:2.5rem;letter-spacing:.15em">SAOW</h1>
-           <p>Edge Node (Push Mode)</p>
-           <p style="opacity:.7">Version: <b>${VERSION}</b></p>
-           <p style="opacity:.5;font-size:0.85rem">${id}</p>
-           <p style="opacity:.5;font-size:0.8rem">Last sync: ${lastSyncAt ? new Date(lastSyncAt).toISOString() : 'never'}</p>
-         </div>
-       </body></html>`,
-      {
-        status: 200,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-      }
+           <h1>SAOW</h1>
+           <p>Edge Node (Push + D1)</p>
+           <p>Version: <b>${VERSION}</b></p>
+           <p style="opacity:.5">${id}</p>
+         </div></body></html>`,
+      { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
     );
   }
 }
 
-// ====================== Main Entry ======================
+// ====================== Main ======================
 export default {
   async fetch(request, env, ctx) {
+    _env = env;
+    if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || '';
+
     const url = new URL(request.url);
     const path = url.pathname;
     childId = generateChildId(request.url);
     const isWs = (request.headers.get('Upgrade') || '').toLowerCase() === 'websocket';
 
-    // ---- تنها نقطه ورود مادر ----
     if (request.method === 'POST' && (path === '/sync' || path === '/sync/')) {
-      return handleSync(request);
+      return handleSync(request, env);
     }
 
     if (path === '/health') {
+      await ensureUsersLoaded(env);
+      const ips = await dbLoadActiveIps(env);
       let activeUsersCount = 0;
       for (const c of activeConns.values()) if (c > 0) activeUsersCount++;
       return new Response(
@@ -682,37 +856,37 @@ export default {
           ok: true,
           id: childId,
           version: VERSION,
-          mode: 'push',
-          activeUsers: activeUsersCount,
+          mode: 'push-d1',
+          activeUsers: Math.max(activeUsersCount, ips.length),
           usersLoaded: usersByUuid.size,
+          activeIpEntries: ips.length,
           nodeDisabled,
           lastSyncAt: lastSyncAt || null,
+          hasDB: !!env.DB,
         }),
         { headers: { 'content-type': 'application/json' } }
       );
     }
 
     if (isWs) {
-      if (nodeDisabled) {
-        return new Response('Node disabled', { status: 503 });
-      }
       ctx.waitUntil(ensureBlocklist());
-      return handleVlessWebSocket(request, ctx);
+      return handleVlessWebSocket(request, env, ctx);
     }
 
-    if (path === '/') {
-      return serveStatusPage(request, childId);
-    }
+    if (path === '/') return serveStatusPage(request, childId);
 
     if (path === '/version') {
+      await ensureUsersLoaded(env);
       return new Response(
         JSON.stringify({
           version: VERSION,
           role: 'node',
-          mode: 'push',
+          mode: 'push-d1',
           id: childId,
+          usersLoaded: usersByUuid.size,
           nodeDisabled,
           lastSyncAt: lastSyncAt || null,
+          hasDB: !!env.DB,
         }),
         { headers: { 'content-type': 'application/json' } }
       );
@@ -721,9 +895,5 @@ export default {
     return new Response('Not Found', { status: 404 });
   },
 
-  // دیگر نیازی به scheduled نیست (فرزند ساکت است)
-  // اگر Cron روی این Worker تنظیم شده باشد، کاری انجام نمی‌دهد.
-  async scheduled(event, env, ctx) {
-    // no-op in push mode
-  },
+  async scheduled() {},
 };
