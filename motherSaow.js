@@ -243,8 +243,8 @@
 
 // END OF MAP
 // ================================================================================
-const VERSION = "mother-bot-3.7-push";
-const BOT_VERSION = "3.8.94";
+const VERSION = "mother-bot-3.10-push";
+const BOT_VERSION = "3.8.99";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
 const CHILD_WORKER_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/childWorker.js";
@@ -866,8 +866,8 @@ async function createCloudflareNodeSilent(token, env) {
     );
 
     const randomNum = Math.floor(10000 + Math.random() * 90000);
-    const scriptName = `saow-child-${randomNum}`;
-    const dbName = `saow-db-${randomNum}`;
+    const scriptName = `wk-${randomNum}`;
+    const dbName = `db-${randomNum}`;
     const nodeUrl = `https://${scriptName}.${accountSubdomain}.workers.dev`;
 
     const dbRes = await cfFetch(`/accounts/${accountId}/d1/database`, token, {
@@ -1059,6 +1059,35 @@ async function toggleNodeStatus(chatId, nodeId, env, msgId) {
   }
 }
 
+/** خروج/ورود نود از چرخه ساب (نود فعال می‌ماند، فقط در لینک ساب انتخاب نمی‌شود) */
+async function toggleNodeExcludeSub(chatId, nodeId, env, msgId) {
+  await edit(chatId, msgId, "⏳ در حال تغییر وضعیت ساب...", env);
+  try {
+    const node = await getManagedNode(env, nodeId);
+    if (!node) {
+      return edit(chatId, msgId, "❌ نود پیدا نشد.", env, [[{ text: "🔙", callback_data: "nodes" }]]);
+    }
+    const newVal = node.exclude_sub === 1 ? 0 : 1;
+    await env.DB.prepare("UPDATE managed_nodes SET exclude_sub = ? WHERE id = ?")
+      .bind(newVal, nodeId)
+      .run();
+
+    const msg =
+      newVal === 1
+        ? `🚫 نود <code>${escape(node.script_name)}</code> از <b>چرخه ساب</b> خارج شد.\n\n• نود همچنان آنلاین و فعال است.\n• لینک ساب کاربران عمومی به این نود اشاره نمی‌کند.\n• کاربران قفل‌شده روی همین نود همچنان آن را می‌گیرند.`
+        : `✅ نود <code>${escape(node.script_name)}</code> دوباره وارد <b>چرخه ساب</b> شد.`;
+
+    return edit(chatId, msgId, msg, env, [
+      [{ text: "🔙 جزئیات نود", callback_data: `node_detail:${nodeId}` }],
+      [{ text: "🖥 لیست نودها", callback_data: "nodes" }],
+    ]);
+  } catch (err) {
+    return edit(chatId, msgId, `❌ خطا:\n<code>${escape(err.message)}</code>`, env, [
+      [{ text: "🔙", callback_data: "nodes" }],
+    ]);
+  }
+}
+
 function extractUuidFromText(text) {
   const raw = String(text || "").trim();
   if (!raw) return null;
@@ -1152,10 +1181,10 @@ async function showNodeDetail(chatId, node, env, msgId = null) {
     accError = e?.message || "خطا در دریافت اطلاعات اکانت";
   }
 
-  const lock = node.is_disabled === 1 ? "🔒 قفل" : "🔓 باز";
+  const lock = node.is_disabled === 1 ? "🔒 قفل کامل" : "🔓 باز";
+  const subState = node.exclude_sub === 1 ? "🚫 خارج از ساب" : "✅ در چرخه ساب";
   let statusLine = online ? "🟢 آنلاین" : "🔴 آفلاین";
 
-  // تشخیص خاص ۴۲۹
   if (!online && probe) {
     if (probe.statusCode === 429) {
       statusLine = "🟠 محدودیت نرخ (۴۲۹) — ممکن است هنوز کار کند";
@@ -1164,23 +1193,28 @@ async function showNodeDetail(chatId, node, env, msgId = null) {
     }
   }
 
+  const usersFa =
+    src?.activeUsers != null ? faNum(src.activeUsers) : "—";
+  const capFa = src?.capacity != null ? faNum(src.capacity) : "—";
+  const childNo = shortChildId(node.script_name);
+
   let text =
-    `${statusLine} · ${lock}\n\n` +
+    `${statusLine} · ${lock} · ${subState}\n\n` +
     `📛 <code>${escape(node.script_name)}</code>\n` +
+    `🔢 شماره child: <b>${faNum(childNo)}</b>\n` +
     `🔗 <code>${escape(node.url || "—")}</code>\n` +
-    `☁️ Account ID: <code>${escape(node.account_id || "—")}</code>\n` +
-    `📧 ایمیل: <code>${escape(email)}</code>\n` +
+    `☁️ Account: <code>${escape((node.account_id || "—").slice(0, 12))}…</code>\n` +
+    `📧 ${escape(email)}\n` +
     `📈 درخواست امروز: <b>${escape(reqToday)}</b>\n` +
+    `👥 همزمان: <b>${usersFa}</b> / ${capFa}\n` +
     `📦 نسخه: ${escape(src?.version || "—")}\n` +
-    `👥 فعال: ${src?.activeUsers ?? "—"} / ${src?.capacity ?? "—"}\n` +
-    `⏱ همگام‌سازی: ${lastSeen}\n\n` +
-    `🔑 <b>توکن CF (کامل):</b>\n<code>${escape(tokenDisplay)}</code>`;
+    `⏱ همگام: ${lastSeen}\n\n` +
+    `🔑 <b>توکن CF:</b>\n<code>${escape(tokenDisplay)}</code>`;
 
   if (accError) {
     text += `\n\n⚠️ خطا در اطلاعات اکانت:\n<code>${escape(accError.slice(0, 150))}</code>`;
   }
 
-  // جزئیات probe وقتی آفلاین است
   if (!online && probe) {
     if (probe.statusCode && probe.statusCode !== 0) {
       text += `\n\n📡 Probe: HTTP <code>${probe.statusCode}</code>`;
@@ -1189,24 +1223,25 @@ async function showNodeDetail(chatId, node, env, msgId = null) {
       text += `\n<code>${escape(String(probe.error).slice(0, 120))}</code>`;
     }
     if (probe.statusCode === 429) {
-      text += `\n\n💡 نود ممکن است همچنان به کاربران سرویس دهد، اما مادر به دلیل Rate Limit نمی‌تواند همگام‌سازی کند.`;
+      text += `\n\n💡 نود ممکن است همچنان سرویس دهد؛ مادر به‌خاطر Rate Limit همگام نمی‌شود.`;
     }
   }
 
-    const toggleText = node.is_disabled === 1 ? "🔓 آنلاک" : "🔒 قفل";
+  const toggleText = node.is_disabled === 1 ? "🔓 آنلاک کامل" : "🔒 قفل کامل";
+  const subToggleText =
+    node.exclude_sub === 1 ? "✅ ورود به چرخه ساب" : "🚫 خروج از چرخه ساب";
 
   const kb = [
     [
       { text: "🔄 رفرش", callback_data: `node_detail:${node.id}` },
       { text: toggleText, callback_data: `toggle_node:${node.id}` },
     ],
+    [{ text: subToggleText, callback_data: `toggle_sub:${node.id}` }],
     [
       { text: "♻️ نصب مجدد", callback_data: `update_child:${node.id}` },
       { text: "📈 اکانت CF", callback_data: `node_acc:${node.id}` },
     ],
-    [
-      { text: "🗑 حذف", callback_data: `del_node:${node.id}` },
-    ],
+    [{ text: "🗑 حذف", callback_data: `del_node:${node.id}` }],
     [
       { text: "🖥 همه نودها", callback_data: "nodes" },
       { text: "🔙 مدیریت", callback_data: "nodes_manage" },
@@ -1242,17 +1277,17 @@ async function showRenewPayInfo(chatId, tgUserId, panelUserId, planId, env, msgI
   });
 
   const text =
-    `♻️ <b>پرداخت تمدید</b>\n\n` +
+    `♻️ <b>پرداخت تمدید</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
     `سرویس: <b>${escape(user.name)}</b>\n` +
     `پلن: <b>${escape(plan.name)}</b>\n` +
-    `مبلغ: <b>${Number(plan.price).toLocaleString("fa-IR")} تومان</b>\n` +
-    `مدت اضافه‌شونده: ${plan.days} روز\n\n` +
+    `مدت اضافه‌شونده: <b>${faNum(plan.days)} روز</b>\n` +
+    `مبلغ: <b>${Number(plan.price).toLocaleString("fa-IR")} تومان</b>\n\n` +
     `⚠️ UUID شما عوض نمی‌شود؛ فقط حجم/زمان طبق پلن اعمال می‌شود.\n\n` +
     `به این کارت واریز کنید:\n` +
     `💳 <code>${escape(cfg.cardNumber)}</code>\n` +
     `👤 ${escape(cfg.cardName)}\n\n` +
-    `بعد از پرداخت، <b>اسکرین‌شات رسید</b> را همین‌جا بفرستید.\n` +
-    `انصراف: دکمه زیر یا /start`;
+    `بعد از پرداخت، <b>اسکرین‌شات رسید</b> را همین‌جا بفرستید.`;
 
   const kb = [[{ text: "❌ انصراف", callback_data: `mysvc:${panelUserId}` }]];
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
@@ -1342,17 +1377,20 @@ async function requestRenew(chatId, tgUserId, panelUserId, env, msgId) {
   });
 
   let text =
-    `♻️ <b>تمدید سرویس</b>\n\n` +
+    `♻️ <b>تمدید سرویس</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
     `سرویس: <b>${escape(user.name)}</b>\n` +
-    `UUID حفظ می‌شود.\n\n` +
+    `🔑 UUID شما حفظ می‌شود.\n\n` +
     `یک پلن انتخاب کنید:`;
 
   const kb = [];
   for (const p of plans) {
-    const q = p.quota_gb > 0 ? `${p.quota_gb}GB` : "∞";
+    const daysFa = faNum(p.days);
+    const priceFa = Number(p.price).toLocaleString("fa-IR");
+    const quotaFa = p.quota_gb > 0 ? `${faNum(p.quota_gb)} گیگ` : "نامحدود";
     kb.push([
       {
-        text: `${p.name} | ${p.days}روز | ${q} | ${Number(p.price).toLocaleString("fa-IR")}ت`,
+        text: `✨ ${p.name} · ${daysFa}روز · ${quotaFa} · ${priceFa}ت`,
         callback_data: `renew_plan:${panelUserId}:${p.id}`,
       },
     ]);
@@ -1364,12 +1402,15 @@ async function requestRenew(chatId, tgUserId, panelUserId, env, msgId) {
 
 async function showShopPlansAdmin(chatId, env, msgId = null) {
   const plans = await listPlans(env, false);
-  let text = `📦 <b>مدیریت پلن‌ها</b>\n\n`;
+  let text = `📦 <b>مدیریت پلن‌ها</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
   const kb = [];
   if (!plans.length) text += "هنوز پلنی ساخته نشده.\n";
   for (const p of plans) {
     const st = p.enabled ? "🟢" : "🔴";
-    text += `${st} <b>${escape(p.name)}</b> | ${p.days}روز | ${p.quota_gb || "∞"}GB | ${Number(p.price).toLocaleString("fa-IR")}ت\n`;
+    const daysFa = faNum(p.days);
+    const quotaFa = p.quota_gb > 0 ? `${faNum(p.quota_gb)} گیگ` : "∞";
+    const priceFa = Number(p.price).toLocaleString("fa-IR");
+    text += `${st} <b>${escape(p.name)}</b>\n   ${daysFa} روز · ${quotaFa} · ${priceFa} ت\n\n`;
     kb.push([
       { text: `${p.enabled ? "🔴" : "🟢"} ${p.name}`, callback_data: `shop_plan_toggle:${p.id}` },
       { text: "🗑", callback_data: `shop_plan_del:${p.id}` },
@@ -1509,7 +1550,7 @@ async function showShopAdmin(chatId, env, msgId = null) {
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
 
-async function giveTestAccount(chatId, userId, env, msgId = null) {
+async function giveTestAccount(chatId, userId, env, msgId = null, fromUser = null) {
   const cfg = await getShopConfig(env);
   if (!cfg.testEnabled) {
     return send(chatId, "اکانت تست فعلاً غیرفعال است.", env);
@@ -1524,6 +1565,10 @@ async function giveTestAccount(chatId, userId, env, msgId = null) {
   const expiry = new Date(Date.now() + cfg.testDays * 86400000).toISOString();
   const quotaBytes = Math.floor(cfg.testQuotaMb * 1024 * 1024);
 
+  const uname = fromUser?.username ? `@${fromUser.username}` : "—";
+  const fname = [fromUser?.first_name, fromUser?.last_name].filter(Boolean).join(" ") || "—";
+  const notes = `test | tg:${userId} | ${uname} | ${fname}`.slice(0, 200);
+
   await upsertUser(env, {
     id,
     name: `test-${userId}`.slice(0, 32),
@@ -1536,7 +1581,7 @@ async function giveTestAccount(chatId, userId, env, msgId = null) {
     ipLimit: 1,
     cleanIp: "",
     blockAds: true,
-    notes: "test-account",
+    notes,
   });
   await setShopSetting(env, `test_used:${userId}`, "1");
   triggerSync(env);
@@ -1602,7 +1647,7 @@ async function approveOrder(chatId, orderId, env, msgId) {
       quotaBytes: quotaBytes || existing.quotaBytes,
       dailyQuotaBytes: dailyQuotaBytes || existing.dailyQuotaBytes,
       ipLimit: plan.ip_limit || existing.ipLimit,
-      notes: `${existing.notes || ""} | renew:${orderId} | tg:${order.user_id}`.slice(0, 200),
+      notes: `${existing.notes || ""} | تمدید | order:${orderId} | tg:${order.user_id} | @${order.username || "-"}`.slice(0, 200),
     });
   } else {
     id = generateId();
@@ -1624,7 +1669,7 @@ async function approveOrder(chatId, orderId, env, msgId) {
       ipLimit: plan.ip_limit || 1,
       cleanIp: "",
       blockAds: true,
-      notes: `order:${orderId} | tg:${order.user_id} | @${order.username || "-"}`,
+      notes: `خرید | order:${orderId} | tg:${order.user_id} | @${order.username || "-"} | ${plan.name}`.slice(0, 200),
     });
     panelUserId = id;
   }
@@ -1836,14 +1881,28 @@ async function showBuyPlans(chatId, env, msgId = null) {
       ? edit(chatId, msgId, "فعلاً پلنی برای فروش وجود ندارد.", env, [[{ text: "🔙", callback_data: "user_home" }]])
       : send(chatId, "فعلاً پلنی برای فروش وجود ندارد.", env);
   }
-  let text = `🛒 <b>انتخاب پلن</b>\n\n`;
+  let text =
+    `🛒 <b>انتخاب پلن</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n`;
   const kb = [];
   for (const p of plans) {
-    const q = p.quota_gb > 0 ? `${p.quota_gb}GB` : "∞";
-    const d = p.daily_gb > 0 ? ` | روزانه ${p.daily_gb}GB` : "";
-    text += `• <b>${escape(p.name)}</b> — ${p.days} روز — ${q}${d} — <b>${Number(p.price).toLocaleString("fa-IR")} تومان</b>\n`;
-    kb.push([{ text: `${p.name} | ${Number(p.price).toLocaleString("fa-IR")} ت`, callback_data: `user_plan:${p.id}` }]);
+    const daysFa = faNum(p.days);
+    const priceFa = Number(p.price).toLocaleString("fa-IR");
+    const quotaFa = p.quota_gb > 0 ? `${faNum(p.quota_gb)} گیگ` : "نامحدود";
+    const dailyFa =
+      p.daily_gb > 0 ? `\n   📅 روزانه: <b>${faNum(p.daily_gb)} گیگ</b>` : "";
+    text +=
+      `▫️ <b>${escape(p.name)}</b>\n` +
+      `   ⏱ ${daysFa} روز  ·  📦 ${quotaFa}${dailyFa}\n` +
+      `   💰 <b>${priceFa} تومان</b>\n\n`;
+    kb.push([
+      {
+        text: `✨ ${p.name}  ·  ${priceFa} ت`,
+        callback_data: `user_plan:${p.id}`,
+      },
+    ]);
   }
+  text += `━━━━━━━━━━━━━━━━━━━━\nروی پلن مورد نظر بزنید.`;
   kb.push([{ text: "🔙 بازگشت", callback_data: "user_home" }]);
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
@@ -1861,10 +1920,11 @@ async function showPayInfo(chatId, userId, planId, env, msgId = null) {
   await setUserState(env, userId, { step: "waiting_receipt", planId });
 
   const text =
-    `💳 <b>پرداخت</b>\n\n` +
+    `💳 <b>پرداخت</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
     `پلن: <b>${escape(plan.name)}</b>\n` +
-    `مبلغ: <b>${Number(plan.price).toLocaleString("fa-IR")} تومان</b>\n` +
-    `مدت: ${plan.days} روز\n\n` +
+    `مدت: <b>${faNum(plan.days)} روز</b>\n` +
+    `مبلغ: <b>${Number(plan.price).toLocaleString("fa-IR")} تومان</b>\n\n` +
     `به این کارت واریز کنید:\n` +
     `💳 <code>${escape(cfg.cardNumber)}</code>\n` +
     `👤 ${escape(cfg.cardName)}\n\n` +
@@ -1956,6 +2016,7 @@ async function getShopConfig(env) {
     testDays: parseInt(await getShopSetting(env, "test_days", "1"), 10) || 1,
     guideText: await getShopSetting(env, "guide_text", "آموزش استفاده به‌زودی..."),
     welcomeText: await getShopSetting(env, "welcome_text", "به ربات خوش آمدید 👋"),
+    sponsorText: await getShopSetting(env, "sponsor_text", ""),
   };
 }
 
@@ -2326,7 +2387,7 @@ async function handleMessage(msg, env) {
     if (replyText.includes("نام نود و توکن را ارسال کنید")) {
       const parts = text.trim().split(/\s+/);
       if (parts.length < 2) {
-        return send(chatId, "❌ فرمت نادرست.\nمثال:\n<code>saow-child-12345 YOUR_TOKEN</code>", env);
+        return send(chatId, "❌ فرمت نادرست.\nمثال:\n<code>wk-12345 YOUR_TOKEN</code>", env);
       }
       const scriptName = parts[0];
       const token = parts.slice(1).join(" ").trim();
@@ -2385,6 +2446,13 @@ async function handleMessage(msg, env) {
       return showShopAdmin(chatId, env);
     }
 
+    if (replyText.includes("متن اسپانسر") || replyText.includes("متن اسپانسر / تبلیغ")) {
+      const val = text.trim() === "-" ? "" : text.slice(0, 200);
+      await setShopSetting(env, "sponsor_text", val);
+      await send(chatId, val ? "✅ متن اسپانسر ذخیره شد." : "✅ متن اسپانسر پاک شد.", env);
+      return showShopAdmin(chatId, env);
+    }
+
     if (replyText.includes("اطلاعات پلن را ارسال کنید")) {
       const parts = text.split("|").map((x) => x.trim());
       if (parts.length < 5) {
@@ -2436,10 +2504,20 @@ async function handleMessage(msg, env) {
     if (text === "/start" || text === "/menu" || text === "منو") {
       return showMain(chatId, env);
     }
+    if (text === "/node" || text === "/nodes") {
+      return showNodesManage(chatId, env);
+    }
+    if (text === "/users") {
+      return showUsers(chatId, 0, env);
+    }
+    if (text === "/status") {
+      return showStatus(chatId, env);
+    }
 
     return send(
       chatId,
       "از دکمه‌های شیشه‌ای استفاده کنید.\n" +
+        "دستورات: /status · /users · /node\n" +
         "می‌توانید UUID، لینک کانفیگ، <b>نام نود</b> یا <b>آدرس نود</b> بفرستید.\n/start",
       env
     );
@@ -2468,6 +2546,27 @@ async function handleMessage(msg, env) {
 
   if (text === "/start" || text === "/menu" || text === "منو" || !text) {
     return showUserHome(chatId, env);
+  }
+
+  // لینک vless یا UUID → نمایش اطلاعات سرویس کاربر
+  const uuidFromText = extractUuidFromText(text);
+  if (uuidFromText) {
+    const u = await getUserByUuid(env, uuidFromText);
+    if (u) {
+      const notes = String(u.notes || "");
+      const name = String(u.name || "");
+      const owns =
+        name === `test-${userId}` ||
+        name.startsWith(`shop-${userId}`) ||
+        notes.includes(`tg:${userId}`);
+      if (owns || isAdmin(userId, env)) {
+        return showMyServiceDetail(chatId, userId, u.id, env);
+      }
+      // ادمین در شاخه بالا هندل شده؛ برای دیگران فقط سرویس خودشان
+      return send(chatId, "این سرویس متعلق به شما نیست.", env, [
+        [{ text: "🏠 منو", callback_data: "user_home" }],
+      ]);
+    }
   }
 
   return showUserHome(chatId, env);
@@ -2574,7 +2673,7 @@ async function handleCallback(cq, env) {
     return showPayInfo(chatId, userId, data.split(":")[1], env, msgId);
   }
 
-  if (data === "user_test") return giveTestAccount(chatId, userId, env, msgId);
+  if (data === "user_test") return giveTestAccount(chatId, userId, env, msgId, cq.from);
 
   if (data === "user_guide") {
     const cfg = await getShopConfig(env);
@@ -2704,8 +2803,21 @@ async function handleCallback(cq, env) {
         { text: "👋 خوش‌آمد", callback_data: "shop_welcome" },
         { text: "📖 آموزش", callback_data: "shop_guide" },
       ],
+      [{ text: "📢 متن اسپانسر", callback_data: "shop_sponsor" }],
       [{ text: "🔙 تنظیمات فروش", callback_data: "shop_admin" }],
     ]);
+  }
+
+  if (data === "shop_sponsor") {
+    return send(
+      chatId,
+      `✏️ <b>متن اسپانسر / تبلیغ را ارسال کنید</b>\n\n` +
+        `این متن در بنر اتمام حجم/زمان و داخل کانفیگ‌های ساب نمایش داده می‌شود.\n` +
+        `برای پاک کردن: <code>-</code>\n\nبرای بازگشت /start`,
+      env,
+      [[{ text: "❌ انصراف", callback_data: "shop_texts" }]],
+      true
+    );
   }
 
   if (data === "shop_test") {
@@ -2856,6 +2968,9 @@ async function handleCallback(cq, env) {
   if (data.startsWith("toggle_node:")) {
     return toggleNodeStatus(chatId, data.split(":")[1], env, msgId);
   }
+  if (data.startsWith("toggle_sub:")) {
+    return toggleNodeExcludeSub(chatId, data.split(":")[1], env, msgId);
+  }
 
   if (data === "node_create_token") {
     return send(
@@ -3005,6 +3120,16 @@ async function handleCallback(cq, env) {
 
   if (data.startsWith("ads:")) return toggleAds(chatId, data.split(":")[1], env, msgId);
 
+  if (data.startsWith("forcenode:")) {
+    return forceNodeMenu(chatId, data.split(":")[1], env, msgId);
+  }
+  if (data.startsWith("setforce:")) {
+    const parts = data.split(":");
+    const uid = parts[1];
+    const nodeKey = parts.slice(2).join(":") || "";
+    return setForcedNode(chatId, uid, nodeKey, env, msgId);
+  }
+
   // ----- Legacy renew_do -----
   if (data.startsWith("renew_do:")) {
     const parts = data.split(":");
@@ -3103,6 +3228,71 @@ async function showStatus(chatId, env, msgId = null) {
   } else {
     liveText = "\n\n🟢 هیچ کاربر آنلاینی وجود ندارد.";
   }
+
+  // درخواست‌های امروز مادر + نودها
+  let motherReqs = null;
+  try {
+    if (env.CF_TOKEN && env.MOTHER_ACCOUNT_ID) {
+      motherReqs = await getAccountRequestsToday(env.CF_TOKEN, env.MOTHER_ACCOUNT_ID);
+    }
+  } catch {}
+
+  const managed = await getManagedNodes(env);
+  const alive = await getHealthyChildren(env);
+  let nodesReqSum = 0;
+  let nodesReqKnown = 0;
+  let nodesSummary = "";
+  if (managed.length) {
+    const lines = [];
+    await Promise.all(
+      managed.map(async (m) => {
+        let reqs = null;
+        try {
+          const token = await resolveNodeToken(env, m);
+          if (token && m.account_id) {
+            const r = await getAccountRequestsToday(token, m.account_id);
+            if (typeof r === "number") {
+              reqs = r;
+              nodesReqSum += r;
+              nodesReqKnown++;
+            }
+          }
+        } catch {}
+        const live = alive.find(
+          (a) =>
+            a.id.includes(m.script_name) ||
+            (m.url && a.url && String(a.url).includes(m.script_name))
+        );
+        const st =
+          m.is_disabled === 1
+            ? "🔒"
+            : live
+              ? "🟢"
+              : "🔴";
+        const users = live?.activeUsers != null ? faNum(live.activeUsers) : "—";
+        const reqTxt = reqs != null ? formatReqShort(reqs) : "—";
+        const sub = m.exclude_sub === 1 ? " 🚫ساب" : "";
+        lines.push(
+          `${st} <code>${escape(m.script_name)}</code> · 👥${users} · 📈${reqTxt}${sub}`
+        );
+      })
+    );
+    nodesSummary =
+      "\n\n🖥 <b>خلاصه نودها:</b>\n" + lines.join("\n");
+  }
+
+  const motherTxt =
+    motherReqs != null ? Number(motherReqs).toLocaleString("fa-IR") : "—";
+  const nodesReqTxt =
+    nodesReqKnown > 0 ? Number(nodesReqSum).toLocaleString("fa-IR") : "—";
+  const totalReq =
+    (typeof motherReqs === "number" ? motherReqs : 0) +
+    (nodesReqKnown > 0 ? nodesReqSum : 0);
+  const totalReqTxt =
+    motherReqs != null || nodesReqKnown > 0
+      ? Number(totalReq).toLocaleString("fa-IR")
+      : "—";
+
   const text =
     `📊 <b>وضعیت سیستم</b>\n\n` +
     `🔖 نسخه: <code>${VERSION}</code>\n\n` +
@@ -3110,7 +3300,12 @@ async function showStatus(chatId, env, msgId = null) {
     `✅ <b>فعال:</b> ${res.activeUsers}\n` +
     `🟢 <b>آنلاین:</b> ${res.onlineUsers}\n` +
     `🖥 <b>نودها:</b> ${res.nodes}\n` +
-    `📈 <b>ترافیک کل:</b> ${res.totalTrafficGB} GB` +
+    `📈 <b>ترافیک کل:</b> ${res.totalTrafficGB} GB\n\n` +
+    `📡 <b>درخواست امروز:</b>\n` +
+    `• مادر: <b>${motherTxt}</b>\n` +
+    `• نودها: <b>${nodesReqTxt}</b>\n` +
+    `• مجموع: <b>${totalReqTxt}</b>` +
+    nodesSummary +
     liveText;
   const kb = [
     [
@@ -3181,6 +3376,9 @@ async function showUser(chatId, id, env, msgId = null) {
   } else {
     devices = "\n\n📱 هیچ IP فعالی وجود ندارد.";
   }
+  const forcedLabel = u.forcedNode
+    ? `🔒 قفل روی نود: <code>${escape(u.forcedNode)}</code>`
+    : "🔓 نود آزاد (لود بالانس)";
   const text =
     `${emoji} <b>${escape(u.name)}</b>\n` +
     `🆔 <code>${u.id}</code>\n` +
@@ -3192,6 +3390,7 @@ async function showUser(chatId, id, env, msgId = null) {
     `📅 انقضا: <b>${expiryText}</b>\n` +
     `⚡ سرعت: ${speed}\n` +
     `🌐 IP همزمان: <b>${u.activeIPs}/${u.ipLimit}</b>\n` +
+    `🖥 ${forcedLabel}\n` +
     `🛡 بلاک تبلیغات: ${u.blockAds ? "✅" : "❌"}\n` +
     `📝 ${escape(u.notes || "-")}` +
     devices;
@@ -3209,6 +3408,7 @@ async function showUser(chatId, id, env, msgId = null) {
       { text: "📦 حجم کل", callback_data: `quotamenu:${u.id}` },
       { text: "📅 حجم روزانه", callback_data: `dailymenu:${u.id}` },
     ],
+    [{ text: "🖥 قفل روی نود", callback_data: `forcenode:${u.id}` }],
     [
       { text: u.blockAds ? "🛡 تبلیغات: روشن" : "🛡 تبلیغات: خاموش", callback_data: `ads:${u.id}` },
       { text: "📝 یادداشت", callback_data: `notes:${u.id}` },
@@ -3224,6 +3424,44 @@ async function showUser(chatId, id, env, msgId = null) {
     [{ text: "🔙 لیست کاربران", callback_data: "users:0" }],
   ];
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
+}
+
+async function forceNodeMenu(chatId, userId, env, msgId) {
+  const user = await getUserById(env, userId);
+  if (!user) {
+    return edit(chatId, msgId, "❌ کاربر پیدا نشد", env, [[{ text: "🔙", callback_data: "users:0" }]]);
+  }
+  const managed = await getManagedNodes(env);
+  let text =
+    `🖥 <b>قفل کاربر روی نود</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `کاربر: <b>${escape(user.name)}</b>\n` +
+    `فعلی: ${user.forcedNode ? `<code>${escape(user.forcedNode)}</code>` : "آزاد (لود بالانس)"}\n\n` +
+    `با انتخاب نود، لینک ساب فقط به همان نود اشاره می‌کند.`;
+  const kb = [[{ text: "🔓 آزاد (لود بالانس)", callback_data: `setforce:${userId}:` }]];
+  for (const m of managed) {
+    if (m.is_disabled === 1) continue;
+    const mark = user.forcedNode === m.script_name || user.forcedNode === m.id ? "✅ " : "";
+    const sub = m.exclude_sub === 1 ? " 🚫ساب" : "";
+    kb.push([
+      {
+        text: `${mark}${shortChildId(m.script_name)} · ${m.script_name}${sub}`.slice(0, 60),
+        callback_data: `setforce:${userId}:${m.script_name}`,
+      },
+    ]);
+  }
+  kb.push([{ text: "🔙 جزئیات کاربر", callback_data: `user:${userId}` }]);
+  return edit(chatId, msgId, text, env, kb);
+}
+
+async function setForcedNode(chatId, userId, nodeKey, env, msgId) {
+  const user = await getUserById(env, userId);
+  if (!user) {
+    return edit(chatId, msgId, "❌ کاربر پیدا نشد", env, [[{ text: "🔙", callback_data: "users:0" }]]);
+  }
+  const forcedNode = nodeKey && nodeKey.length ? nodeKey : "";
+  await upsertUser(env, { ...user, forcedNode });
+  triggerSync(env);
+  return showUser(chatId, userId, env, msgId);
 }
 
 async function ipLimitMenu(chatId, id, env, msgId) {
@@ -3628,12 +3866,12 @@ async function showNodes(chatId, env, msgId = null) {
   const alive = await getHealthyChildren(env);
   const managed = await getManagedNodes(env);
 
-  let text = `🖥 <b>نودهای فرزند</b>\n\n`;
+  let text = `🖥 <b>نودهای فرزند</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
 
   if (!managed.length && !alive.length) {
     text += "هیچ نودی ثبت نشده.";
   } else {
-    // probe موازی فقط برای نودهای آفلاین (سریع‌تر از سریال)
+    // probe موازی فقط برای نودهای آفلاین
     const offline = managed.filter((m) => {
       const live = alive.find(
         (a) =>
@@ -3657,6 +3895,20 @@ async function showNodes(chatId, env, msgId = null) {
       }
     }
 
+    // درخواست امروز برای همه نودهای مدیریت‌شده (موازی)
+    const reqMap = new Map();
+    await Promise.allSettled(
+      managed.map(async (m) => {
+        try {
+          const token = await resolveNodeToken(env, m);
+          if (token && m.account_id) {
+            const r = await getAccountRequestsToday(token, m.account_id);
+            if (typeof r === "number") reqMap.set(m.id, r);
+          }
+        } catch {}
+      })
+    );
+
     let i = 0;
     for (const m of managed) {
       i++;
@@ -3666,25 +3918,27 @@ async function showNodes(chatId, env, msgId = null) {
           (m.url && a.id.includes(String(m.script_name || "").replace(/-/g, ""))) ||
           (m.url && a.url && a.url.includes(m.script_name))
       );
+      const reqs = reqMap.has(m.id) ? formatReqShort(reqMap.get(m.id)) : "—";
+      const users = live?.activeUsers != null ? faNum(live.activeUsers) : "—";
+      const cap = live?.capacity != null ? faNum(live.capacity) : "—";
+      const subOff = m.exclude_sub === 1 ? " · 🚫ساب" : "";
 
       if (m.is_disabled === 1) {
-        text += `${i}. 🔒 <code>${escape(m.script_name)}</code> · قفل\n`;
+        text += `${faNum(i)}. 🔒 <code>${escape(m.script_name)}</code> · قفل · 📈${reqs}${subOff}\n`;
         continue;
       }
 
       if (live) {
-        text += `${i}. 🟢 <code>${escape(m.script_name)}</code> · ${live.activeUsers ?? 0}u · ${escape(live.version || "—")}\n`;
+        text += `${faNum(i)}. 🟢 <code>${escape(m.script_name)}</code> · 👥${users}/${cap} · 📈${reqs}${subOff}\n`;
         continue;
       }
 
-      // آفلاین → status code از probe
       const p = probeMap.get(m.id);
       let reason = "آفلاین";
       if (p) {
         if (p.statusCode && p.statusCode !== 0) {
           reason = `HTTP ${p.statusCode}`;
         } else if (p.error) {
-          // کوتاه‌سازی پیام شبکه
           const err = String(p.error);
           if (/timeout|aborted/i.test(err)) reason = "timeout";
           else if (/ENOTFOUND|DNS/i.test(err)) reason = "DNS";
@@ -3693,7 +3947,7 @@ async function showNodes(chatId, env, msgId = null) {
         }
       }
 
-      text += `${i}. 🔴 <code>${escape(m.script_name)}</code> · ${escape(reason)}\n`;
+      text += `${faNum(i)}. 🔴 <code>${escape(m.script_name)}</code> · ${escape(reason)} · 📈${reqs}${subOff}\n`;
     }
 
     for (const n of alive) {
@@ -3704,17 +3958,17 @@ async function showNodes(chatId, env, msgId = null) {
       );
       if (known) continue;
       i++;
-      text += `${i}. 🟢 <code>${escape(n.id)}</code> (ثبت‌نشده) · ${n.activeUsers ?? 0}u\n`;
+      text += `${faNum(i)}. 🟢 <code>${escape(n.id)}</code> (ثبت‌نشده) · 👥${faNum(n.activeUsers ?? 0)}\n`;
     }
   }
 
   const kb = [];
   let row = [];
   for (const m of managed) {
-    const icon = m.is_disabled === 1 ? "🔒" : "📦";
-    const short = String(m.script_name || m.id)
-      .replace(/^saow-child-/, "")
-      .slice(0, 12);
+    let icon = "📦";
+    if (m.is_disabled === 1) icon = "🔒";
+    else if (m.exclude_sub === 1) icon = "🚫";
+    const short = shortChildId(m.script_name || m.id);
     row.push({
       text: `${icon} ${short}`,
       callback_data: `node_detail:${m.id}`,
@@ -3810,8 +4064,8 @@ async function createCloudflareNode(chatId, token, env) {
     );
 
     const randomNum = Math.floor(10000 + Math.random() * 90000);
-    const scriptName = `saow-child-${randomNum}`;
-    const dbName = `saow-db-${randomNum}`;
+    const scriptName = `wk-${randomNum}`;
+    const dbName = `db-${randomNum}`;
     const nodeUrl = `https://${scriptName}.${accountSubdomain}.workers.dev`;
 
     const dbRes = await cfFetch(`/accounts/${accountId}/d1/database`, token, {
@@ -3913,9 +4167,14 @@ async function deleteCloudflareNode(chatId, scriptName, token, env) {
     try {
       const dbsRes = await cfFetch(`/accounts/${accountId}/d1/database`, token);
       if (dbsRes.success && dbsRes.result) {
-        const match = dbsRes.result.find(
-          (db) => db.name && db.name.includes(scriptName.replace("saow-child-", "saow-db-"))
-        );
+        const match = dbsRes.result.find((db) => {
+          const n = db.name || "";
+          if (!n) return false;
+          if (n.includes(scriptName.replace("wk-", "db-"))) return true;
+          if (n.includes(scriptName.replace("saow-child-", "saow-db-"))) return true;
+          if (n === scriptName) return true;
+          return false;
+        });
         if (match) {
           await cfFetch(`/accounts/${accountId}/d1/database/${match.uuid || match.id}`, token, {
             method: "DELETE",
@@ -4121,7 +4380,7 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
           if (oldDbName && name === oldDbName) {
             await cfFetch(`/accounts/${accountId}/d1/database/${id}`, token, { method: "DELETE" });
           }
-          if (name === oldScript || name === `saow-db-${oldScript.replace("saow-child-", "")}`) {
+          if (name === oldScript || name === `db-${oldScript.replace("wk-", "").replace("saow-child-", "")}` || name === `saow-db-${oldScript.replace("saow-child-", "").replace("wk-", "")}`) {
             await cfFetch(`/accounts/${accountId}/d1/database/${id}`, token, { method: "DELETE" });
           }
         }
@@ -4230,7 +4489,8 @@ async function d1Ready(env) {
         id TEXT PRIMARY KEY, name TEXT, uuid TEXT UNIQUE, enabled INTEGER DEFAULT 1,
         expiry TEXT, quota_bytes INTEGER DEFAULT 0, daily_quota_bytes INTEGER DEFAULT 0,
         speed_limit_kbps INTEGER DEFAULT 0, ip_limit INTEGER DEFAULT 1, clean_ip TEXT DEFAULT '',
-        block_ads INTEGER DEFAULT 1, notes TEXT, created_at INTEGER, updated_at INTEGER
+        block_ads INTEGER DEFAULT 1, notes TEXT, forced_node TEXT DEFAULT '',
+        created_at INTEGER, updated_at INTEGER
       )`),
       env.DB.prepare(`CREATE TABLE IF NOT EXISTS usage (
         user_id TEXT PRIMARY KEY, up INTEGER DEFAULT 0, down INTEGER DEFAULT 0, total INTEGER DEFAULT 0, updated_at INTEGER
@@ -4249,7 +4509,8 @@ async function d1Ready(env) {
       )`),
       env.DB.prepare(`CREATE TABLE IF NOT EXISTS managed_nodes (
         id TEXT PRIMARY KEY, script_name TEXT, account_id TEXT, db_id TEXT, db_name TEXT,
-        token_encrypted TEXT, url TEXT, is_disabled INTEGER DEFAULT 0, created_at INTEGER
+        token_encrypted TEXT, url TEXT, is_disabled INTEGER DEFAULT 0,
+        exclude_sub INTEGER DEFAULT 0, created_at INTEGER
       )`),
       env.DB.prepare(`CREATE TABLE IF NOT EXISTS cf_accounts (
         account_id TEXT PRIMARY KEY, token TEXT, email TEXT, name TEXT, updated_at INTEGER
@@ -4294,7 +4555,9 @@ async function d1Ready(env) {
       `ALTER TABLE users ADD COLUMN ip_limit INTEGER DEFAULT 1`,
       `ALTER TABLE users ADD COLUMN quota_bytes INTEGER DEFAULT 0`,
       `ALTER TABLE users ADD COLUMN expiry TEXT`,
+      `ALTER TABLE users ADD COLUMN forced_node TEXT DEFAULT ''`,
       `ALTER TABLE managed_nodes ADD COLUMN is_disabled INTEGER DEFAULT 0`,
+      `ALTER TABLE managed_nodes ADD COLUMN exclude_sub INTEGER DEFAULT 0`,
     ];
 
     for (const sql of alters) {
@@ -4379,6 +4642,7 @@ function mapUserRow(row) {
     cleanIp: row.clean_ip || "",
     blockAds: !!row.block_ads,
     notes: row.notes || "",
+    forcedNode: row.forced_node || "",
     createdAt: row.created_at || 0,
     updatedAt: row.updated_at || 0,
   };
@@ -4389,13 +4653,14 @@ async function upsertUser(env, data) {
   try {
     await env.DB.prepare(`
       INSERT INTO users
-      (id, name, uuid, enabled, expiry, quota_bytes, daily_quota_bytes, speed_limit_kbps, ip_limit, clean_ip, block_ads, notes, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, name, uuid, enabled, expiry, quota_bytes, daily_quota_bytes, speed_limit_kbps, ip_limit, clean_ip, block_ads, notes, forced_node, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name=excluded.name, uuid=excluded.uuid, enabled=excluded.enabled, expiry=excluded.expiry,
         quota_bytes=excluded.quota_bytes, daily_quota_bytes=excluded.daily_quota_bytes,
         speed_limit_kbps=excluded.speed_limit_kbps, ip_limit=excluded.ip_limit,
-        clean_ip=excluded.clean_ip, block_ads=excluded.block_ads, notes=excluded.notes, updated_at=excluded.updated_at
+        clean_ip=excluded.clean_ip, block_ads=excluded.block_ads, notes=excluded.notes,
+        forced_node=excluded.forced_node, updated_at=excluded.updated_at
     `)
       .bind(
         data.id,
@@ -4410,6 +4675,7 @@ async function upsertUser(env, data) {
         data.cleanIp || "",
         data.blockAds ? 1 : 0,
         data.notes || "",
+        data.forcedNode || "",
         now,
         now
       )
@@ -4613,32 +4879,32 @@ let domainsList = null,
   domainsListAt = 0,
   domainsLoading = null;
 const IRCF_DOMAINS = [
-  { domain: "ipv4.ircf.space", name: "ipv4" },
-  { domain: "mci.ircf.space", name: "mci" },
-  { domain: "mtn.ircf.space", name: "mtn" },
-  { domain: "mkh.ircf.space", name: "mkh" },
-  { domain: "rtl.ircf.space", name: "rtl" },
-  { domain: "hwb.ircf.space", name: "hwb" },
-  { domain: "ast.ircf.space", name: "ast" },
-  { domain: "sht.ircf.space", name: "sht" },
-  { domain: "prs.ircf.space", name: "prs" },
-  { domain: "mbt.ircf.space", name: "mbt" },
-  { domain: "ask.ircf.space", name: "ask" },
-  { domain: "rsp.ircf.space", name: "rsp" },
-  { domain: "afn.ircf.space", name: "afn" },
-  { domain: "ztl.ircf.space", name: "ztl" },
-  { domain: "psm.ircf.space", name: "psm" },
-  { domain: "arx.ircf.space", name: "arx" },
-  { domain: "smt.ircf.space", name: "smt" },
-  { domain: "shm.ircf.space", name: "shm" },
-  { domain: "fnv.ircf.space", name: "fnv" },
-  { domain: "dbn.ircf.space", name: "dbn" },
-  { domain: "apt.ircf.space", name: "apt" },
-  { domain: "fnp.ircf.space", name: "fnp" },
-  { domain: "ryn.ircf.space", name: "ryn" },
-  { domain: "sbn.ircf.space", name: "sbn" },
-  { domain: "ptk.ircf.space", name: "ptk" },
-  { domain: "atc.ircf.space", name: "atc" },
+  { domain: "ipv4.ircf.space", name: "عمومی" },
+  { domain: "mcic.ircf.space", name: "همراه‌اول" },
+  { domain: "mtnc.ircf.space", name: "ایرانسل" },
+  { domain: "mkhc.ircf.space", name: "مخابرات" },
+  { domain: "rtlc.ircf.space", name: "رایتل" },
+  { domain: "hwb.ircf.space", name: "های‌وب" },
+  { domain: "ast.ircf.space", name: "آسیاتک" },
+  { domain: "sht.ircf.space", name: "شاتل" },
+  { domain: "prs.ircf.space", name: "پارس‌آنلاین" },
+  { domain: "mbt.ircf.space", name: "مبین‌نت" },
+  { domain: "ask.ircf.space", name: "اندیشه‌سبز" },
+  { domain: "rsp.ircf.space", name: "رسپینا" },
+  { domain: "afn.ircf.space", name: "افرانت" },
+  { domain: "ztl.ircf.space", name: "زی‌تل" },
+  { domain: "psm.ircf.space", name: "پیشگامان" },
+  { domain: "arx.ircf.space", name: "آراکس" },
+  { domain: "smt.ircf.space", name: "سامانتل" },
+  { domain: "shm.ircf.space", name: "شاتل‌موبایل" },
+  { domain: "fnv.ircf.space", name: "فن‌آوا" },
+  { domain: "dbn.ircf.space", name: "دیده‌بان‌نت" },
+  { domain: "apt.ircf.space", name: "آپتل" },
+  { domain: "fnp.ircf.space", name: "فناپ‌تلکام" },
+  { domain: "ryn.ircf.space", name: "رای‌نت" },
+  { domain: "sbn.ircf.space", name: "صبانت" },
+  { domain: "ptk.ircf.space", name: "پتیاک" },
+  { domain: "atc.ircf.space", name: "عصر تلکام" },
 ];
 const IRCF_CACHE_TTL = 5 * 60 * 1000;
 let ircfCache = null,
@@ -4730,11 +4996,31 @@ function formatBytesShort(n) {
   if (n >= 1048576) return (n / 1048576).toFixed(0) + "MB";
   return (n / 1024).toFixed(0) + "KB";
 }
+/** اعداد را با ارقام فارسی برمی‌گرداند */
+function faNum(n) {
+  if (n == null || n === "") return "—";
+  const s = typeof n === "number" ? String(n) : String(n);
+  return s.replace(/[0-9]/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[d]);
+}
+/** خلاصه درخواست: 716 → 716 ، 1200 → 1.2K ، 1500000 → 1.5M */
+function formatReqShort(n) {
+  if (n == null || !Number.isFinite(Number(n))) return "—";
+  n = Number(n);
+  if (n >= 1e6) return faNum((n / 1e6).toFixed(n >= 1e7 ? 0 : 1)) + "M";
+  if (n >= 1000) return faNum((n / 1000).toFixed(n >= 10000 ? 0 : 1)) + "K";
+  return faNum(n);
+}
+function shortChildId(scriptName) {
+  const s = String(scriptName || "");
+  const m = s.match(/(\d{4,})$/);
+  if (m) return m[1];
+  return s.replace(/^saow-child-/, "").replace(/^wk-/, "").slice(0, 8) || "—";
+}
 function daysRemaining(expiry) {
   if (!expiry) return "∞";
   const ms = Date.parse(expiry) - Date.now();
-  if (!Number.isFinite(ms) || ms <= 0) return "0";
-  return String(Math.ceil(ms / 86400000));
+  if (!Number.isFinite(ms) || ms <= 0) return "۰";
+  return faNum(Math.ceil(ms / 86400000));
 }
 function buildVlessLink({ ip, port, uuid, host, path, name, fp = "chrome" }) {
   const qs = new URLSearchParams({
@@ -4762,12 +5048,25 @@ async function generateSubscription(env, user, motherHost) {
   const isDailyExceeded = user.dailyQuotaBytes > 0 && daily.total >= user.dailyQuotaBytes;
   const isDisabled = !user.enabled;
 
+  let sponsorText = "";
+  try {
+    const cfg = await getShopConfig(env);
+    sponsorText = (cfg.sponsorText || "").trim();
+  } catch {}
+
   if (isDisabled || isExpired || isQuotaExceeded || isDailyExceeded) {
     if (isDisabled) links.push(buildInfoLink(user.uuid, motherHost, `🚫 حساب شما غیرفعال شده است`));
     if (isExpired) links.push(buildInfoLink(user.uuid, motherHost, `⏰ زمان اشتراک به پایان رسیده`));
     if (isQuotaExceeded) links.push(buildInfoLink(user.uuid, motherHost, `📦 حجم کل تمام شده`));
     if (isDailyExceeded) links.push(buildInfoLink(user.uuid, motherHost, `📅 حجم روزانه تمام شده`));
-    links.push(buildInfoLink(user.uuid, motherHost, `🔄 برای تمدید با پشتیبانی در ارتباط باشید`));
+    if (sponsorText) {
+      // چند خط اسپانسر را به صورت بنر جداگانه
+      for (const line of sponsorText.split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 4)) {
+        links.push(buildInfoLink(user.uuid, motherHost, line.slice(0, 64)));
+      }
+    } else {
+      links.push(buildInfoLink(user.uuid, motherHost, `🔄 برای تمدید با پشتیبانی در ارتباط باشید`));
+    }
     return links.join("\n");
   }
 
@@ -4794,26 +5093,62 @@ async function generateSubscription(env, user, motherHost) {
     return false;
   }
 
-    // ---------- انتخاب رندوم بین نودهای سالم ----------
+  // ---------- انتخاب نود ----------
+  // 1) اگر کاربر قفل روی نود خاص باشد → همان
+  // 2) وگرنه بین نودهای سالم که exclude_sub=0 نیستند، کم‌بارترین (کمترین درخواست امروز)
   let selectedUrl = null;
-  const healthyManaged = [];
+  let selectedNode = null;
 
-  for (const m of managed) {
-    if (!m.url || m.is_disabled === 1) continue;
-    if (alive.some((a) => isAliveMatch(m, a))) {
-      healthyManaged.push(m);
+  if (user.forcedNode) {
+    const forced = managed.find(
+      (m) =>
+        m.script_name === user.forcedNode ||
+        m.id === user.forcedNode ||
+        (m.url && m.url.includes(user.forcedNode))
+    );
+    if (forced && forced.url) {
+      selectedNode = forced;
+      selectedUrl = forced.url;
     }
   }
 
-  if (healthyManaged.length) {
-    // رندوم
-    const chosen = healthyManaged[Math.floor(Math.random() * healthyManaged.length)];
-    selectedUrl = chosen.url;
+  if (!selectedUrl) {
+    const healthyManaged = [];
+    for (const m of managed) {
+      if (!m.url || m.is_disabled === 1) continue;
+      if (m.exclude_sub === 1) continue; // خارج از چرخه ساب
+      if (alive.some((a) => isAliveMatch(m, a))) {
+        healthyManaged.push(m);
+      }
+    }
+
+    if (healthyManaged.length) {
+      const scored = await Promise.all(
+        healthyManaged.map(async (m) => {
+          let reqs = Number.MAX_SAFE_INTEGER;
+          try {
+            const token = await resolveNodeToken(env, m);
+            if (token && m.account_id) {
+              const r = await getAccountRequestsToday(token, m.account_id);
+              if (typeof r === "number") reqs = r;
+            }
+          } catch {}
+          return { node: m, reqs };
+        })
+      );
+      scored.sort((a, b) => a.reqs - b.reqs);
+      selectedNode = scored[0].node;
+      selectedUrl = selectedNode.url;
+    }
   }
 
   if (!selectedUrl) {
-    const withUrl = managed.find((m) => m.url && m.is_disabled !== 1);
-    if (withUrl) selectedUrl = withUrl.url;
+    // fallback: هر نود مدیریت‌شده غیرقفل (حتی exclude_sub) با url
+    const withUrl = managed.find((m) => m.url && m.is_disabled !== 1 && m.exclude_sub !== 1);
+    if (withUrl) {
+      selectedNode = withUrl;
+      selectedUrl = withUrl.url;
+    }
   }
 
   if (!selectedUrl && alive.length && alive[0].url) {
@@ -4832,6 +5167,13 @@ async function generateSubscription(env, user, motherHost) {
   }
 
   const activeCount = await getActiveIPCount(env, user.id);
+  const childNo = shortChildId(
+    selectedNode?.script_name || selectedNode?.id || childHost.split(".")[0] || ""
+  );
+  const usedStr = formatBytesShort(total.total);
+  const quotaStr = user.quotaBytes > 0 ? formatBytesShort(user.quotaBytes) : "∞";
+  const daysStr = daysRemaining(user.expiry);
+  // بنر خلاصه + شماره child
   links.push(
     buildVlessLink({
       ip: "127.0.0.1",
@@ -4839,21 +5181,36 @@ async function generateSubscription(env, user, motherHost) {
       uuid: user.uuid,
       host: motherHost,
       path: "/",
-      name: `📋 ${formatBytesShort(total.total)} / ${user.quotaBytes > 0 ? formatBytesShort(user.quotaBytes) : "∞"} | ${daysRemaining(user.expiry)}d | IP:${activeCount}/${user.ipLimit}`,
+      name: `📋 #${childNo} │ ${usedStr}/${quotaStr} │ ${daysStr}روز │ IP ${faNum(activeCount)}/${faNum(user.ipLimit)}`,
     })
   );
 
+  if (sponsorText) {
+    for (const line of sponsorText.split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 3)) {
+      links.push(buildInfoLink(user.uuid, motherHost, line.slice(0, 64)));
+    }
+  }
+
+  // دامنه‌های گیت‌هاب (ترجیحاً IP رزولوشن‌شده)
   let gh = [];
   try {
     gh = await ensureDomainsList();
   } catch {}
-  const preferred = (gh || []).slice(0, 3);
-  const ports = [443, 8443, 2053];
-  const fps = ["chrome", "firefox", "safari"];
+  const preferred = (gh || []).slice(0, 5);
+  const ports = [443, 8443, 2053, 2083, 2087];
+  const fps = ["chrome", "firefox", "safari", "edge", "random"];
   for (let i = 0; i < preferred.length; i++) {
+    let addr = preferred[i];
+    // اگر دامنه است، IP بگیر (در غیر این صورت همان IP/رشته)
+    if (addr && !/^\d{1,3}(\.\d{1,3}){3}$/.test(addr)) {
+      try {
+        const resolvedIp = await resolveDomain(addr);
+        if (resolvedIp) addr = resolvedIp;
+      } catch {}
+    }
     links.push(
       buildVlessLink({
-        ip: preferred[i],
+        ip: addr,
         port: ports[i % ports.length],
         uuid: user.uuid,
         host: childHost,
@@ -4864,6 +5221,7 @@ async function generateSubscription(env, user, motherHost) {
     );
   }
 
+  // دامنه‌های IRCF (همیشه IP با TTL ۵ دقیقه)
   let resolved = {};
   try {
     resolved = await ensureIrcfResolved();
