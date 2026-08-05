@@ -1,7 +1,7 @@
-// child-worker.js — v4.9.3-push (optimized D1 + speed limit + revoke on sync)
+// child-worker.js — v4.9.4-proxyip (D1 + speed limit + revoke + ProxyIP for CF-blocked sites)
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-4.9.3-push';
+const VERSION = 'node-4.9.5';
 const API_SECRET = 'saow-pan2';
 let MOTHER_URL = null;
 
@@ -27,6 +27,48 @@ const BLOCKLIST_URLS = [
   'https://raw.githubusercontent.com/sjhgvr/oisd/main/domainswild2_small.txt',
 ];
 const BLOCKLIST_TTL_MS = 6 * 60 * 60 * 1000;
+
+// ====================== ProxyIP (for CF-blocked targets) ======================
+// Public community ProxyIPs — no personal VPS required.
+// These act as relays so Worker can reach sites behind Cloudflare (ChatGPT, Grok, etc.)
+const DEFAULT_PROXY_IPS = [
+  'proxyip.cmliussss.net',
+  'proxyip.us.fxxk.dedyn.io',
+  'proxyip.sg.fxxk.dedyn.io',
+  'proxyip.jp.fxxk.dedyn.io',
+  'proxyip.hk.fxxk.dedyn.io',
+];
+
+// Domains that usually fail with direct connect from Workers → force ProxyIP
+const PROXY_FORCE_SUFFIXES = [
+  'openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com',
+  'x.ai', 'grok.x.ai', 'grok.com',
+  'anthropic.com', 'claude.ai',
+  'gemini.google.com', 'bard.google.com',
+  'perplexity.ai',
+];
+
+function getProxyIpList(env) {
+  if (env?.PROXYIP) {
+    const list = String(env.PROXYIP)
+      .split(/[,|\s]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    if (list.length) return list;
+  }
+  return DEFAULT_PROXY_IPS;
+}
+
+function pickProxyIp(env) {
+  const list = getProxyIpList(env);
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+function needsProxyIp(host) {
+  const h = String(host || '').toLowerCase().replace(/\.$/, '');
+  if (!h) return false;
+  return PROXY_FORCE_SUFFIXES.some((s) => h === s || h.endsWith('.' + s));
+}
 
 // ====================== In-memory ======================
 let usersByUuid = new Map();
@@ -712,8 +754,16 @@ async function handleVlessWebSocket(request, env, ctx) {
       port = ADGUARD_DNS_PORT;
     }
 
+    // ProxyIP for domains that Cloudflare Workers cannot reach directly
+    // (ChatGPT, Grok, Claude, etc.) — uses public community relays, no personal VPS
+    let connectHost = host;
+    const forceProxy = needsProxyIp(host) || !!envRef?.PROXYIP;
+    if (forceProxy && port !== 53) {
+      connectHost = pickProxyIp(envRef);
+    }
+
     try {
-      remoteSocket = connect({ hostname: host, port });
+      remoteSocket = connect({ hostname: connectHost, port });
       remoteWriter = remoteSocket.writable.getWriter();
       sendOk();
 
