@@ -243,8 +243,8 @@
 
 // END OF MAP
 // ================================================================================
-const VERSION = "mother-bot-3.10-push";
-const BOT_VERSION = "3.8.99";
+const VERSION = "mother-bot-3.7-push";
+const BOT_VERSION = "3.8.94";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
 const CHILD_WORKER_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/childWorker.js";
@@ -760,9 +760,59 @@ async function handleBackupImport(msg, env) {
   }
 }
 
-async function updateAllChildNodes(chatId, env, msgId) {
-  await edit(chatId, msgId, "⏳ در حال آماده‌سازی آپدیت همه نودها...", env);
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
+/** لاگ مرحله‌ای آپدیت — پیام تلگرام را ویرایش می‌کند */
+async function logUpdateProgress(chatId, msgId, env, lines, footer = "") {
+  const body =
+    `♻️ <b>آپدیت همه نودها</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    lines.join("\n") +
+    (footer ? `\n\n${footer}` : "");
+  try {
+    await edit(chatId, msgId, body, env);
+  } catch (e) {
+    console.log("logUpdateProgress:", e?.message);
+  }
+}
+
+/**
+ * فراخوانی Cloudflare با ریتری روی rate-limit / خطای موقت
+ */
+async function cfFetchRetry(path, token, options = {}, retries = 4) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await cfFetch(path, token, options);
+      // cfFetch همیشه JSON برمی‌گرداند؛ rate limit معمولاً success=false + code 9109/429
+      const errCode = res?.errors?.[0]?.code;
+      const errMsg = (res?.errors?.[0]?.message || "").toLowerCase();
+      const rateLimited =
+        errCode === 9109 ||
+        errCode === 429 ||
+        /rate limit|too many|throttl/i.test(errMsg);
+      if (rateLimited && attempt < retries - 1) {
+        const wait = 4000 * (attempt + 1);
+        console.log(`cfFetchRetry rate-limit ${path}, wait ${wait}ms`);
+        await sleep(wait);
+        continue;
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries - 1) {
+        await sleep(3000 * (attempt + 1));
+        continue;
+      }
+    }
+  }
+  if (lastErr) throw lastErr;
+  return { success: false, errors: [{ message: "cfFetchRetry exhausted" }] };
+}
+
+async function updateAllChildNodes(chatId, env, msgId) {
   const managed = await getManagedNodes(env);
   if (!managed.length) {
     return edit(chatId, msgId, "هیچ نود مدیریت‌شده‌ای وجود ندارد.", env, [
@@ -770,58 +820,166 @@ async function updateAllChildNodes(chatId, env, msgId) {
     ]);
   }
 
+  const total = managed.length;
+  const logLines = [`📋 تعداد نود: <b>${faNum(total)}</b>`, `⏱ با تأخیر و ریتری (محدودیت CF)`];
+  await logUpdateProgress(chatId, msgId, env, logLines, "در حال شروع...");
+
+  // فاصله بین نودها تا subprocessهای CF قفل نشوند
+  const DELAY_BETWEEN_NODES_MS = 8000;
+  const DELAY_AFTER_DELETE_MS = 3500;
+  const DELAY_BEFORE_CREATE_MS = 2500;
+
   let success = 0;
   let failed = 0;
   const results = [];
 
-  for (const node of managed) {
+  for (let i = 0; i < managed.length; i++) {
+    const node = managed[i];
+    const idx = i + 1;
+    const token = node.token_encrypted;
+    const accountId = node.account_id;
+    const oldScript = node.script_name;
+    const oldDbId = node.db_id;
+    const oldDbName = node.db_name;
+
+    const stepLines = [
+      ...logLines,
+      ``,
+      `📦 نود <b>${faNum(idx)}</b> از <b>${faNum(total)}</b>`,
+      `📛 <code>${escape(oldScript)}</code>`,
+      `✅ موفق تا الان: ${faNum(success)} · ❌ ناموفق: ${faNum(failed)}`,
+    ];
+
+    if (!token || !accountId) {
+      failed++;
+      results.push(`❌ ${oldScript}: توکن/اکانت ندارد`);
+      stepLines.push(`⚠️ رد شد: توکن یا account_id خالی`);
+      await logUpdateProgress(chatId, msgId, env, stepLines);
+      await sleep(1500);
+      continue;
+    }
+
     try {
-      await edit(chatId, msgId, `⏳ در حال آپدیت نود ${success + failed + 1}/${managed.length}\n<code>${escape(node.script_name)}</code>`, env);
+      // ---- 1) حذف Worker قدیمی ----
+      stepLines.push(`🗑 حذف Worker...`);
+      await logUpdateProgress(chatId, msgId, env, stepLines);
 
-      // حذف قدیمی
-      const token = node.token_encrypted;
-      const accountId = node.account_id;
-      const oldScript = node.script_name;
-      const oldDbId = node.db_id;
-
+      let delWorkerOk = false;
       try {
-        await cfFetch(`/accounts/${accountId}/workers/scripts/${oldScript}`, token, { method: "DELETE" });
-      } catch {}
+        const delW = await cfFetchRetry(
+          `/accounts/${accountId}/workers/scripts/${oldScript}`,
+          token,
+          { method: "DELETE" },
+          4
+        );
+        delWorkerOk = !!delW?.success || (delW?.errors?.[0]?.code === 10007); // already gone
+        stepLines.push(
+          delWorkerOk
+            ? `✓ Worker حذف شد`
+            : `⚠ حذف Worker: ${escape(delW?.errors?.[0]?.message || "نامشخص").slice(0, 80)}`
+        );
+      } catch (e) {
+        stepLines.push(`⚠ حذف Worker: ${escape(e.message).slice(0, 80)}`);
+      }
+      await logUpdateProgress(chatId, msgId, env, stepLines);
+      await sleep(DELAY_AFTER_DELETE_MS);
+
+      // ---- 2) حذف D1 ----
+      stepLines.push(`🗑 حذف D1...`);
+      await logUpdateProgress(chatId, msgId, env, stepLines);
 
       if (oldDbId) {
         try {
-          await cfFetch(`/accounts/${accountId}/d1/database/${oldDbId}`, token, { method: "DELETE" });
-        } catch {}
+          const delDb = await cfFetchRetry(
+            `/accounts/${accountId}/d1/database/${oldDbId}`,
+            token,
+            { method: "DELETE" },
+            3
+          );
+          stepLines.push(
+            delDb?.success
+              ? `✓ D1 حذف شد`
+              : `⚠ حذف D1: ${escape(delDb?.errors?.[0]?.message || "—").slice(0, 60)}`
+          );
+        } catch (e) {
+          stepLines.push(`⚠ حذف D1: ${escape(e.message).slice(0, 60)}`);
+        }
+      } else {
+        stepLines.push(`· db_id خالی — رد شد`);
       }
 
-      await removeChildByScriptName(env, oldScript);
-      await removeManagedNode(env, node.id);
+      // پاکسازی لیستی (نام‌های قدیمی saow-db / db-)
+      try {
+        const dbsRes = await cfFetchRetry(`/accounts/${accountId}/d1/database`, token, {}, 2);
+        if (dbsRes?.success && Array.isArray(dbsRes.result)) {
+          for (const db of dbsRes.result) {
+            const n = db.name || "";
+            const id = db.uuid || db.id;
+            const related =
+              (oldDbName && n === oldDbName) ||
+              n === oldScript ||
+              n === `db-${String(oldScript).replace(/^wk-/, "").replace(/^saow-child-/, "")}` ||
+              n === `saow-db-${String(oldScript).replace(/^saow-child-/, "").replace(/^wk-/, "")}`;
+            if (related && id) {
+              try {
+                await cfFetchRetry(`/accounts/${accountId}/d1/database/${id}`, token, { method: "DELETE" }, 2);
+                await sleep(800);
+              } catch {}
+            }
+          }
+        }
+      } catch {}
 
-      // کمی صبر
-      await new Promise((r) => setTimeout(r, 1500));
+      await logUpdateProgress(chatId, msgId, env, stepLines);
+      await sleep(DELAY_BEFORE_CREATE_MS);
 
-      // ساخت مجدد با همان توکن
-      const createResult = await createCloudflareNodeSilent(token, env); // نسخهٔ silent پایین
+      // ---- 3) ساخت نود جدید ----
+      stepLines.push(`🚀 نصب نسخه جدید...`);
+      await logUpdateProgress(chatId, msgId, env, stepLines);
+
+      const createResult = await createCloudflareNodeSilent(token, env);
+
       if (createResult.ok) {
+        // فقط بعد از موفقیت، رکورد قدیمی را پاک کن
+        await removeChildByScriptName(env, oldScript);
+        await removeManagedNode(env, node.id);
+        // createSilent خودش saveManagedNode کرده
+
         success++;
-        results.push(`✅ ${node.script_name} → ${createResult.scriptName}`);
+        results.push(`✅ ${oldScript} → ${createResult.scriptName}`);
+        stepLines.push(`✅ آماده: <code>${escape(createResult.scriptName)}</code>`);
       } else {
         failed++;
-        results.push(`❌ ${node.script_name}: ${createResult.error}`);
+        const err = createResult.error || "create failed";
+        results.push(`❌ ${oldScript}: ${err}`);
+        stepLines.push(`❌ ساخت ناموفق: <code>${escape(String(err).slice(0, 120))}</code>`);
+        // managed قدیمی را نگه می‌داریم تا ادمین بتواند دستی ریترای کند
       }
+      await logUpdateProgress(chatId, msgId, env, stepLines);
     } catch (e) {
       failed++;
-      results.push(`❌ ${node.script_name}: ${e.message}`);
+      results.push(`❌ ${oldScript}: ${e.message}`);
+      stepLines.push(`❌ خطا: <code>${escape(String(e.message).slice(0, 120))}</code>`);
+      await logUpdateProgress(chatId, msgId, env, stepLines);
+    }
+
+    // فاصله بین نودها (به‌جز آخرین)
+    if (i < managed.length - 1) {
+      stepLines.push(`⏸ استراحت ${DELAY_BETWEEN_NODES_MS / 1000}ث تا نود بعدی...`);
+      await logUpdateProgress(chatId, msgId, env, stepLines);
+      await sleep(DELAY_BETWEEN_NODES_MS);
     }
   }
 
   triggerSync(env);
 
+  const summaryLines = results.slice(0, 20).map((r) => escape(r));
   const text =
-    `✅ آپدیت همه نودها تمام شد\n\n` +
-    `موفق: <b>${success}</b>\n` +
-    `ناموفق: <b>${failed}</b>\n\n` +
-    results.slice(0, 15).map((r) => escape(r)).join("\n");
+    `✅ <b>آپدیت همه نودها تمام شد</b>\n\n` +
+    `موفق: <b>${faNum(success)}</b> / ${faNum(total)}\n` +
+    `ناموفق: <b>${faNum(failed)}</b>\n\n` +
+    summaryLines.join("\n") +
+    (results.length > 20 ? `\n… و ${results.length - 20} مورد دیگر` : "");
 
   return edit(chatId, msgId, text, env, [
     [{ text: "📊 وضعیت نودها", callback_data: "nodes" }],
@@ -866,16 +1024,20 @@ async function createCloudflareNodeSilent(token, env) {
     );
 
     const randomNum = Math.floor(10000 + Math.random() * 90000);
-    const scriptName = `wk-${randomNum}`;
-    const dbName = `db-${randomNum}`;
+    const scriptName = `saow-child-${randomNum}`;
+    const dbName = `saow-db-${randomNum}`;
     const nodeUrl = `https://${scriptName}.${accountSubdomain}.workers.dev`;
 
     const dbRes = await cfFetch(`/accounts/${accountId}/d1/database`, token, {
       method: "POST",
       body: JSON.stringify({ name: dbName }),
     });
-    if (!dbRes.success) return { ok: false, error: "D1 create failed" };
+    if (!dbRes.success) {
+      const detail = dbRes.errors?.[0]?.message || JSON.stringify(dbRes.errors || {}).slice(0, 120);
+      return { ok: false, error: `D1 create: ${detail}` };
+    }
     const databaseId = dbRes.result.uuid || dbRes.result.id;
+    await sleep(1200);
 
     const motherUrl = (env.MOTHER_URL || env._SELF_URL || "").replace(/\/$/, "");
 
@@ -901,7 +1063,8 @@ async function createCloudflareNodeSilent(token, env) {
     const uploadJson = await uploadRes.json();
     if (!uploadJson.success) {
       try { await cfFetch(`/accounts/${accountId}/d1/database/${databaseId}`, token, { method: "DELETE" }); } catch {}
-      return { ok: false, error: "upload failed" };
+      const detail = uploadJson.errors?.[0]?.message || JSON.stringify(uploadJson.errors || uploadJson).slice(0, 160);
+      return { ok: false, error: `upload: ${detail}` };
     }
 
     try {
@@ -1550,7 +1713,7 @@ async function showShopAdmin(chatId, env, msgId = null) {
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
 
-async function giveTestAccount(chatId, userId, env, msgId = null, fromUser = null) {
+async function giveTestAccount(chatId, userId, env, msgId = null) {
   const cfg = await getShopConfig(env);
   if (!cfg.testEnabled) {
     return send(chatId, "اکانت تست فعلاً غیرفعال است.", env);
@@ -1565,10 +1728,6 @@ async function giveTestAccount(chatId, userId, env, msgId = null, fromUser = nul
   const expiry = new Date(Date.now() + cfg.testDays * 86400000).toISOString();
   const quotaBytes = Math.floor(cfg.testQuotaMb * 1024 * 1024);
 
-  const uname = fromUser?.username ? `@${fromUser.username}` : "—";
-  const fname = [fromUser?.first_name, fromUser?.last_name].filter(Boolean).join(" ") || "—";
-  const notes = `test | tg:${userId} | ${uname} | ${fname}`.slice(0, 200);
-
   await upsertUser(env, {
     id,
     name: `test-${userId}`.slice(0, 32),
@@ -1581,7 +1740,7 @@ async function giveTestAccount(chatId, userId, env, msgId = null, fromUser = nul
     ipLimit: 1,
     cleanIp: "",
     blockAds: true,
-    notes,
+    notes: "test-account",
   });
   await setShopSetting(env, `test_used:${userId}`, "1");
   triggerSync(env);
@@ -1647,7 +1806,7 @@ async function approveOrder(chatId, orderId, env, msgId) {
       quotaBytes: quotaBytes || existing.quotaBytes,
       dailyQuotaBytes: dailyQuotaBytes || existing.dailyQuotaBytes,
       ipLimit: plan.ip_limit || existing.ipLimit,
-      notes: `${existing.notes || ""} | تمدید | order:${orderId} | tg:${order.user_id} | @${order.username || "-"}`.slice(0, 200),
+      notes: `${existing.notes || ""} | renew:${orderId} | tg:${order.user_id}`.slice(0, 200),
     });
   } else {
     id = generateId();
@@ -1669,7 +1828,7 @@ async function approveOrder(chatId, orderId, env, msgId) {
       ipLimit: plan.ip_limit || 1,
       cleanIp: "",
       blockAds: true,
-      notes: `خرید | order:${orderId} | tg:${order.user_id} | @${order.username || "-"} | ${plan.name}`.slice(0, 200),
+      notes: `order:${orderId} | tg:${order.user_id} | @${order.username || "-"}`,
     });
     panelUserId = id;
   }
@@ -2016,7 +2175,6 @@ async function getShopConfig(env) {
     testDays: parseInt(await getShopSetting(env, "test_days", "1"), 10) || 1,
     guideText: await getShopSetting(env, "guide_text", "آموزش استفاده به‌زودی..."),
     welcomeText: await getShopSetting(env, "welcome_text", "به ربات خوش آمدید 👋"),
-    sponsorText: await getShopSetting(env, "sponsor_text", ""),
   };
 }
 
@@ -2387,7 +2545,7 @@ async function handleMessage(msg, env) {
     if (replyText.includes("نام نود و توکن را ارسال کنید")) {
       const parts = text.trim().split(/\s+/);
       if (parts.length < 2) {
-        return send(chatId, "❌ فرمت نادرست.\nمثال:\n<code>wk-12345 YOUR_TOKEN</code>", env);
+        return send(chatId, "❌ فرمت نادرست.\nمثال:\n<code>saow-child-12345 YOUR_TOKEN</code>", env);
       }
       const scriptName = parts[0];
       const token = parts.slice(1).join(" ").trim();
@@ -2446,13 +2604,6 @@ async function handleMessage(msg, env) {
       return showShopAdmin(chatId, env);
     }
 
-    if (replyText.includes("متن اسپانسر") || replyText.includes("متن اسپانسر / تبلیغ")) {
-      const val = text.trim() === "-" ? "" : text.slice(0, 200);
-      await setShopSetting(env, "sponsor_text", val);
-      await send(chatId, val ? "✅ متن اسپانسر ذخیره شد." : "✅ متن اسپانسر پاک شد.", env);
-      return showShopAdmin(chatId, env);
-    }
-
     if (replyText.includes("اطلاعات پلن را ارسال کنید")) {
       const parts = text.split("|").map((x) => x.trim());
       if (parts.length < 5) {
@@ -2504,20 +2655,10 @@ async function handleMessage(msg, env) {
     if (text === "/start" || text === "/menu" || text === "منو") {
       return showMain(chatId, env);
     }
-    if (text === "/node" || text === "/nodes") {
-      return showNodesManage(chatId, env);
-    }
-    if (text === "/users") {
-      return showUsers(chatId, 0, env);
-    }
-    if (text === "/status") {
-      return showStatus(chatId, env);
-    }
 
     return send(
       chatId,
       "از دکمه‌های شیشه‌ای استفاده کنید.\n" +
-        "دستورات: /status · /users · /node\n" +
         "می‌توانید UUID، لینک کانفیگ، <b>نام نود</b> یا <b>آدرس نود</b> بفرستید.\n/start",
       env
     );
@@ -2546,27 +2687,6 @@ async function handleMessage(msg, env) {
 
   if (text === "/start" || text === "/menu" || text === "منو" || !text) {
     return showUserHome(chatId, env);
-  }
-
-  // لینک vless یا UUID → نمایش اطلاعات سرویس کاربر
-  const uuidFromText = extractUuidFromText(text);
-  if (uuidFromText) {
-    const u = await getUserByUuid(env, uuidFromText);
-    if (u) {
-      const notes = String(u.notes || "");
-      const name = String(u.name || "");
-      const owns =
-        name === `test-${userId}` ||
-        name.startsWith(`shop-${userId}`) ||
-        notes.includes(`tg:${userId}`);
-      if (owns || isAdmin(userId, env)) {
-        return showMyServiceDetail(chatId, userId, u.id, env);
-      }
-      // ادمین در شاخه بالا هندل شده؛ برای دیگران فقط سرویس خودشان
-      return send(chatId, "این سرویس متعلق به شما نیست.", env, [
-        [{ text: "🏠 منو", callback_data: "user_home" }],
-      ]);
-    }
   }
 
   return showUserHome(chatId, env);
@@ -2673,7 +2793,7 @@ async function handleCallback(cq, env) {
     return showPayInfo(chatId, userId, data.split(":")[1], env, msgId);
   }
 
-  if (data === "user_test") return giveTestAccount(chatId, userId, env, msgId, cq.from);
+  if (data === "user_test") return giveTestAccount(chatId, userId, env, msgId);
 
   if (data === "user_guide") {
     const cfg = await getShopConfig(env);
@@ -2803,21 +2923,8 @@ async function handleCallback(cq, env) {
         { text: "👋 خوش‌آمد", callback_data: "shop_welcome" },
         { text: "📖 آموزش", callback_data: "shop_guide" },
       ],
-      [{ text: "📢 متن اسپانسر", callback_data: "shop_sponsor" }],
       [{ text: "🔙 تنظیمات فروش", callback_data: "shop_admin" }],
     ]);
-  }
-
-  if (data === "shop_sponsor") {
-    return send(
-      chatId,
-      `✏️ <b>متن اسپانسر / تبلیغ را ارسال کنید</b>\n\n` +
-        `این متن در بنر اتمام حجم/زمان و داخل کانفیگ‌های ساب نمایش داده می‌شود.\n` +
-        `برای پاک کردن: <code>-</code>\n\nبرای بازگشت /start`,
-      env,
-      [[{ text: "❌ انصراف", callback_data: "shop_texts" }]],
-      true
-    );
   }
 
   if (data === "shop_test") {
@@ -3228,71 +3335,6 @@ async function showStatus(chatId, env, msgId = null) {
   } else {
     liveText = "\n\n🟢 هیچ کاربر آنلاینی وجود ندارد.";
   }
-
-  // درخواست‌های امروز مادر + نودها
-  let motherReqs = null;
-  try {
-    if (env.CF_TOKEN && env.MOTHER_ACCOUNT_ID) {
-      motherReqs = await getAccountRequestsToday(env.CF_TOKEN, env.MOTHER_ACCOUNT_ID);
-    }
-  } catch {}
-
-  const managed = await getManagedNodes(env);
-  const alive = await getHealthyChildren(env);
-  let nodesReqSum = 0;
-  let nodesReqKnown = 0;
-  let nodesSummary = "";
-  if (managed.length) {
-    const lines = [];
-    await Promise.all(
-      managed.map(async (m) => {
-        let reqs = null;
-        try {
-          const token = await resolveNodeToken(env, m);
-          if (token && m.account_id) {
-            const r = await getAccountRequestsToday(token, m.account_id);
-            if (typeof r === "number") {
-              reqs = r;
-              nodesReqSum += r;
-              nodesReqKnown++;
-            }
-          }
-        } catch {}
-        const live = alive.find(
-          (a) =>
-            a.id.includes(m.script_name) ||
-            (m.url && a.url && String(a.url).includes(m.script_name))
-        );
-        const st =
-          m.is_disabled === 1
-            ? "🔒"
-            : live
-              ? "🟢"
-              : "🔴";
-        const users = live?.activeUsers != null ? faNum(live.activeUsers) : "—";
-        const reqTxt = reqs != null ? formatReqShort(reqs) : "—";
-        const sub = m.exclude_sub === 1 ? " 🚫ساب" : "";
-        lines.push(
-          `${st} <code>${escape(m.script_name)}</code> · 👥${users} · 📈${reqTxt}${sub}`
-        );
-      })
-    );
-    nodesSummary =
-      "\n\n🖥 <b>خلاصه نودها:</b>\n" + lines.join("\n");
-  }
-
-  const motherTxt =
-    motherReqs != null ? Number(motherReqs).toLocaleString("fa-IR") : "—";
-  const nodesReqTxt =
-    nodesReqKnown > 0 ? Number(nodesReqSum).toLocaleString("fa-IR") : "—";
-  const totalReq =
-    (typeof motherReqs === "number" ? motherReqs : 0) +
-    (nodesReqKnown > 0 ? nodesReqSum : 0);
-  const totalReqTxt =
-    motherReqs != null || nodesReqKnown > 0
-      ? Number(totalReq).toLocaleString("fa-IR")
-      : "—";
-
   const text =
     `📊 <b>وضعیت سیستم</b>\n\n` +
     `🔖 نسخه: <code>${VERSION}</code>\n\n` +
@@ -3300,12 +3342,7 @@ async function showStatus(chatId, env, msgId = null) {
     `✅ <b>فعال:</b> ${res.activeUsers}\n` +
     `🟢 <b>آنلاین:</b> ${res.onlineUsers}\n` +
     `🖥 <b>نودها:</b> ${res.nodes}\n` +
-    `📈 <b>ترافیک کل:</b> ${res.totalTrafficGB} GB\n\n` +
-    `📡 <b>درخواست امروز:</b>\n` +
-    `• مادر: <b>${motherTxt}</b>\n` +
-    `• نودها: <b>${nodesReqTxt}</b>\n` +
-    `• مجموع: <b>${totalReqTxt}</b>` +
-    nodesSummary +
+    `📈 <b>ترافیک کل:</b> ${res.totalTrafficGB} GB` +
     liveText;
   const kb = [
     [
@@ -4064,8 +4101,8 @@ async function createCloudflareNode(chatId, token, env) {
     );
 
     const randomNum = Math.floor(10000 + Math.random() * 90000);
-    const scriptName = `wk-${randomNum}`;
-    const dbName = `db-${randomNum}`;
+    const scriptName = `saow-child-${randomNum}`;
+    const dbName = `saow-db-${randomNum}`;
     const nodeUrl = `https://${scriptName}.${accountSubdomain}.workers.dev`;
 
     const dbRes = await cfFetch(`/accounts/${accountId}/d1/database`, token, {
@@ -4167,14 +4204,9 @@ async function deleteCloudflareNode(chatId, scriptName, token, env) {
     try {
       const dbsRes = await cfFetch(`/accounts/${accountId}/d1/database`, token);
       if (dbsRes.success && dbsRes.result) {
-        const match = dbsRes.result.find((db) => {
-          const n = db.name || "";
-          if (!n) return false;
-          if (n.includes(scriptName.replace("wk-", "db-"))) return true;
-          if (n.includes(scriptName.replace("saow-child-", "saow-db-"))) return true;
-          if (n === scriptName) return true;
-          return false;
-        });
+        const match = dbsRes.result.find(
+          (db) => db.name && db.name.includes(scriptName.replace("saow-child-", "saow-db-"))
+        );
         if (match) {
           await cfFetch(`/accounts/${accountId}/d1/database/${match.uuid || match.id}`, token, {
             method: "DELETE",
@@ -4342,7 +4374,7 @@ async function doUpdateMother(chatId, env, msgId) {
 }
 
 async function updateChildNode(chatId, nodeId, env, msgId) {
-  await edit(chatId, msgId, `⏳ در حال آپدیت نود <code>${escape(nodeId)}</code>...`, env);
+  await edit(chatId, msgId, `⏳ آماده‌سازی آپدیت <code>${escape(nodeId)}</code>...`, env);
   try {
     const node = await getManagedNode(env, nodeId);
     if (!node || !node.token_encrypted) {
@@ -4357,31 +4389,59 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
     const oldDbId = node.db_id;
     const oldDbName = node.db_name;
 
+    await edit(
+      chatId,
+      msgId,
+      `⏳ <b>آپدیت نود</b>\n<code>${escape(oldScript)}</code>\n\n🗑 حذف Worker...`,
+      env
+    );
     try {
-      await cfFetch(`/accounts/${accountId}/workers/scripts/${oldScript}`, token, { method: "DELETE" });
+      await cfFetchRetry(
+        `/accounts/${accountId}/workers/scripts/${oldScript}`,
+        token,
+        { method: "DELETE" },
+        4
+      );
     } catch (e) {
       console.log("delete worker warning:", e?.message);
     }
+    await sleep(3500);
 
+    await edit(
+      chatId,
+      msgId,
+      `⏳ <b>آپدیت نود</b>\n<code>${escape(oldScript)}</code>\n\n🗑 حذف D1...`,
+      env
+    );
     if (oldDbId) {
       try {
-        await cfFetch(`/accounts/${accountId}/d1/database/${oldDbId}`, token, { method: "DELETE" });
+        await cfFetchRetry(
+          `/accounts/${accountId}/d1/database/${oldDbId}`,
+          token,
+          { method: "DELETE" },
+          3
+        );
       } catch (e) {
         console.log("delete D1 by id failed:", e?.message);
       }
     }
 
     try {
-      const dbsRes = await cfFetch(`/accounts/${accountId}/d1/database`, token);
+      const dbsRes = await cfFetchRetry(`/accounts/${accountId}/d1/database`, token, {}, 2);
       if (dbsRes.success && Array.isArray(dbsRes.result)) {
         for (const db of dbsRes.result) {
           const name = db.name || "";
           const id = db.uuid || db.id;
-          if (oldDbName && name === oldDbName) {
-            await cfFetch(`/accounts/${accountId}/d1/database/${id}`, token, { method: "DELETE" });
-          }
-          if (name === oldScript || name === `db-${oldScript.replace("wk-", "").replace("saow-child-", "")}` || name === `saow-db-${oldScript.replace("saow-child-", "").replace("wk-", "")}`) {
-            await cfFetch(`/accounts/${accountId}/d1/database/${id}`, token, { method: "DELETE" });
+          const related =
+            (oldDbName && name === oldDbName) ||
+            name === oldScript ||
+            name === `db-${String(oldScript).replace(/^wk-/, "").replace(/^saow-child-/, "")}` ||
+            name === `saow-db-${String(oldScript).replace(/^saow-child-/, "").replace(/^wk-/, "")}`;
+          if (related && id) {
+            try {
+              await cfFetchRetry(`/accounts/${accountId}/d1/database/${id}`, token, { method: "DELETE" }, 2);
+              await sleep(800);
+            } catch {}
           }
         }
       }
@@ -4389,13 +4449,49 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
       console.log("cleanup D1 by list failed:", e?.message);
     }
 
+    await sleep(2500);
+
+    await edit(
+      chatId,
+      msgId,
+      `⏳ <b>آپدیت نود</b>\n<code>${escape(oldScript)}</code>\n\n🚀 نصب نسخه جدید...\n(رکورد قدیمی بعد از موفقیت حذف می‌شود)`,
+      env
+    );
+
+    // اول بساز؛ فقط در صورت موفقیت رکورد قدیمی پاک شود
+    const createResult = await createCloudflareNodeSilent(token, env);
+    if (!createResult.ok) {
+      return edit(
+        chatId,
+        msgId,
+        `❌ ساخت نود جدید ناموفق بود.\n` +
+          `نود قدیمی از پنل حذف نشد تا بتوانید دوباره تلاش کنید.\n\n` +
+          `<code>${escape(String(createResult.error || "unknown").slice(0, 200))}</code>`,
+        env,
+        [
+          [{ text: "♻️ تلاش مجدد", callback_data: `update_child:${nodeId}` }],
+          [{ text: "🔙", callback_data: "nodes" }],
+        ]
+      );
+    }
+
     await removeChildByScriptName(env, oldScript);
     await removeManagedNode(env, nodeId);
+    triggerSync(env);
 
-    await new Promise((r) => setTimeout(r, 2000));
-
-    await edit(chatId, msgId, "⏳ نود قدیمی حذف شد. در حال نصب نسخه جدید...", env);
-    return createCloudflareNode(chatId, token, env);
+    return edit(
+      chatId,
+      msgId,
+      `✅ <b>نود آپدیت شد</b>\n\n` +
+        `قدیمی: <code>${escape(oldScript)}</code>\n` +
+        `جدید: <code>${escape(createResult.scriptName)}</code>\n` +
+        `🔗 <code>${escape(createResult.url || "")}</code>`,
+      env,
+      [
+        [{ text: "📊 وضعیت نودها", callback_data: "nodes" }],
+        [{ text: "🔙 مدیریت", callback_data: "nodes_manage" }],
+      ]
+    );
   } catch (e) {
     return edit(chatId, msgId, `❌ خطا: ${escape(e.message)}`, env, [
       [{ text: "🔙", callback_data: "nodes" }],
@@ -5014,7 +5110,7 @@ function shortChildId(scriptName) {
   const s = String(scriptName || "");
   const m = s.match(/(\d{4,})$/);
   if (m) return m[1];
-  return s.replace(/^saow-child-/, "").replace(/^wk-/, "").slice(0, 8) || "—";
+  return s.replace(/^saow-child-/, "").slice(0, 8) || "—";
 }
 function daysRemaining(expiry) {
   if (!expiry) return "∞";
@@ -5048,25 +5144,12 @@ async function generateSubscription(env, user, motherHost) {
   const isDailyExceeded = user.dailyQuotaBytes > 0 && daily.total >= user.dailyQuotaBytes;
   const isDisabled = !user.enabled;
 
-  let sponsorText = "";
-  try {
-    const cfg = await getShopConfig(env);
-    sponsorText = (cfg.sponsorText || "").trim();
-  } catch {}
-
   if (isDisabled || isExpired || isQuotaExceeded || isDailyExceeded) {
     if (isDisabled) links.push(buildInfoLink(user.uuid, motherHost, `🚫 حساب شما غیرفعال شده است`));
     if (isExpired) links.push(buildInfoLink(user.uuid, motherHost, `⏰ زمان اشتراک به پایان رسیده`));
     if (isQuotaExceeded) links.push(buildInfoLink(user.uuid, motherHost, `📦 حجم کل تمام شده`));
     if (isDailyExceeded) links.push(buildInfoLink(user.uuid, motherHost, `📅 حجم روزانه تمام شده`));
-    if (sponsorText) {
-      // چند خط اسپانسر را به صورت بنر جداگانه
-      for (const line of sponsorText.split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 4)) {
-        links.push(buildInfoLink(user.uuid, motherHost, line.slice(0, 64)));
-      }
-    } else {
-      links.push(buildInfoLink(user.uuid, motherHost, `🔄 برای تمدید با پشتیبانی در ارتباط باشید`));
-    }
+    links.push(buildInfoLink(user.uuid, motherHost, `🔄 برای تمدید با پشتیبانی در ارتباط باشید`));
     return links.join("\n");
   }
 
@@ -5184,12 +5267,6 @@ async function generateSubscription(env, user, motherHost) {
       name: `📋 #${childNo} │ ${usedStr}/${quotaStr} │ ${daysStr}روز │ IP ${faNum(activeCount)}/${faNum(user.ipLimit)}`,
     })
   );
-
-  if (sponsorText) {
-    for (const line of sponsorText.split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 3)) {
-      links.push(buildInfoLink(user.uuid, motherHost, line.slice(0, 64)));
-    }
-  }
 
   // دامنه‌های گیت‌هاب (ترجیحاً IP رزولوشن‌شده)
   let gh = [];
