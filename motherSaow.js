@@ -243,8 +243,8 @@
 
 // END OF MAP
 // ================================================================================
-const VERSION = "mother-bot-3.7-push";
-const BOT_VERSION = "3.8.94";
+const VERSION = "m-3.11-push";
+const BOT_VERSION = "1.12.1";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
 const CHILD_WORKER_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/childWorker.js";
@@ -1713,7 +1713,7 @@ async function showShopAdmin(chatId, env, msgId = null) {
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
 
-async function giveTestAccount(chatId, userId, env, msgId = null) {
+async function giveTestAccount(chatId, userId, env, msgId = null, fromUser = null) {
   const cfg = await getShopConfig(env);
   if (!cfg.testEnabled) {
     return send(chatId, "اکانت تست فعلاً غیرفعال است.", env);
@@ -1728,6 +1728,10 @@ async function giveTestAccount(chatId, userId, env, msgId = null) {
   const expiry = new Date(Date.now() + cfg.testDays * 86400000).toISOString();
   const quotaBytes = Math.floor(cfg.testQuotaMb * 1024 * 1024);
 
+  const uname = fromUser?.username ? `@${fromUser.username}` : "—";
+  const fname = [fromUser?.first_name, fromUser?.last_name].filter(Boolean).join(" ") || "—";
+  const notes = `test | tg:${userId} | ${uname} | ${fname}`.slice(0, 200);
+
   await upsertUser(env, {
     id,
     name: `test-${userId}`.slice(0, 32),
@@ -1740,7 +1744,7 @@ async function giveTestAccount(chatId, userId, env, msgId = null) {
     ipLimit: 1,
     cleanIp: "",
     blockAds: true,
-    notes: "test-account",
+    notes,
   });
   await setShopSetting(env, `test_used:${userId}`, "1");
   triggerSync(env);
@@ -1806,7 +1810,7 @@ async function approveOrder(chatId, orderId, env, msgId) {
       quotaBytes: quotaBytes || existing.quotaBytes,
       dailyQuotaBytes: dailyQuotaBytes || existing.dailyQuotaBytes,
       ipLimit: plan.ip_limit || existing.ipLimit,
-      notes: `${existing.notes || ""} | renew:${orderId} | tg:${order.user_id}`.slice(0, 200),
+      notes: `${existing.notes || ""} | تمدید | order:${orderId} | tg:${order.user_id} | @${order.username || "-"}`.slice(0, 200),
     });
   } else {
     id = generateId();
@@ -1828,7 +1832,7 @@ async function approveOrder(chatId, orderId, env, msgId) {
       ipLimit: plan.ip_limit || 1,
       cleanIp: "",
       blockAds: true,
-      notes: `order:${orderId} | tg:${order.user_id} | @${order.username || "-"}`,
+      notes: `خرید | order:${orderId} | tg:${order.user_id} | @${order.username || "-"} | ${plan.name}`.slice(0, 200),
     });
     panelUserId = id;
   }
@@ -2175,6 +2179,7 @@ async function getShopConfig(env) {
     testDays: parseInt(await getShopSetting(env, "test_days", "1"), 10) || 1,
     guideText: await getShopSetting(env, "guide_text", "آموزش استفاده به‌زودی..."),
     welcomeText: await getShopSetting(env, "welcome_text", "به ربات خوش آمدید 👋"),
+    sponsorText: await getShopSetting(env, "sponsor_text", ""),
   };
 }
 
@@ -2545,7 +2550,7 @@ async function handleMessage(msg, env) {
     if (replyText.includes("نام نود و توکن را ارسال کنید")) {
       const parts = text.trim().split(/\s+/);
       if (parts.length < 2) {
-        return send(chatId, "❌ فرمت نادرست.\nمثال:\n<code>saow-child-12345 YOUR_TOKEN</code>", env);
+        return send(chatId, "❌ فرمت نادرست.\nمثال:\n<code>wk-12345 YOUR_TOKEN</code>", env);
       }
       const scriptName = parts[0];
       const token = parts.slice(1).join(" ").trim();
@@ -2604,6 +2609,13 @@ async function handleMessage(msg, env) {
       return showShopAdmin(chatId, env);
     }
 
+    if (replyText.includes("متن اسپانسر") || replyText.includes("متن اسپانسر / تبلیغ")) {
+      const val = text.trim() === "-" ? "" : text.slice(0, 200);
+      await setShopSetting(env, "sponsor_text", val);
+      await send(chatId, val ? "✅ متن اسپانسر ذخیره شد." : "✅ متن اسپانسر پاک شد.", env);
+      return showShopAdmin(chatId, env);
+    }
+
     if (replyText.includes("اطلاعات پلن را ارسال کنید")) {
       const parts = text.split("|").map((x) => x.trim());
       if (parts.length < 5) {
@@ -2655,10 +2667,20 @@ async function handleMessage(msg, env) {
     if (text === "/start" || text === "/menu" || text === "منو") {
       return showMain(chatId, env);
     }
+    if (text === "/node" || text === "/nodes") {
+      return showNodesManage(chatId, env);
+    }
+    if (text === "/users") {
+      return showUsers(chatId, 0, env);
+    }
+    if (text === "/status") {
+      return showStatus(chatId, env);
+    }
 
     return send(
       chatId,
       "از دکمه‌های شیشه‌ای استفاده کنید.\n" +
+        "دستورات: /status · /users · /node\n" +
         "می‌توانید UUID، لینک کانفیگ، <b>نام نود</b> یا <b>آدرس نود</b> بفرستید.\n/start",
       env
     );
@@ -2687,6 +2709,27 @@ async function handleMessage(msg, env) {
 
   if (text === "/start" || text === "/menu" || text === "منو" || !text) {
     return showUserHome(chatId, env);
+  }
+
+  // لینک vless یا UUID → نمایش اطلاعات سرویس کاربر
+  const uuidFromText = extractUuidFromText(text);
+  if (uuidFromText) {
+    const u = await getUserByUuid(env, uuidFromText);
+    if (u) {
+      const notes = String(u.notes || "");
+      const name = String(u.name || "");
+      const owns =
+        name === `test-${userId}` ||
+        name.startsWith(`shop-${userId}`) ||
+        notes.includes(`tg:${userId}`);
+      if (owns || isAdmin(userId, env)) {
+        return showMyServiceDetail(chatId, userId, u.id, env);
+      }
+      // ادمین در شاخه بالا هندل شده؛ برای دیگران فقط سرویس خودشان
+      return send(chatId, "این سرویس متعلق به شما نیست.", env, [
+        [{ text: "🏠 منو", callback_data: "user_home" }],
+      ]);
+    }
   }
 
   return showUserHome(chatId, env);
@@ -2793,7 +2836,7 @@ async function handleCallback(cq, env) {
     return showPayInfo(chatId, userId, data.split(":")[1], env, msgId);
   }
 
-  if (data === "user_test") return giveTestAccount(chatId, userId, env, msgId);
+  if (data === "user_test") return giveTestAccount(chatId, userId, env, msgId, cq.from);
 
   if (data === "user_guide") {
     const cfg = await getShopConfig(env);
@@ -2923,8 +2966,21 @@ async function handleCallback(cq, env) {
         { text: "👋 خوش‌آمد", callback_data: "shop_welcome" },
         { text: "📖 آموزش", callback_data: "shop_guide" },
       ],
+      [{ text: "📢 متن اسپانسر", callback_data: "shop_sponsor" }],
       [{ text: "🔙 تنظیمات فروش", callback_data: "shop_admin" }],
     ]);
+  }
+
+  if (data === "shop_sponsor") {
+    return send(
+      chatId,
+      `✏️ <b>متن اسپانسر / تبلیغ را ارسال کنید</b>\n\n` +
+        `این متن در بنر اتمام حجم/زمان و داخل کانفیگ‌های ساب نمایش داده می‌شود.\n` +
+        `برای پاک کردن: <code>-</code>\n\nبرای بازگشت /start`,
+      env,
+      [[{ text: "❌ انصراف", callback_data: "shop_texts" }]],
+      true
+    );
   }
 
   if (data === "shop_test") {
@@ -3335,6 +3391,71 @@ async function showStatus(chatId, env, msgId = null) {
   } else {
     liveText = "\n\n🟢 هیچ کاربر آنلاینی وجود ندارد.";
   }
+
+  // درخواست‌های امروز مادر + نودها
+  let motherReqs = null;
+  try {
+    if (env.CF_TOKEN && env.MOTHER_ACCOUNT_ID) {
+      motherReqs = await getAccountRequestsToday(env.CF_TOKEN, env.MOTHER_ACCOUNT_ID);
+    }
+  } catch {}
+
+  const managed = await getManagedNodes(env);
+  const alive = await getHealthyChildren(env);
+  let nodesReqSum = 0;
+  let nodesReqKnown = 0;
+  let nodesSummary = "";
+  if (managed.length) {
+    const lines = [];
+    await Promise.all(
+      managed.map(async (m) => {
+        let reqs = null;
+        try {
+          const token = await resolveNodeToken(env, m);
+          if (token && m.account_id) {
+            const r = await getAccountRequestsToday(token, m.account_id);
+            if (typeof r === "number") {
+              reqs = r;
+              nodesReqSum += r;
+              nodesReqKnown++;
+            }
+          }
+        } catch {}
+        const live = alive.find(
+          (a) =>
+            a.id.includes(m.script_name) ||
+            (m.url && a.url && String(a.url).includes(m.script_name))
+        );
+        const st =
+          m.is_disabled === 1
+            ? "🔒"
+            : live
+              ? "🟢"
+              : "🔴";
+        const users = live?.activeUsers != null ? faNum(live.activeUsers) : "—";
+        const reqTxt = reqs != null ? formatReqShort(reqs) : "—";
+        const sub = m.exclude_sub === 1 ? " 🚫ساب" : "";
+        lines.push(
+          `${st} <code>${escape(m.script_name)}</code> · 👥${users} · 📈${reqTxt}${sub}`
+        );
+      })
+    );
+    nodesSummary =
+      "\n\n🖥 <b>خلاصه نودها:</b>\n" + lines.join("\n");
+  }
+
+  const motherTxt =
+    motherReqs != null ? Number(motherReqs).toLocaleString("fa-IR") : "—";
+  const nodesReqTxt =
+    nodesReqKnown > 0 ? Number(nodesReqSum).toLocaleString("fa-IR") : "—";
+  const totalReq =
+    (typeof motherReqs === "number" ? motherReqs : 0) +
+    (nodesReqKnown > 0 ? nodesReqSum : 0);
+  const totalReqTxt =
+    motherReqs != null || nodesReqKnown > 0
+      ? Number(totalReq).toLocaleString("fa-IR")
+      : "—";
+
   const text =
     `📊 <b>وضعیت سیستم</b>\n\n` +
     `🔖 نسخه: <code>${VERSION}</code>\n\n` +
@@ -3342,7 +3463,12 @@ async function showStatus(chatId, env, msgId = null) {
     `✅ <b>فعال:</b> ${res.activeUsers}\n` +
     `🟢 <b>آنلاین:</b> ${res.onlineUsers}\n` +
     `🖥 <b>نودها:</b> ${res.nodes}\n` +
-    `📈 <b>ترافیک کل:</b> ${res.totalTrafficGB} GB` +
+    `📈 <b>ترافیک کل:</b> ${res.totalTrafficGB} GB\n\n` +
+    `📡 <b>درخواست امروز:</b>\n` +
+    `• مادر: <b>${motherTxt}</b>\n` +
+    `• نودها: <b>${nodesReqTxt}</b>\n` +
+    `• مجموع: <b>${totalReqTxt}</b>` +
+    nodesSummary +
     liveText;
   const kb = [
     [
@@ -4101,8 +4227,8 @@ async function createCloudflareNode(chatId, token, env) {
     );
 
     const randomNum = Math.floor(10000 + Math.random() * 90000);
-    const scriptName = `saow-child-${randomNum}`;
-    const dbName = `saow-db-${randomNum}`;
+    const scriptName = `wk-${randomNum}`;
+    const dbName = `db-${randomNum}`;
     const nodeUrl = `https://${scriptName}.${accountSubdomain}.workers.dev`;
 
     const dbRes = await cfFetch(`/accounts/${accountId}/d1/database`, token, {
@@ -4204,9 +4330,14 @@ async function deleteCloudflareNode(chatId, scriptName, token, env) {
     try {
       const dbsRes = await cfFetch(`/accounts/${accountId}/d1/database`, token);
       if (dbsRes.success && dbsRes.result) {
-        const match = dbsRes.result.find(
-          (db) => db.name && db.name.includes(scriptName.replace("saow-child-", "saow-db-"))
-        );
+        const match = dbsRes.result.find((db) => {
+          const n = db.name || "";
+          if (!n) return false;
+          if (n.includes(scriptName.replace("wk-", "db-"))) return true;
+          if (n.includes(scriptName.replace("saow-child-", "saow-db-"))) return true;
+          if (n === scriptName) return true;
+          return false;
+        });
         if (match) {
           await cfFetch(`/accounts/${accountId}/d1/database/${match.uuid || match.id}`, token, {
             method: "DELETE",
@@ -5110,7 +5241,7 @@ function shortChildId(scriptName) {
   const s = String(scriptName || "");
   const m = s.match(/(\d{4,})$/);
   if (m) return m[1];
-  return s.replace(/^saow-child-/, "").slice(0, 8) || "—";
+  return s.replace(/^saow-child-/, "").replace(/^wk-/, "").slice(0, 8) || "—";
 }
 function daysRemaining(expiry) {
   if (!expiry) return "∞";
@@ -5144,12 +5275,25 @@ async function generateSubscription(env, user, motherHost) {
   const isDailyExceeded = user.dailyQuotaBytes > 0 && daily.total >= user.dailyQuotaBytes;
   const isDisabled = !user.enabled;
 
+  let sponsorText = "";
+  try {
+    const cfg = await getShopConfig(env);
+    sponsorText = (cfg.sponsorText || "").trim();
+  } catch {}
+
   if (isDisabled || isExpired || isQuotaExceeded || isDailyExceeded) {
     if (isDisabled) links.push(buildInfoLink(user.uuid, motherHost, `🚫 حساب شما غیرفعال شده است`));
     if (isExpired) links.push(buildInfoLink(user.uuid, motherHost, `⏰ زمان اشتراک به پایان رسیده`));
     if (isQuotaExceeded) links.push(buildInfoLink(user.uuid, motherHost, `📦 حجم کل تمام شده`));
     if (isDailyExceeded) links.push(buildInfoLink(user.uuid, motherHost, `📅 حجم روزانه تمام شده`));
-    links.push(buildInfoLink(user.uuid, motherHost, `🔄 برای تمدید با پشتیبانی در ارتباط باشید`));
+    if (sponsorText) {
+      // چند خط اسپانسر را به صورت بنر جداگانه
+      for (const line of sponsorText.split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 4)) {
+        links.push(buildInfoLink(user.uuid, motherHost, line.slice(0, 64)));
+      }
+    } else {
+      links.push(buildInfoLink(user.uuid, motherHost, `🔄 برای تمدید با پشتیبانی در ارتباط باشید`));
+    }
     return links.join("\n");
   }
 
@@ -5267,6 +5411,12 @@ async function generateSubscription(env, user, motherHost) {
       name: `📋 #${childNo} │ ${usedStr}/${quotaStr} │ ${daysStr}روز │ IP ${faNum(activeCount)}/${faNum(user.ipLimit)}`,
     })
   );
+
+  if (sponsorText) {
+    for (const line of sponsorText.split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 3)) {
+      links.push(buildInfoLink(user.uuid, motherHost, line.slice(0, 64)));
+    }
+  }
 
   // دامنه‌های گیت‌هاب (ترجیحاً IP رزولوشن‌شده)
   let gh = [];
