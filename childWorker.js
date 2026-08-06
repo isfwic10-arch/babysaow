@@ -1,8 +1,7 @@
-
-// child-worker.js — v4.9.8-proxyip (D1 + speed limit + revoke + resilient ProxyIP + SNI adblock)
+// child-worker.js — v4.9.6-proxyip (D1 + speed limit + revoke + resilient ProxyIP)
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'node-4.9.8';
+const VERSION = 'node-4.9.6';
 const API_SECRET = 'saow-pan2';
 let MOTHER_URL = null;
 
@@ -16,42 +15,18 @@ const ADGUARD_DNS_HOST = 'dns.adguard.com';
 const ADGUARD_DNS_PORT = 53;
 
 const AD_HOST_SUFFIXES = [
-  // شبکه‌های تبلیغاتی عمومی
   'doubleclick.net', 'googleadservices.com', 'googlesyndication.com',
   'googletagmanager.com', 'googletagservices.com', 'google-analytics.com',
   'adservice.google.com', 'pagead2.googlesyndication.com',
   'facebook.net', 'scorecardresearch.com', 'adnxs.com', 'adsrvr.org',
   'taboola.com', 'outbrain.com', 'moatads.com', 'criteo.com', 'hotjar.com',
-  'adform.net', 'pubmatic.com', 'openx.net', '2mdn.net',
-  'googlesyndication.com', 'googleadservices.com', 'moat.com',
-  'serving-sys.com', 'admob.com', 'adjust.com', 'inmobi.com',
-  'media-match.com', 'omaze.com', 'zedo.com',
-  // اسپاتیفای — فقط دامنه‌های تبلیغ / ترکینگ / telemetry
-  // توجه: audio-fa.scdn.co و audio-*.spotifycdn.com هم موسیقی هم تبلیغ‌اند؛ بلاک‌شان پخش را می‌شکند
-  'ads-fa.spotify.com', 'ads.spotify.com', 'ads-web.spotify.com',
-  'audio-ads.spotify.com', 'adshelp.spotify.com', 'adsmanager.spotify.com',
-  'adeventtracker.spotify.com', 'adeventtrackermonitoring.spotify.com',
-  'adstudio.spotify.com', 'adstudio-assets.scdn.co',
-  'aet.spotify.com', 'pixel.spotify.com', 'pixels.spotify.com',
-  'pixel-static.spotify.com', 'pixel.byspotify.com',
-  'log.spotify.com', 'log2.spotify.com', 'analytics.spotify.com',
-  'analytics.spotify.net', 'metrics.spotify.com',
-  'crashdump.spotify.com', 'crashlytics.com',
-  'heads-ec.spotify.com', 'heads-fa.spotify.com',
-  'heads-fab.spotify.com', 'heads-fac.spotify.com',
-  'audio-fa.spotify.com', 'audio-ec.spotify.com', 'audio-gc.spotify.com',
-  'audio-sp-pos.spotify.com', 'audio-sp-sto.spotify.com',
-  'audio2.spotify.com', 'audio-ak.spotify.com',
-  'bloodhound.spotify.com', 'gtl.spotify.com',
-  'audio-akp-bbr-spotify-com.akamaized.net',
+  'adform.net', 'pubmatic.com', 'openx.net',
 ];
 const BLOCKLIST_URLS = [
   'https://small.oisd.nl/domainswild2',
   'https://raw.githubusercontent.com/sjhgvr/oisd/main/domainswild2_small.txt',
 ];
 const BLOCKLIST_TTL_MS = 6 * 60 * 60 * 1000;
-/** اگر فقط fallback محلی لود شد، زودتر دوباره از شبکه بگیر */
-const BLOCKLIST_FALLBACK_TTL_MS = 5 * 60 * 1000;
 
 // ====================== ProxyIP (resilient) ======================
 // Public community ProxyIPs — used as fallback / for CF-blocked targets.
@@ -226,7 +201,6 @@ let dbReady = false;
 let _env = null;
 let blockSet = null;
 let blockSetAt = 0;
-let blockSetIsFallback = false; // true = فقط لیست محلی، زود retry شود
 let blockSetLoading = null;
 
 // ====================== D1 ======================
@@ -513,82 +487,10 @@ function getLimiter(uuid, kbps) {
 }
 
 // ====================== Ad Block ======================
-function isIpLiteral(host) {
-  const h = String(host || '');
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return true;
-  if (h.includes(':')) return true; // IPv6 فشرده/کامل
-  return false;
-}
-
-/**
- * استخراج SNI از TLS ClientHello (اولین بایت‌های HTTPS)
- * وقتی کلاینت با IP وصل می‌شود، نام واقعی دامنه فقط داخل SNI است.
- */
-function extractSniFromTls(buf) {
-  try {
-    const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-    if (u8.byteLength < 44) return null;
-    // TLS record: type=0x16 (Handshake), version 0x03xx
-    if (u8[0] !== 0x16 || u8[1] !== 0x03) return null;
-    // Handshake type ClientHello = 0x01
-    // record header 5 bytes, then handshake header
-    let off = 5;
-    if (u8[off] !== 0x01) return null;
-    // skip handshake hdr (1 type + 3 length) + client_version(2) + random(32)
-    off += 4 + 2 + 32;
-    if (off >= u8.byteLength) return null;
-    // session_id
-    const sidLen = u8[off];
-    off += 1 + sidLen;
-    if (off + 2 > u8.byteLength) return null;
-    // cipher suites
-    const csLen = (u8[off] << 8) | u8[off + 1];
-    off += 2 + csLen;
-    if (off + 1 > u8.byteLength) return null;
-    // compression methods
-    const compLen = u8[off];
-    off += 1 + compLen;
-    if (off + 2 > u8.byteLength) return null;
-    // extensions
-    const extLen = (u8[off] << 8) | u8[off + 1];
-    off += 2;
-    const extEnd = Math.min(u8.byteLength, off + extLen);
-    while (off + 4 <= extEnd) {
-      const etype = (u8[off] << 8) | u8[off + 1];
-      const elen = (u8[off + 2] << 8) | u8[off + 3];
-      off += 4;
-      if (off + elen > extEnd) break;
-      if (etype === 0x0000 && elen >= 5) {
-        // SNI extension: list_len(2) + type(1)=0 + name_len(2) + name
-        let p = off + 2;
-        if (p + 3 > off + elen) break;
-        if (u8[p] !== 0) {
-          off += elen;
-          continue;
-        }
-        p += 1;
-        const nameLen = (u8[p] << 8) | u8[p + 1];
-        p += 2;
-        if (p + nameLen > off + elen) break;
-        const name = new TextDecoder().decode(u8.subarray(p, p + nameLen));
-        if (name && name.length >= 3) return name.toLowerCase();
-      }
-      off += elen;
-    }
-  } catch {}
-  return null;
-}
-
 function isAdHostLocal(host) {
   const h = String(host || '').toLowerCase().replace(/\.$/, '');
   if (!h) return false;
-  // الگوهای عمومی تبلیغ / ترکینگ
   if (/(^|\.)ads?\d*\./.test(h) || /(^|\.)adserver\./.test(h) || /(^|\.)tracking\./.test(h)) return true;
-  // الگوهای اختصاصی اسپاتیفای (بدون بلاک کردن کل scdn.co / spotifycdn.com)
-  if (/(^|\.)ads?[-.].*\.spotify\.com$/.test(h)) return true;
-  if (/^ads?[.-]/.test(h) && h.includes('spotify')) return true;
-  if (/^audio-ads\./.test(h) || /^heads-fa[bc]?\./.test(h) || /^heads-ec\./.test(h)) return true;
-  if (/^audio-(fa|ec|ak|gc|sp-)/.test(h) && (h.endsWith('.spotify.com') || h.includes('spotify.com.'))) return true;
   return AD_HOST_SUFFIXES.some((s) => h === s || h.endsWith('.' + s));
 }
 function parseBlocklistText(text) {
@@ -604,15 +506,9 @@ function parseBlocklistText(text) {
   }
   return set;
 }
-/** لیست محلی را همیشه داخل set ادغام کن تا اسپاتیفای حتی با oisd هم پوشش داشته باشد */
-function mergeLocalAdHosts(set) {
-  for (const d of AD_HOST_SUFFIXES) set.add(d);
-  return set;
-}
 async function ensureBlocklist() {
   const now = Date.now();
-  const ttl = blockSetIsFallback ? BLOCKLIST_FALLBACK_TTL_MS : BLOCKLIST_TTL_MS;
-  if (blockSet && now - blockSetAt < ttl) return blockSet;
+  if (blockSet && now - blockSetAt < BLOCKLIST_TTL_MS) return blockSet;
   if (blockSetLoading) return blockSetLoading;
   blockSetLoading = (async () => {
     for (const url of BLOCKLIST_URLS) {
@@ -624,17 +520,16 @@ async function ensureBlocklist() {
         if (!r.ok) continue;
         const set = parseBlocklistText(await r.text());
         if (set.size > 100) {
-          blockSet = mergeLocalAdHosts(set);
+          blockSet = set;
           blockSetAt = Date.now();
-          blockSetIsFallback = false;
-          return blockSet;
+          return set;
         }
       } catch {}
     }
-    // لود شبکه شکست خورد → fallback کوتاه‌عمر تا زود دوباره تلاش شود
-    blockSet = mergeLocalAdHosts(new Set(AD_HOST_SUFFIXES));
-    blockSetAt = Date.now();
-    blockSetIsFallback = true;
+    if (!blockSet) {
+      blockSet = new Set(AD_HOST_SUFFIXES);
+      blockSetAt = Date.now();
+    }
     return blockSet;
   })();
   try {
@@ -655,23 +550,12 @@ function hostInBlockset(host, set) {
   return false;
 }
 async function isAdHost(host) {
-  if (!host || isIpLiteral(host)) return false;
   if (isAdHostLocal(host)) return true;
   try {
     return hostInBlockset(host, await ensureBlocklist());
   } catch {
     return isAdHostLocal(host);
   }
-}
-
-/** میزبان مقصد را از آدرس VLESS + SNI داخل ClientHello تشخیص بده */
-async function resolveAdTarget(host, firstPayload) {
-  if (await isAdHost(host)) return { blocked: true, reason: host };
-  if (firstPayload && firstPayload.byteLength > 0) {
-    const sni = extractSniFromTls(firstPayload);
-    if (sni && (await isAdHost(sni))) return { blocked: true, reason: sni };
-  }
-  return { blocked: false };
 }
 
 // ====================== VLESS ======================
@@ -913,21 +797,6 @@ async function handleVlessWebSocket(request, env, ctx) {
       return safeClose('only TCP');
     }
 
-    let host = parsed.address;
-    let port = parsed.port;
-    const firstPayload =
-      parsed.rest && parsed.rest.byteLength > 0 ? new Uint8Array(parsed.rest) : null;
-
-    // بلاک تبلیغ بر اساس دامنه VLESS و در صورت نیاز SNI داخل TLS ClientHello
-    if (cfg.blockAds) {
-      const ad = await resolveAdTarget(host, firstPayload);
-      if (ad.blocked) {
-        sendOk();
-        await sleep(SOFT_REJECT_DELAY_MS);
-        return safeClose('ad blocked');
-      }
-    }
-
     const acq = await tryAcquireIp(envRef, userId, clientIP, cfg.ipLimit || 1);
     if (!acq.ok) {
       sendOk();
@@ -942,6 +811,16 @@ async function handleVlessWebSocket(request, env, ctx) {
     if (!activeSessions.has(userUuid)) activeSessions.set(userUuid, new Set());
     activeSessions.get(userUuid).add(sessionRef);
 
+    let host = parsed.address;
+    let port = parsed.port;
+
+    if (cfg.blockAds && (await isAdHost(host))) {
+      joined = false;
+      sendOk();
+      await sleep(SOFT_REJECT_DELAY_MS);
+      return safeClose('ad blocked');
+    }
+
     if (port === 53 || parsed.cmd === 2) {
       host = ADGUARD_DNS_HOST;
       port = ADGUARD_DNS_PORT;
@@ -953,11 +832,12 @@ async function handleVlessWebSocket(request, env, ctx) {
       remoteWriter = opened.writer;
       sendOk();
 
-      if (firstPayload) {
-        if (limiter.enabled) await limiter.take(firstPayload.byteLength);
-        bytesUp += firstPayload.byteLength;
-        sessionBytes += firstPayload.byteLength;
-        await remoteWriter.write(firstPayload);
+      if (parsed.rest && parsed.rest.byteLength > 0) {
+        const first = new Uint8Array(parsed.rest);
+        if (limiter.enabled) await limiter.take(first.byteLength);
+        bytesUp += first.byteLength;
+        sessionBytes += first.byteLength;
+        await remoteWriter.write(first);
       }
 
       remoteSocket.readable
