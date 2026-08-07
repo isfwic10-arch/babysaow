@@ -1,7 +1,7 @@
-// child-worker.js — v4.9.3-push (optimized D1 + speed limit + revoke on sync)
+// child-worker.js — DNS via DoH (adblock DoH if blockAds, else Google clean DoH)
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-4.9.3-push';
+const VERSION = 'saow-node-4.21.2';
 const API_SECRET = 'saow-pan2';
 let MOTHER_URL = null;
 
@@ -12,21 +12,17 @@ const SOFT_REJECT_DELAY_MS = 50;
 const IP_CACHE_TTL_MS = 60 * 1000; // داخل isolate تا ۶۰ثانیه دوباره D1 نزن
 const IP_CLEANUP_PROB = 0.08; // فقط ~۸٪ درخواست‌ها cleanup idle
 
-const ADGUARD_DNS_HOST = 'dns.adguard.com';
-const ADGUARD_DNS_PORT = 53;
-const AD_HOST_SUFFIXES = [
-  'doubleclick.net', 'googleadservices.com', 'googlesyndication.com',
-  'googletagmanager.com', 'googletagservices.com', 'google-analytics.com',
-  'adservice.google.com', 'pagead2.googlesyndication.com',
-  'facebook.net', 'scorecardresearch.com', 'adnxs.com', 'adsrvr.org',
-  'taboola.com', 'outbrain.com', 'moatads.com', 'criteo.com', 'hotjar.com',
-  'adform.net', 'pubmatic.com', 'openx.net',
-];
-const BLOCKLIST_URLS = [
-  'https://small.oisd.nl/domainswild2',
-  'https://raw.githubusercontent.com/sjhgvr/oisd/main/domainswild2_small.txt',
-];
-const BLOCKLIST_TTL_MS = 6 * 60 * 60 * 1000;
+// ====================== DoH (rethinkdns with OISD-style lists) ======================
+// const DOH_URL = 'https://sky.rethinkdns.com/1:-APACQCAEI0AECgAAIAAQA==';
+// DoH با فیلتر تبلیغات (برای یوزرهایی که blockAds=true دارند)
+const DOH_URL = 'https://hard.dnsforge.de/dns-query';
+// DoH تمیز بدون فیلتر (برای یوزرهایی که blockAds=false دارند)
+const DOH_CLEAN_URL = 'https://dns.google/dns-query';
+
+const DOH_CACHE_TTL_MS = 10 * 60 * 1000; // ۱۰ دقیقه کش نتیجهٔ بلاک/اجازه
+const DOH_TIMEOUT_MS = 2500;
+
+// همه DNS از طریق DoH — انتخاب upstream بر اساس blockAds یوزر
 
 // ====================== In-memory ======================
 let usersByUuid = new Map();
@@ -35,16 +31,17 @@ const activeConns = new Map();
 const activeSessions = new Map();
 const limiters = new Map();
 const ipCache = new Map(); // `${userId}|${ip}` -> { at, ok }
+const dohCache = new Map(); // host -> { blocked: boolean, at: number }
+
+// آمار سبک DNS (per-isolate)
+let dnsStats = { total: 0, ok: 0, fail: 0, dotBlocked: 0 };
 
 let nodeDisabled = false;
 let lastSyncAt = 0;
 let childId = 'child-unknown';
 let dbReady = false;
 let _env = null;
-
-let blockSet = null;
-let blockSetAt = 0;
-let blockSetLoading = null;
+let _ctx = null;
 
 // ====================== D1 ======================
 async function ensureDb(env) {
@@ -68,6 +65,33 @@ async function ensureDb(env) {
         user_id TEXT PRIMARY KEY, up INTEGER DEFAULT 0, down INTEGER DEFAULT 0
       )`),
     ]);
+
+    // مهاجرت: جدول‌های قدیمی ممکن است ستون block_ads نداشته باشند
+    try {
+      const cols = await env.DB.prepare(`PRAGMA table_info(node_users)`).all();
+      const names = new Set((cols.results || []).map((r) => r.name));
+      if (!names.has('block_ads')) {
+        await env.DB.prepare(
+          `ALTER TABLE node_users ADD COLUMN block_ads INTEGER DEFAULT 1`
+        ).run();
+        console.log('ensureDb: migrated node_users +block_ads');
+      }
+      // ستون‌های احتمالی دیگر که بعداً اضافه شده‌اند
+      const need = [
+        ['daily_quota_bytes', 'INTEGER DEFAULT 0'],
+        ['speed_limit_kbps', 'INTEGER DEFAULT 0'],
+        ['ip_limit', 'INTEGER DEFAULT 1'],
+      ];
+      for (const [col, def] of need) {
+        if (!names.has(col)) {
+          await env.DB.prepare(`ALTER TABLE node_users ADD COLUMN ${col} ${def}`).run();
+          console.log('ensureDb: migrated node_users +' + col);
+        }
+      }
+    } catch (migErr) {
+      console.log('ensureDb migrate:', migErr?.message);
+    }
+
     dbReady = true;
     return true;
   } catch (e) {
@@ -101,8 +125,8 @@ async function saveUsersToDb(env, users, disabled) {
           String(u.uuid).toLowerCase(), String(u.id), u.name || '',
           u.enabled === false ? 0 : 1, u.expiry || null,
           Number(u.quotaBytes) || 0, Number(u.dailyQuotaBytes) || 0,
-          Number(u.speedLimitKBps) || 0,
-          Number(u.ipLimit) > 0 ? Number(u.ipLimit) : 1,
+          Math.max(0, Number(u.speedLimitKBps) || 0),
+          Math.max(0, Number(u.ipLimit) || 0),
           u.blockAds === false ? 0 : 1
         )
       );
@@ -126,7 +150,8 @@ async function loadUsersFromDb(env) {
         id: String(r.id), uuid, name: r.name || '',
         enabled: !!r.enabled, expiry: r.expiry || null,
         quotaBytes: r.quota_bytes || 0, dailyQuotaBytes: r.daily_quota_bytes || 0,
-        speedLimitKBps: r.speed_limit_kbps || 0, ipLimit: r.ip_limit || 1,
+        speedLimitKBps: Math.max(0, Number(r.speed_limit_kbps) || 0),
+        ipLimit: Math.max(0, Number(r.ip_limit) || 0), // 0 = unlimited
         blockAds: !!r.block_ads,
       });
     }
@@ -143,8 +168,12 @@ async function loadUsersFromDb(env) {
 }
 
 async function ensureUsersLoaded(env) {
-  if (usersByUuid.size > 0 && lastSyncAt > 0) return;
-  await loadUsersFromDb(env || _env);
+  try {
+    if (usersByUuid.size > 0 && lastSyncAt > 0) return;
+    await loadUsersFromDb(env || _env);
+  } catch (e) {
+    console.log('ensureUsersLoaded:', e?.message || e);
+  }
 }
 
 async function dbAddUsage(env, userId, up, down) {
@@ -196,13 +225,20 @@ async function dbLoadAndClearUsage(env) {
   }
 }
 
-/** IP limit با کش حافظه + cleanup کم‌هزینه */
+/**
+ * محدودیت IP همزمان برای یک userId.
+ * limit <= 0 → نامحدود
+ * همان IP قبلی فقط last_seen را تازه می‌کند و شمرده نمی‌شود دوباره.
+ */
 async function tryAcquireIp(env, userId, ip, limit) {
+  const maxIps = Number(limit) || 0;
+  if (maxIps <= 0) return { ok: true, unlimited: true };
   if (!env?.DB || !userId || !ip) return { ok: true, fallback: true };
 
   const ipStr = String(ip);
   const key = userId + '|' + ipStr;
   const now = Date.now();
+
   const cached = ipCache.get(key);
   if (cached && cached.ok && now - cached.at < IP_CACHE_TTL_MS) {
     return { ok: true, cached: true };
@@ -227,20 +263,19 @@ async function tryAcquireIp(env, userId, ip, limit) {
     ).bind(userId).first();
 
     const current = Number(row?.c) || 0;
-    if (current > limit) {
+    if (current > maxIps) {
       await env.DB.prepare(
         `DELETE FROM node_active_ips WHERE user_id = ? AND ip = ?`
       ).bind(userId, ipStr).run();
       ipCache.delete(key);
-      return { ok: false, reason: 'ip limit' };
+      return { ok: false, reason: 'ip limit', current, limit: maxIps };
     }
 
     ipCache.set(key, { at: now, ok: true });
     if (ipCache.size > 500) {
-      const first = ipCache.keys().next().value;
-      ipCache.delete(first);
+      ipCache.delete(ipCache.keys().next().value);
     }
-    return { ok: true };
+    return { ok: true, current, limit: maxIps };
   } catch (e) {
     const msg = e?.message || '';
     if (msg.includes('UNIQUE') || msg.includes('CONSTRAINT')) {
@@ -250,6 +285,20 @@ async function tryAcquireIp(env, userId, ip, limit) {
     console.log('tryAcquireIp:', msg);
     return { ok: true, fallback: true };
   }
+}
+
+/** تازه کردن last_seen برای IP فعال (سشن طولانی) */
+function touchActiveIp(env, userId, ip) {
+  if (!env?.DB || !userId || !ip) return;
+  const key = userId + '|' + String(ip);
+  const now = Date.now();
+  const cached = ipCache.get(key);
+  if (cached && now - cached.at < IP_CACHE_TTL_MS) return;
+  ipCache.set(key, { at: now, ok: true });
+  const run = env.DB.prepare(`
+    UPDATE node_active_ips SET last_seen = ? WHERE user_id = ? AND ip = ?
+  `).bind(now, userId, String(ip)).run().catch(() => {});
+  if (_ctx && typeof _ctx.waitUntil === 'function') _ctx.waitUntil(run);
 }
 
 // ====================== Helpers ======================
@@ -300,7 +349,18 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ====================== Rate Limiter ======================
+function isIpLiteral(host) {
+  const h = String(host || '').trim();
+  if (!h) return false;
+  // IPv4
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return true;
+  // IPv6 (simple)
+  if (h.includes(':')) return true;
+  return false;
+}
+
+// ====================== Rate Limiter (token bucket, per uuid) ======================
+/** kbps <= 0 → بدون محدودیت */
 function createRateLimiter(kbps) {
   const bytesPerSec = kbps > 0 ? kbps * 1024 : 0;
   if (!bytesPerSec) return { enabled: false, async take() {} };
@@ -329,6 +389,7 @@ function createRateLimiter(kbps) {
 
   return {
     enabled: true,
+    kbps,
     take(n) {
       const run = tail.then(() => doTake(n));
       tail = run.catch(() => {});
@@ -338,88 +399,217 @@ function createRateLimiter(kbps) {
 }
 
 function getLimiter(uuid, kbps) {
-  if (!kbps || kbps <= 0) return { enabled: false, async take() {} };
+  const k = Math.max(0, Number(kbps) || 0);
+  if (k <= 0) return { enabled: false, async take() {} };
   let entry = limiters.get(uuid);
-  if (!entry || entry.kbps !== kbps) {
-    entry = { kbps, limiter: createRateLimiter(kbps) };
+  if (!entry || entry.kbps !== k) {
+    entry = { kbps: k, limiter: createRateLimiter(k) };
     limiters.set(uuid, entry);
   }
   return entry.limiter;
 }
 
-// ====================== Ad Block ======================
-function isAdHostLocal(host) {
-  const h = String(host || '').toLowerCase().replace(/\.$/, '');
-  if (!h) return false;
-  if (/(^|\.)ads?\d*\./.test(h) || /(^|\.)adserver\./.test(h) || /(^|\.)tracking\./.test(h)) return true;
-  return AD_HOST_SUFFIXES.some((s) => h === s || h.endsWith('.' + s));
+// ====================== DoH Ad-Block (rethinkdns) ======================
+function base64UrlEncode(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-function parseBlocklistText(text) {
-  const set = new Set();
-  for (let line of text.split('\n')) {
-    line = line.trim().toLowerCase();
-    if (!line || line.startsWith('#') || line.startsWith('!')) continue;
-    if (line.startsWith('0.0.0.0 ') || line.startsWith('127.0.0.1 ')) {
-      line = line.split(/\s+/)[1] || '';
-    }
-    line = line.replace(/^\|\|/, '').replace(/\^.*$/, '').replace(/^\*\./, '').replace(/^\./, '');
-    if (line.length >= 3 && line.length <= 253 && !/[^a-z0-9.-]/.test(line)) set.add(line);
+/** ساخت یک کوئری DNS ساده برای رکورد A */
+function buildDnsQueryA(hostname) {
+  const labels = String(hostname).toLowerCase().replace(/\.$/, '').split('.').filter(Boolean);
+  const nameParts = [];
+  for (const label of labels) {
+    const enc = new TextEncoder().encode(label);
+    if (enc.length > 63) return null;
+    nameParts.push(enc.length);
+    for (let i = 0; i < enc.length; i++) nameParts.push(enc[i]);
   }
-  return set;
+  nameParts.push(0); // root
+
+  const id = Math.floor(Math.random() * 65535);
+  const header = new Uint8Array(12);
+  const view = new DataView(header.buffer);
+  view.setUint16(0, id);
+  view.setUint16(2, 0x0100); // RD
+  view.setUint16(4, 1); // QDCOUNT
+  // ANCOUNT, NSCOUNT, ARCOUNT = 0
+
+  const question = new Uint8Array(nameParts.length + 4);
+  question.set(nameParts, 0);
+  const qView = new DataView(question.buffer);
+  qView.setUint16(nameParts.length, 1); // QTYPE A
+  qView.setUint16(nameParts.length + 2, 1); // QCLASS IN
+
+  const packet = new Uint8Array(header.length + question.length);
+  packet.set(header, 0);
+  packet.set(question, header.length);
+  return packet;
 }
 
-async function ensureBlocklist() {
+/** پارس پاسخ DoH و تشخیص بلاک بودن (0.0.0.0 یا بدون A) */
+function isBlockedFromDnsResponse(buf) {
+  if (!buf || buf.byteLength < 12) return true; // fail closed for safety? or false. بهتر fail open
+  const view = new DataView(buf);
+  const flags = view.getUint16(2);
+  const rcode = flags & 0x0f;
+  // NXDOMAIN / SERVFAIL → معمولاً بلاک یا خطا → بلاک در نظر می‌گیریم؟ برای adblock بهتره fail-open
+  if (rcode !== 0) return false; // fail open on error
+
+  const qdcount = view.getUint16(4);
+  const ancount = view.getUint16(6);
+  if (ancount === 0) return true; // هیچ پاسخی = بلاک
+
+  // رد شدن از سوال‌ها
+  let offset = 12;
+  for (let i = 0; i < qdcount; i++) {
+    while (offset < buf.byteLength) {
+      const len = view.getUint8(offset);
+      if (len === 0) { offset += 1; break; }
+      if ((len & 0xc0) === 0xc0) { offset += 2; break; } // pointer
+      offset += 1 + len;
+    }
+    offset += 4; // QTYPE + QCLASS
+  }
+
+  // بررسی answerها
+  let hasRealA = false;
+  for (let i = 0; i < ancount && offset + 10 < buf.byteLength; i++) {
+    // NAME
+    while (offset < buf.byteLength) {
+      const len = view.getUint8(offset);
+      if (len === 0) { offset += 1; break; }
+      if ((len & 0xc0) === 0xc0) { offset += 2; break; }
+      offset += 1 + len;
+    }
+    if (offset + 10 > buf.byteLength) break;
+    const rtype = view.getUint16(offset); offset += 2;
+    offset += 2; // class
+    offset += 4; // TTL
+    const rdlen = view.getUint16(offset); offset += 2;
+    if (rtype === 1 && rdlen === 4 && offset + 4 <= buf.byteLength) { // A
+      const a = view.getUint8(offset);
+      const b = view.getUint8(offset + 1);
+      const c = view.getUint8(offset + 2);
+      const d = view.getUint8(offset + 3);
+      if (a === 0 && b === 0 && c === 0 && d === 0) {
+        // 0.0.0.0 → بلاک
+        return true;
+      }
+      hasRealA = true;
+    }
+    offset += rdlen;
+  }
+  // اگر هیچ A واقعی نداشت → بلاک
+  return !hasRealA;
+}
+
+async function queryDohBlocked(host) {
+  const h = String(host || '').toLowerCase().replace(/\.$/, '');
+  if (!h || isIpLiteral(h)) return false;
+
   const now = Date.now();
-  if (blockSet && now - blockSetAt < BLOCKLIST_TTL_MS) return blockSet;
-  if (blockSetLoading) return blockSetLoading;
-  blockSetLoading = (async () => {
-    for (const url of BLOCKLIST_URLS) {
-      try {
-        const r = await fetch(url, {
-          headers: { 'User-Agent': 'cf-child/4.9' },
-          cf: { cacheTtl: 3600, cacheEverything: true },
-        });
-        if (!r.ok) continue;
-        const set = parseBlocklistText(await r.text());
-        if (set.size > 100) {
-          blockSet = set;
-          blockSetAt = Date.now();
-          return set;
-        }
-      } catch {}
-    }
-    if (!blockSet) {
-      blockSet = new Set(AD_HOST_SUFFIXES);
-      blockSetAt = Date.now();
-    }
-    return blockSet;
-  })();
-  try {
-    return await blockSetLoading;
-  } finally {
-    blockSetLoading = null;
+  const cached = dohCache.get(h);
+  if (cached && now - cached.at < DOH_CACHE_TTL_MS) {
+    return cached.blocked;
   }
-}
 
-function hostInBlockset(host, set) {
-  const h = String(host || '').toLowerCase().replace(/\.$/, '');
-  if (!h || !set) return false;
-  if (set.has(h)) return true;
-  let i = h.indexOf('.');
-  while (i !== -1) {
-    if (set.has(h.slice(i + 1))) return true;
-    i = h.indexOf('.', i + 1);
+  try {
+    const query = buildDnsQueryA(h);
+    if (!query) return false;
+
+    const dnsParam = base64UrlEncode(query);
+    const url = `${DOH_URL}?dns=${dnsParam}`;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DOH_TIMEOUT_MS);
+
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/dns-message',
+        'User-Agent': 'cf-child/4.9.4',
+      },
+      signal: controller.signal,
+      cf: { cacheTtl: 0, cacheEverything: false },
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      // fail open
+      dohCache.set(h, { blocked: false, at: now });
+      return false;
+    }
+
+    const buf = await res.arrayBuffer();
+    const blocked = isBlockedFromDnsResponse(buf);
+
+    dohCache.set(h, { blocked, at: now });
+    // محدود کردن اندازه کش
+    if (dohCache.size > 2000) {
+      const first = dohCache.keys().next().value;
+      dohCache.delete(first);
+    }
+    return blocked;
+  } catch (e) {
+    // timeout / network → fail open
+    dohCache.set(h, { blocked: false, at: now });
+    return false;
   }
-  return false;
 }
 
 async function isAdHost(host) {
-  if (isAdHostLocal(host)) return true;
+  return queryDohBlocked(host);
+}
+
+/** رزولوشن واقعی DNS از طریق DoH (برای ترافیک کلاینت) */
+/** upstream: اگر blockAds فعال → DOH_URL (فیلتردار)، وگرنه DOH_CLEAN_URL */
+function pickDohUrl(blockAds) {
+  return blockAds ? DOH_URL : DOH_CLEAN_URL;
+}
+
+async function dohResolve(dnsQueryBytes, blockAds = true) {
+  if (!dnsQueryBytes || dnsQueryBytes.byteLength < 12) return null;
+  const q = dnsQueryBytes instanceof Uint8Array ? dnsQueryBytes : new Uint8Array(dnsQueryBytes);
+  const upstream = pickDohUrl(!!blockAds);
+  dnsStats.total += 1;
+
   try {
-    return hostInBlockset(host, await ensureBlocklist());
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DOH_TIMEOUT_MS);
+    const res = await fetch(upstream, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/dns-message',
+        'Accept': 'application/dns-message',
+        'User-Agent': 'cf-child/' + VERSION,
+      },
+      body: q,
+      signal: controller.signal,
+      cf: { cacheTtl: 0, cacheEverything: false },
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const dnsParam = base64UrlEncode(q);
+      const res2 = await fetch(`${upstream}?dns=${dnsParam}`, {
+        method: 'GET',
+        headers: { 'Accept': 'application/dns-message', 'User-Agent': 'cf-child/' + VERSION },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (!res2.ok) {
+        dnsStats.fail += 1;
+        return null;
+      }
+      dnsStats.ok += 1;
+      return new Uint8Array(await res2.arrayBuffer());
+    }
+    dnsStats.ok += 1;
+    return new Uint8Array(await res.arrayBuffer());
   } catch {
-    return isAdHostLocal(host);
+    dnsStats.fail += 1;
+    return null;
   }
 }
 
@@ -502,8 +692,8 @@ async function handleSync(request, env) {
       enabled: u.enabled !== false, expiry: u.expiry || null,
       quotaBytes: Number(u.quotaBytes) || 0,
       dailyQuotaBytes: Number(u.dailyQuotaBytes) || 0,
-      speedLimitKBps: Number(u.speedLimitKBps) || 0,
-      ipLimit: Number(u.ipLimit) > 0 ? Number(u.ipLimit) : 1,
+      speedLimitKBps: Math.max(0, Number(u.speedLimitKBps) || 0),
+      ipLimit: Math.max(0, Number(u.ipLimit) || 0), // 0 = unlimited
       blockAds: u.blockAds !== false,
     });
   }
@@ -511,6 +701,7 @@ async function handleSync(request, env) {
   usersByUuid = newMap;
   lastSyncAt = Date.now();
   ipCache.clear();
+  // کش DoH را نگه می‌داریم (دامنه‌ها تغییر نکرده‌اند)
 
   // قطع اجباری کاربرانی که دیگر در لیست نیستند / غیرفعال / منقضی
   for (const [uuid, sessions] of [...activeSessions.entries()]) {
@@ -551,6 +742,7 @@ async function handleSync(request, env) {
     meta: {
       users_loaded: usersByUuid.size, node_disabled: nodeDisabled,
       usage_entries: usageReport.length, ip_entries: activeIpsReport.length,
+      doh: DOH_URL, dohClean: DOH_CLEAN_URL,
     },
   }), {
     status: 200,
@@ -564,13 +756,21 @@ async function handleVlessWebSocket(request, env, ctx) {
     return new Response('Expected Upgrade: websocket', { status: 426 });
   }
 
-  await ensureUsersLoaded(env);
+  try {
+    await ensureUsersLoaded(env);
+  } catch {}
   if (nodeDisabled) return new Response('Node disabled', { status: 503 });
 
-  const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair);
-  server.binaryType = 'arraybuffer';
-  server.accept({ allowHalfOpen: true });
+  let pair, client, server;
+  try {
+    pair = new WebSocketPair();
+    [client, server] = Object.values(pair);
+    server.binaryType = 'arraybuffer';
+    server.accept();
+  } catch (e) {
+    console.log('ws accept:', e?.message || e);
+    return new Response('ws error', { status: 500 });
+  }
 
   const envRef = env;
   const clientIP = getClientIP(request);
@@ -587,6 +787,8 @@ async function handleVlessWebSocket(request, env, ctx) {
   let remoteWriter = null;
   let limiter = { enabled: false, async take() {} };
   let sessionRef = null;
+  let isDnsMode = false; // همه DNS از DoH
+  let userBlockAds = true; // از cfg یوزر؛ انتخاب upstream DoH
 
   const flushUsage = () => {
     if (!userId || bytesUp + bytesDown === 0) return;
@@ -600,6 +802,7 @@ async function handleVlessWebSocket(request, env, ctx) {
     if (sessionBytes - lastReported >= REPORT_THRESHOLD) {
       flushUsage();
       lastReported = sessionBytes;
+      if (userId) touchActiveIp(envRef, userId, clientIP);
     }
   };
 
@@ -639,9 +842,10 @@ async function handleVlessWebSocket(request, env, ctx) {
   const processChunk = async (chunk) => {
     if (closed || !(chunk instanceof Uint8Array) || chunk.byteLength === 0) return;
 
-    // بعد از اتصال — ترافیک عادی
+    // first-chunk log disabled (noise) — فقط DNS خاص لاگ می‌شود
+
+    // بعد از اتصال — ترافیک عادی (TCP non-DNS)
     if (remoteWriter) {
-      // اگر در همین isolate کاربر revoke شده، قطع کن
       if (userUuid && !getUserByUuid(userUuid)) {
         return safeClose('revoked');
       }
@@ -657,31 +861,116 @@ async function handleVlessWebSocket(request, env, ctx) {
       return;
     }
 
+    // حالت DNS: کلاینت کوئری DNS فرستاده → فقط از DoH جواب بده (MITM)
+    if (isDnsMode) {
+      if (userUuid && !getUserByUuid(userUuid)) {
+        return safeClose('revoked');
+      }
+      try {
+        // تشخیص فریم: ممکن است چند کوئری length-prefixed پشت سر هم باشد (TCP DNS / XUDP)
+        // یا یک raw DNS message
+        const queries = [];
+        let usedLengthPrefix = false;
+
+        if (chunk.byteLength >= 2) {
+          let off = 0;
+          while (off + 2 <= chunk.byteLength) {
+            const len = (chunk[off] << 8) | chunk[off + 1];
+            if (len < 12 || off + 2 + len > chunk.byteLength) break;
+            queries.push(chunk.subarray(off + 2, off + 2 + len));
+            off += 2 + len;
+            usedLengthPrefix = true;
+          }
+        }
+        // اگر هیچ فریم معتبری پیدا نشد → کل پیام یک کوئری خام است
+        if (queries.length === 0) {
+          queries.push(chunk);
+          usedLengthPrefix = false;
+        }
+
+        for (const query of queries) {
+          if (limiter.enabled) await limiter.take(query.byteLength);
+          bytesUp += query.byteLength;
+          sessionBytes += query.byteLength;
+          maybeReport();
+
+          const resp = await dohResolve(query, userBlockAds);
+          if (!resp || resp.byteLength < 12) {
+            continue;
+          }
+
+          let out;
+          if (usedLengthPrefix) {
+            // همان سبک length-prefix که کلاینت فرستاده بود
+            out = new Uint8Array(2 + resp.byteLength);
+            out[0] = (resp.byteLength >> 8) & 0xff;
+            out[1] = resp.byteLength & 0xff;
+            out.set(resp, 2);
+          } else {
+            // raw
+            out = resp;
+          }
+
+          if (limiter.enabled) await limiter.take(out.byteLength);
+          bytesDown += out.byteLength;
+          sessionBytes += out.byteLength;
+          maybeReport();
+          try {
+            server.send(out);
+          } catch {
+            safeClose('ws send fail');
+            return;
+          }
+        }
+      } catch (e) {
+        safeClose('dns fail');
+      }
+      return;
+    }
+
     // هدر VLESS
     const buf = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
     const parsed = parseVlessHeader(buf);
-    if (!parsed.ok) return safeClose('bad header');
+    if (!parsed.ok) {
+      return safeClose('bad header');
+    }
 
     userUuid = parsed.uuid.toLowerCase();
     const cfg = getUserByUuid(userUuid);
-    if (!cfg) return safeClose('user not found');
+    if (!cfg) {
+      return safeClose('user not found');
+    }
     userId = cfg.id;
 
-    // فقط TCP (UDP غیر DNS رد)
-    if (parsed.cmd === 2) {
-      const isDns =
-        parsed.port === 53 ||
-        ['1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4', 'dns.google', 'dns.google.com'].includes(parsed.address);
-      if (!isDns) {
-        sendOk();
-        return safeClose('udp not supported');
-      }
-    } else if (parsed.cmd !== 1) {
+    // تشخیص DNS / DoT
+    const dnsAddrs = ['1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4', '9.9.9.9',
+      'dns.google', 'dns.google.com', 'cloudflare-dns.com', 'dns.adguard.com',
+      'dns.quad9.net', 'dns.dnsforge.de', 'one.one.one.one', 'dns.cloudflare.com'];
+    const addrLower = String(parsed.address || '').toLowerCase();
+    const isDot = parsed.port === 853; // DNS over TLS
+    const isDnsRequest =
+      parsed.port === 53 ||
+      (parsed.cmd === 2 && (parsed.port === 53 || dnsAddrs.includes(addrLower)));
+
+    // DoT (853) را قطع می‌کنیم تا کلاینت به DNS/53 برگردد و با DoH جواب داده شود
+    if (isDot) {
+      dnsStats.dotBlocked += 1;
+      sendOk();
+      await sleep(SOFT_REJECT_DELAY_MS);
+      return safeClose('dot blocked, use dns/53');
+    }
+
+    if (parsed.cmd === 2 && !isDnsRequest) {
+      sendOk();
+      return safeClose('udp not supported');
+    }
+    if (parsed.cmd !== 1 && parsed.cmd !== 2) {
       sendOk();
       return safeClose('only TCP');
     }
 
-    const acq = await tryAcquireIp(envRef, userId, clientIP, cfg.ipLimit || 1);
+    // محدودیت IP همزمان
+    const acq = await tryAcquireIp(envRef, userId, clientIP, cfg.ipLimit);
     if (!acq.ok) {
       sendOk();
       await sleep(SOFT_REJECT_DELAY_MS);
@@ -689,8 +978,10 @@ async function handleVlessWebSocket(request, env, ctx) {
     }
 
     joined = true;
+    userBlockAds = cfg.blockAds === true;
     activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
-    limiter = getLimiter(userUuid, cfg.speedLimitKBps || 0);
+    // محدودیت سرعت (۰ = نامحدود) — روی آپلود و دانلود اعمال می‌شود
+    limiter = getLimiter(userUuid, cfg.speedLimitKBps);
 
     // ثبت سشن برای قطع بعد از sync
     sessionRef = { close: () => safeClose('revoked') };
@@ -700,18 +991,28 @@ async function handleVlessWebSocket(request, env, ctx) {
     let host = parsed.address;
     let port = parsed.port;
 
-    if (cfg.blockAds && (await isAdHost(host))) {
+    // ad-block فقط اگر برای این یوزر blockAds فعال باشد (و مقصد DNS نباشد)
+    if (!isDnsRequest && cfg.blockAds === true && (await isAdHost(host))) {
       joined = false;
       sendOk();
       await sleep(SOFT_REJECT_DELAY_MS);
       return safeClose('ad blocked');
     }
 
-    if (port === 53 || parsed.cmd === 2) {
-      host = ADGUARD_DNS_HOST;
-      port = ADGUARD_DNS_PORT;
+    // ========== همه DNS از DoH ==========
+    if (isDnsRequest) {
+      isDnsMode = true;
+      sendOk();
+
+      // اگر early data / rest داشت، همان را به عنوان کوئری اول پردازش کن
+      if (parsed.rest && parsed.rest.byteLength > 0) {
+        const first = new Uint8Array(parsed.rest);
+        await processChunk(first);
+      }
+      return;
     }
 
+    // ========== TCP عادی ==========
     try {
       remoteSocket = connect({ hostname: host, port });
       remoteWriter = remoteSocket.writable.getWriter();
@@ -749,20 +1050,30 @@ async function handleVlessWebSocket(request, env, ctx) {
   };
 
   server.addEventListener('message', (ev) => {
-    const data = ev.data;
-    if (data instanceof ArrayBuffer) {
-      processChunk(new Uint8Array(data)).catch(() => safeClose());
-    } else if (data instanceof Blob) {
-      data.arrayBuffer().then((b) => processChunk(new Uint8Array(b))).catch(() => safeClose());
-    } else if (typeof data === 'string') {
-      processChunk(new TextEncoder().encode(data)).catch(() => safeClose());
+    try {
+      const data = ev.data;
+      if (data instanceof ArrayBuffer) {
+        processChunk(new Uint8Array(data)).catch(() => { try { safeClose(); } catch {} });
+      } else if (data instanceof Blob) {
+        data.arrayBuffer()
+          .then((b) => processChunk(new Uint8Array(b)))
+          .catch(() => { try { safeClose(); } catch {} });
+      } else if (typeof data === 'string') {
+        processChunk(new TextEncoder().encode(data)).catch(() => { try { safeClose(); } catch {} });
+      }
+    } catch {
+      try { safeClose(); } catch {}
     }
   });
-  server.addEventListener('close', () => safeClose());
-  server.addEventListener('error', () => safeClose());
+  server.addEventListener('close', () => { try { safeClose(); } catch {} });
+  server.addEventListener('error', () => { try { safeClose(); } catch {} });
 
   if (earlyData && earlyData.byteLength > 0) {
-    ctx.waitUntil(processChunk(earlyData).catch(() => {}));
+    try {
+      ctx.waitUntil(processChunk(earlyData).catch(() => {}));
+    } catch {
+      processChunk(earlyData).catch(() => {});
+    }
   }
 
   return new Response(null, { status: 101, webSocket: client });
@@ -772,7 +1083,7 @@ async function handleVlessWebSocket(request, env, ctx) {
 async function serveStatusPage(id) {
   try {
     const res = await fetch(STATUS_HTML_URL, {
-      headers: { 'User-Agent': 'cf-child/4.9' },
+      headers: { 'User-Agent': 'cf-child/4.9.4' },
       cf: { cacheTtl: 300, cacheEverything: true },
     });
     if (!res.ok) throw new Error('fetch failed');
@@ -788,7 +1099,7 @@ async function serveStatusPage(id) {
       `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><title>Saow Node</title></head>
        <body style="background:#05060f;color:#e2e8f0;font-family:system-ui;display:grid;place-items:center;min-height:100vh;margin:0">
          <div style="text-align:center">
-           <h1>SAOW</h1><p>Edge Node (Push + D1)</p>
+           <h1>SAOW</h1><p>Edge Node (Push + D1 + DoH)</p>
            <p>Version: <b>${VERSION}</b></p>
            <p style="opacity:.5">${id}</p>
          </div></body></html>`,
@@ -802,6 +1113,7 @@ export default {
   async fetch(request, env, ctx) {
     try {
       _env = env;
+      _ctx = ctx;
       if (!MOTHER_URL) MOTHER_URL = env.MOTHER_URL || '';
 
       const url = new URL(request.url);
@@ -819,15 +1131,16 @@ export default {
         let activeUsersCount = 0;
         for (const c of activeConns.values()) if (c > 0) activeUsersCount++;
         return new Response(JSON.stringify({
-          ok: true, id: childId, version: VERSION, mode: 'push-d1',
+          ok: true, id: childId, version: VERSION, mode: 'push-d1-doh-dns',
           activeUsers: Math.max(activeUsersCount, ips.length),
           usersLoaded: usersByUuid.size, activeIpEntries: ips.length,
           nodeDisabled, lastSyncAt: lastSyncAt || null, hasDB: !!env.DB,
+          doh: DOH_URL, dohClean: DOH_CLEAN_URL, dohCacheSize: dohCache.size,
+          dns: { ...dnsStats },
         }), { headers: { 'content-type': 'application/json' } });
       }
 
       if (isWs) {
-        ctx.waitUntil(ensureBlocklist());
         return handleVlessWebSocket(request, env, ctx);
       }
 
@@ -836,9 +1149,11 @@ export default {
       if (path === '/version') {
         await ensureUsersLoaded(env);
         return new Response(JSON.stringify({
-          version: VERSION, role: 'node', mode: 'push-d1', id: childId,
+          version: VERSION, role: 'node', mode: 'push-d1-doh-dns', id: childId,
           usersLoaded: usersByUuid.size, nodeDisabled,
           lastSyncAt: lastSyncAt || null, hasDB: !!env.DB,
+          doh: DOH_URL, dohClean: DOH_CLEAN_URL,
+          dns: { ...dnsStats },
         }), { headers: { 'content-type': 'application/json' } });
       }
 
