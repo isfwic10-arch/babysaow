@@ -1,7 +1,7 @@
 // child-worker.js — DNS via DoH (adblock DoH if blockAds, else Google clean DoH)
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = 'saow-node-4.21.2';
+const VERSION = '4.31.0-ipfix';
 const API_SECRET = 'saow-pan2';
 let MOTHER_URL = null;
 
@@ -9,7 +9,7 @@ const REPORT_THRESHOLD = 8 * 1024 * 1024; // هر ۸ مگ یک‌بار usage �
 const STATUS_HTML_URL = 'https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/node-status.html';
 const IP_IDLE_MS = 10 * 60 * 1000;
 const SOFT_REJECT_DELAY_MS = 50;
-const IP_CACHE_TTL_MS = 60 * 1000; // داخل isolate تا ۶۰ثانیه دوباره D1 نزن
+const IP_CACHE_TTL_MS = 5 * 1000; // کش کوتاه — تا D1 زودتر دوباره چک شود
 const IP_CLEANUP_PROB = 0.08; // فقط ~۸٪ درخواست‌ها cleanup idle
 
 // ====================== DoH (rethinkdns with OISD-style lists) ======================
@@ -31,7 +31,47 @@ const activeConns = new Map();
 const activeSessions = new Map();
 const limiters = new Map();
 const ipCache = new Map(); // `${userId}|${ip}` -> { at, ok }
+const memIps = new Map(); // userId -> Map<ip, lastSeen>  (اعمال limit حتی اگر D1 fail شود)
 const dohCache = new Map(); // host -> { blocked: boolean, at: number }
+
+/** خواندن عدد از چند نام فیلد ممکن */
+function pickNum(obj, keys, fallback) {
+  for (const k of keys) {
+    if (obj == null || !(k in obj)) continue;
+    const v = obj[k];
+    if (v === null || v === undefined || v === '') continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return fallback;
+}
+
+/**
+ * نرمال‌سازی فیلدهای محدودیت از mother یا ردیف D1
+ * ipLimit: undefined → پیش‌فرض 1 | صریحاً 0 → نامحدود
+ * speedLimitKBps: undefined/0 → نامحدود | >0 → KB/s
+ */
+function normalizeUserLimits(raw) {
+  const o = raw || {};
+  // IP
+  let ipLimit;
+  if (['ipLimit', 'ip_limit', 'maxIp', 'max_ip', 'ipCount'].some((k) => k in o && o[k] !== null && o[k] !== undefined && o[k] !== '')) {
+    ipLimit = Math.max(0, pickNum(o, ['ipLimit', 'ip_limit', 'maxIp', 'max_ip', 'ipCount'], 1));
+  } else {
+    ipLimit = 1; // پیش‌فرض: ۱ آی‌پی
+  }
+
+  // Speed: پشتیبانی از KBps و Mbps و نام‌های مختلف
+  let speedLimitKBps = 0;
+  if (['speedLimitKBps', 'speed_limit_kbps', 'speedLimit', 'speed_kbps', 'limitKBps'].some((k) => k in o && o[k] != null && o[k] !== '')) {
+    speedLimitKBps = Math.max(0, pickNum(o, ['speedLimitKBps', 'speed_limit_kbps', 'speedLimit', 'speed_kbps', 'limitKBps'], 0));
+  } else if (['speedLimitMbps', 'speed_mbps', 'mbps'].some((k) => k in o && o[k] != null && o[k] !== '')) {
+    const mbps = Math.max(0, pickNum(o, ['speedLimitMbps', 'speed_mbps', 'mbps'], 0));
+    speedLimitKBps = mbps * 128; // 1 Mbps ≈ 128 KB/s
+  }
+
+  return { ipLimit, speedLimitKBps };
+}
 
 // آمار سبک DNS (per-isolate)
 let dnsStats = { total: 0, ok: 0, fail: 0, dotBlocked: 0 };
@@ -125,8 +165,8 @@ async function saveUsersToDb(env, users, disabled) {
           String(u.uuid).toLowerCase(), String(u.id), u.name || '',
           u.enabled === false ? 0 : 1, u.expiry || null,
           Number(u.quotaBytes) || 0, Number(u.dailyQuotaBytes) || 0,
-          Math.max(0, Number(u.speedLimitKBps) || 0),
-          Math.max(0, Number(u.ipLimit) || 0),
+          normalizeUserLimits(u).speedLimitKBps,
+          normalizeUserLimits(u).ipLimit,
           u.blockAds === false ? 0 : 1
         )
       );
@@ -146,14 +186,26 @@ async function loadUsersFromDb(env) {
     const newMap = new Map();
     for (const r of list) {
       const uuid = String(r.uuid).toLowerCase();
-      newMap.set(uuid, {
-        id: String(r.id), uuid, name: r.name || '',
-        enabled: !!r.enabled, expiry: r.expiry || null,
-        quotaBytes: r.quota_bytes || 0, dailyQuotaBytes: r.daily_quota_bytes || 0,
-        speedLimitKBps: Math.max(0, Number(r.speed_limit_kbps) || 0),
-        ipLimit: Math.max(0, Number(r.ip_limit) || 0), // 0 = unlimited
-        blockAds: !!r.block_ads,
-      });
+      {
+        const lim = normalizeUserLimits({
+          speed_limit_kbps: r.speed_limit_kbps,
+          ip_limit: r.ip_limit,
+          speedLimitKBps: r.speed_limit_kbps,
+          ipLimit: r.ip_limit,
+        });
+        // از D1: اگر ستون null بود پیش‌فرض ip=1
+        const ipLimit = (r.ip_limit === null || r.ip_limit === undefined)
+          ? 1
+          : Math.max(0, Number(r.ip_limit) || 0);
+        newMap.set(uuid, {
+          id: String(r.id), uuid, name: r.name || '',
+          enabled: !!r.enabled, expiry: r.expiry || null,
+          quotaBytes: r.quota_bytes || 0, dailyQuotaBytes: r.daily_quota_bytes || 0,
+          speedLimitKBps: Math.max(0, Number(r.speed_limit_kbps) || 0),
+          ipLimit,
+          blockAds: !!r.block_ads,
+        });
+      }
     }
     usersByUuid = newMap;
     const dis = await env.DB.prepare(`SELECT value FROM node_state WHERE key='node_disabled'`).first();
@@ -226,78 +278,155 @@ async function dbLoadAndClearUsage(env) {
 }
 
 /**
- * محدودیت IP همزمان برای یک userId.
+ * محدودیت IP همزمان — D1 اول (بین isolate)، حافظه دوم.
+ * ترتیب: cleanup → لیست فعال → اگر IP هست OK → اگر ظرفیت پر است رد → insert → تأیید دوباره
  * limit <= 0 → نامحدود
- * همان IP قبلی فقط last_seen را تازه می‌کند و شمرده نمی‌شود دوباره.
  */
 async function tryAcquireIp(env, userId, ip, limit) {
-  const maxIps = Number(limit) || 0;
-  if (maxIps <= 0) return { ok: true, unlimited: true };
-  if (!env?.DB || !userId || !ip) return { ok: true, fallback: true };
+  const maxIps = Number(limit);
+  if (!Number.isFinite(maxIps) || maxIps <= 0) return { ok: true, unlimited: true };
+  if (!userId || !ip) return { ok: true, fallback: true };
 
-  const ipStr = String(ip);
+  const ipStr = String(ip).trim();
+  // IP نامعتبر / ناشناس را در جدول فعال ثبت نکن (جلوگیری از پر شدن با 0.0.0.0 و لبه CF)
+  if (!isValidPublicIp(ipStr) || ipStr === '0.0.0.0') {
+    return { ok: true, skipped: true, reason: 'invalid-or-unknown-ip' };
+  }
   const key = userId + '|' + ipStr;
   const now = Date.now();
+  const cutoff = now - IP_IDLE_MS;
 
+  // حافظه isolate
+  let m = memIps.get(userId);
+  if (!m) {
+    m = new Map();
+    memIps.set(userId, m);
+  }
+  for (const [x, ts] of m) {
+    if (now - ts > IP_IDLE_MS) m.delete(x);
+  }
+
+  // کش کوتاه فقط برای همین IP (reconnect سریع)
   const cached = ipCache.get(key);
   if (cached && cached.ok && now - cached.at < IP_CACHE_TTL_MS) {
-    return { ok: true, cached: true };
+    m.set(ipStr, now);
+    return { ok: true, cached: true, limit: maxIps };
+  }
+
+  // بدون D1 فقط حافظه
+  if (!env?.DB) {
+    if (!m.has(ipStr) && m.size >= maxIps) {
+      return { ok: false, reason: 'ip limit', current: m.size, limit: maxIps, via: 'memory' };
+    }
+    m.set(ipStr, now);
+    ipCache.set(key, { at: now, ok: true });
+    return { ok: true, via: 'memory-only', current: m.size, limit: maxIps };
   }
 
   try {
     await ensureDb(env);
 
-    await env.DB.prepare(`
-      INSERT INTO node_active_ips (user_id, ip, last_seen) VALUES (?, ?, ?)
-      ON CONFLICT(user_id, ip) DO UPDATE SET last_seen = excluded.last_seen
-    `).bind(userId, ipStr, now).run();
+    // همیشه idle این یوزر را پاک کن (نه تصادفی) تا ظرفیت آزاد شود
+    await env.DB.prepare(
+      `DELETE FROM node_active_ips WHERE user_id = ? AND last_seen < ?`
+    ).bind(userId, cutoff).run();
 
-    if (Math.random() < IP_CLEANUP_PROB) {
+    const listed = await env.DB.prepare(
+      `SELECT ip, last_seen FROM node_active_ips WHERE user_id = ? ORDER BY last_seen ASC`
+    ).bind(userId).all();
+    const rows = listed.results || [];
+    const known = new Set(rows.map((r) => String(r.ip)));
+
+    // همین IP قبلاً مجاز بوده → فقط touch
+    if (known.has(ipStr)) {
       await env.DB.prepare(
-        `DELETE FROM node_active_ips WHERE user_id = ? AND last_seen < ?`
-      ).bind(userId, now - IP_IDLE_MS).run();
-    }
-
-    const row = await env.DB.prepare(
-      `SELECT COUNT(*) AS c FROM node_active_ips WHERE user_id = ?`
-    ).bind(userId).first();
-
-    const current = Number(row?.c) || 0;
-    if (current > maxIps) {
-      await env.DB.prepare(
-        `DELETE FROM node_active_ips WHERE user_id = ? AND ip = ?`
-      ).bind(userId, ipStr).run();
-      ipCache.delete(key);
-      return { ok: false, reason: 'ip limit', current, limit: maxIps };
-    }
-
-    ipCache.set(key, { at: now, ok: true });
-    if (ipCache.size > 500) {
-      ipCache.delete(ipCache.keys().next().value);
-    }
-    return { ok: true, current, limit: maxIps };
-  } catch (e) {
-    const msg = e?.message || '';
-    if (msg.includes('UNIQUE') || msg.includes('CONSTRAINT')) {
+        `UPDATE node_active_ips SET last_seen = ? WHERE user_id = ? AND ip = ?`
+      ).bind(now, userId, ipStr).run();
+      m.set(ipStr, now);
       ipCache.set(key, { at: now, ok: true });
-      return { ok: true, already: true };
+      return { ok: true, existing: true, current: known.size, limit: maxIps };
     }
-    console.log('tryAcquireIp:', msg);
-    return { ok: true, fallback: true };
+
+    // ظرفیت پر — IP جدید رد شود (هنوز insert نشده)
+    if (rows.length >= maxIps) {
+      console.log('ip-limit reject', userId, ipStr, 'have', rows.length, 'max', maxIps, rows.map((r) => r.ip));
+      return {
+        ok: false,
+        reason: 'ip limit',
+        current: rows.length,
+        limit: maxIps,
+        held: rows.map((r) => r.ip),
+        via: 'd1-pre',
+      };
+    }
+
+    // جا هست → ثبت
+    await env.DB.prepare(
+      `INSERT INTO node_active_ips (user_id, ip, last_seen) VALUES (?, ?, ?)
+       ON CONFLICT(user_id, ip) DO UPDATE SET last_seen = excluded.last_seen`
+    ).bind(userId, ipStr, now).run();
+
+    // تأیید بعد از insert (مقابل race دو isolate)
+    const listed2 = await env.DB.prepare(
+      `SELECT ip, last_seen FROM node_active_ips WHERE user_id = ? AND last_seen >= ? ORDER BY last_seen ASC`
+    ).bind(userId, cutoff).all();
+    const rows2 = listed2.results || [];
+
+    if (rows2.length > maxIps) {
+      // قدیمی‌ها را نگه دار، بقیه (از جمله IP جدید اگر جزو آخرهاست) را حذف کن
+      const keep = new Set(rows2.slice(0, maxIps).map((r) => String(r.ip)));
+      for (const r of rows2) {
+        const x = String(r.ip);
+        if (!keep.has(x)) {
+          await env.DB.prepare(
+            `DELETE FROM node_active_ips WHERE user_id = ? AND ip = ?`
+          ).bind(userId, x).run();
+        }
+      }
+      if (!keep.has(ipStr)) {
+        m.delete(ipStr);
+        ipCache.delete(key);
+        console.log('ip-limit race reject', userId, ipStr, 'kept', [...keep]);
+        return {
+          ok: false,
+          reason: 'ip limit',
+          current: rows2.length,
+          limit: maxIps,
+          via: 'd1-race',
+        };
+      }
+    }
+
+    m.set(ipStr, now);
+    ipCache.set(key, { at: now, ok: true });
+    if (ipCache.size > 500) ipCache.delete(ipCache.keys().next().value);
+    return { ok: true, current: Math.min(rows2.length, maxIps), limit: maxIps, via: 'd1' };
+  } catch (e) {
+    console.log('tryAcquireIp d1:', e?.message || e);
+    // fallback سخت‌گیرانه: فقط حافظه همین isolate
+    if (!m.has(ipStr) && m.size >= maxIps) {
+      return { ok: false, reason: 'ip limit', current: m.size, limit: maxIps, via: 'memory-fallback' };
+    }
+    m.set(ipStr, now);
+    ipCache.set(key, { at: now, ok: true });
+    return { ok: true, via: 'memory-fallback', current: m.size, limit: maxIps };
   }
 }
 
-/** تازه کردن last_seen برای IP فعال (سشن طولانی) */
 function touchActiveIp(env, userId, ip) {
-  if (!env?.DB || !userId || !ip) return;
-  const key = userId + '|' + String(ip);
+  if (!userId || !ip) return;
+  const ipStr = String(ip);
   const now = Date.now();
+  const m = memIps.get(userId);
+  if (m) m.set(ipStr, now);
+  const key = userId + '|' + ipStr;
   const cached = ipCache.get(key);
   if (cached && now - cached.at < IP_CACHE_TTL_MS) return;
   ipCache.set(key, { at: now, ok: true });
+  if (!env?.DB) return;
   const run = env.DB.prepare(`
     UPDATE node_active_ips SET last_seen = ? WHERE user_id = ? AND ip = ?
-  `).bind(now, userId, String(ip)).run().catch(() => {});
+  `).bind(now, userId, ipStr).run().catch(() => {});
   if (_ctx && typeof _ctx.waitUntil === 'function') _ctx.waitUntil(run);
 }
 
@@ -311,12 +440,83 @@ function generateChildId(url) {
   }
 }
 
+/**
+ * IP واقعی کلاینت روی Cloudflare Workers
+ * فقط CF-Connecting-IP قابل‌اعتماد است؛ XFF را فقط اگر شبیه IP عمومی معتبر بود استفاده می‌کنیم.
+ * IPهای private / loopback / link-local و رنج‌های شناخته‌شده لبه CF رد می‌شوند.
+ */
+function isValidPublicIp(ip) {
+  if (!ip || typeof ip !== 'string') return false;
+  const s = ip.trim();
+  // IPv4
+  const m4 = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m4) {
+    const a = [+m4[1], +m4[2], +m4[3], +m4[4]];
+    if (a.some((n) => n > 255)) return false;
+    // 0.0.0.0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16, 100.64/10 (CGNAT shared - keep? keep as public-ish)
+    if (a[0] === 0) return false;
+    if (a[0] === 10) return false;
+    if (a[0] === 127) return false;
+    if (a[0] === 169 && a[1] === 254) return false;
+    if (a[0] === 172 && a[1] >= 16 && a[1] <= 31) return false;
+    if (a[0] === 192 && a[1] === 168) return false;
+    if (a[0] === 100 && a[1] >= 64 && a[1] <= 127) return false; // CGNAT
+    // Cloudflare anycast تقریبی — این‌ها هرگز نباید به‌عنوان کلاینت ثبت شوند
+    // 104.16–104.31, 172.64–172.71, 173.245, 103.21.244, 141.101, 108.162, 190.93, 188.114, 197.234, 198.41, 162.158, 104.18
+    if (a[0] === 104 && a[1] >= 16 && a[1] <= 31) return false;
+    if (a[0] === 172 && a[1] >= 64 && a[1] <= 71) return false;
+    if (a[0] === 173 && a[1] === 245) return false;
+    if (a[0] === 103 && a[1] === 21 && a[2] === 244) return false;
+    if (a[0] === 141 && a[1] === 101) return false;
+    if (a[0] === 108 && a[1] === 162) return false;
+    if (a[0] === 190 && a[1] === 93) return false;
+    if (a[0] === 188 && a[1] === 114) return false;
+    if (a[0] === 197 && a[1] === 234) return false;
+    if (a[0] === 198 && a[1] === 41) return false;
+    if (a[0] === 162 && a[1] === 158) return false;
+    // 205.251.x AWS / بعضی anycast — 205.252 بعضی edgeهای واسط
+    // اگر کل 205.x را رد کنیم ممکن است کلاینت واقعی در این رنج باشد؛ فقط 205.251–205.255 مشکوک CF/AWS
+    if (a[0] === 205 && a[1] >= 251) return false;
+    return true;
+  }
+  // IPv6 ساده — رد کردن local/link
+  if (s.includes(':')) {
+    const low = s.toLowerCase();
+    if (low === '::1' || low.startsWith('fe80:') || low.startsWith('fc') || low.startsWith('fd')) return false;
+    // IPv4-mapped
+    const mapped = low.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+    if (mapped) return isValidPublicIp(mapped[1]);
+    return true;
+  }
+  return false;
+}
+
 function getClientIP(request) {
-  return (
-    request.headers.get('CF-Connecting-IP') ||
-    request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
-    '0.0.0.0'
-  );
+  try {
+    // ۱) منبع اصلی روی Workers
+    const cfIp = (request.headers.get('CF-Connecting-IP') || request.headers.get('cf-connecting-ip') || '').trim();
+    if (isValidPublicIp(cfIp)) return cfIp;
+
+    // ۲) True-Client-IP (اگر فعال باشد)
+    const trueIp = (request.headers.get('True-Client-IP') || request.headers.get('true-client-ip') || '').trim();
+    if (isValidPublicIp(trueIp)) return trueIp;
+
+    // ۳) X-Forwarded-For: از راست به چپ اولین IP عمومی معتبر (آخرین hop نزدیک کلاینت معمولاً سمت چپ است؛
+    // روی CF معمولاً XFF توسط خود CF نوشته می‌شود — باز هم فقط public معتبر)
+    const xff = request.headers.get('X-Forwarded-For') || request.headers.get('x-forwarded-for') || '';
+    if (xff) {
+      const parts = xff.split(',').map((p) => p.trim()).filter(Boolean);
+      for (const p of parts) {
+        if (isValidPublicIp(p)) return p;
+      }
+    }
+
+    // ۴) cf object (ندارد IP مستقیم معمولاً)
+  } catch (e) {
+    console.log('getClientIP err', e?.message || e);
+  }
+  // بدون IP معتبر — یک مقدار ثابت تا اسپم IPهای تصادفی نسازد
+  return '0.0.0.0';
 }
 
 function extractSecret(request) {
@@ -687,20 +887,25 @@ async function handleSync(request, env) {
   for (const u of users) {
     if (!u?.uuid || !u?.id) continue;
     const uuid = String(u.uuid).toLowerCase();
-    newMap.set(uuid, {
-      id: String(u.id), uuid, name: u.name || '',
-      enabled: u.enabled !== false, expiry: u.expiry || null,
-      quotaBytes: Number(u.quotaBytes) || 0,
-      dailyQuotaBytes: Number(u.dailyQuotaBytes) || 0,
-      speedLimitKBps: Math.max(0, Number(u.speedLimitKBps) || 0),
-      ipLimit: Math.max(0, Number(u.ipLimit) || 0), // 0 = unlimited
-      blockAds: u.blockAds !== false,
-    });
+    {
+      const lim = normalizeUserLimits(u);
+      newMap.set(uuid, {
+        id: String(u.id), uuid, name: u.name || '',
+        enabled: u.enabled !== false, expiry: u.expiry || null,
+        quotaBytes: Number(u.quotaBytes) || Number(u.quota_bytes) || 0,
+        dailyQuotaBytes: Number(u.dailyQuotaBytes) || Number(u.daily_quota_bytes) || 0,
+        speedLimitKBps: lim.speedLimitKBps,
+        ipLimit: lim.ipLimit,
+        blockAds: u.blockAds !== false && u.block_ads !== 0 && u.block_ads !== false,
+      });
+    }
   }
 
   usersByUuid = newMap;
   lastSyncAt = Date.now();
   ipCache.clear();
+  memIps.clear();
+  limiters.clear(); // تا speed limit جدید اعمال شود
   // کش DoH را نگه می‌داریم (دامنه‌ها تغییر نکرده‌اند)
 
   // قطع اجباری کاربرانی که دیگر در لیست نیستند / غیرفعال / منقضی
@@ -750,7 +955,493 @@ async function handleSync(request, env) {
   });
 }
 
-// ====================== VLESS WebSocket ======================
+// ====================== VLESS XHTTP (stream-one) ======================
+/**
+ * XHTTP stream-one روی Cloudflare Workers:
+ * - کلاینت یک POST می‌فرستد؛ بدنه = هدر VLESS + آپلود
+ * - پاسخ استریم = دانلود از مقصد
+ * سازگار با xhttpSettings.mode = "stream-one"
+ */
+function xlog(...args) {
+  try {
+    console.log('[xhttp]', ...args);
+  } catch {}
+}
+
+function hexPreview(buf, max = 32) {
+  try {
+    const u = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    const n = Math.min(u.length, max);
+    let s = '';
+    for (let i = 0; i < n; i++) s += u[i].toString(16).padStart(2, '0');
+    if (u.length > max) s += '…';
+    return s;
+  } catch {
+    return '?';
+  }
+}
+
+async function handleVlessXhttp(request, env, ctx) {
+  const t0 = Date.now();
+  const reqUrl = request.url || '';
+  const method = request.method || '';
+  const clientIP = getClientIP(request);
+  const ct = request.headers.get('content-type') || '';
+  const cl = request.headers.get('content-length') || '';
+  const te = request.headers.get('transfer-encoding') || '';
+  const hostH = request.headers.get('host') || '';
+  const ua = (request.headers.get('user-agent') || '').slice(0, 80);
+  const alpnHint = request.cf?.httpProtocol || request.headers.get('cf-visitor') || '';
+
+  xlog('IN', {
+    method,
+    url: String(reqUrl).slice(0, 180),
+    ip: clientIP,
+    host: hostH,
+    ct,
+    cl,
+    te,
+    ua,
+    alpn: alpnHint,
+    users: usersByUuid.size,
+    disabled: nodeDisabled,
+  });
+
+  try {
+    await ensureUsersLoaded(env);
+  } catch (e) {
+    xlog('ensureUsersLoaded err', e?.message || e);
+  }
+  if (nodeDisabled) {
+    xlog('REJECT nodeDisabled');
+    return new Response('Node disabled', { status: 503 });
+  }
+  if (!request.body) {
+    xlog('REJECT no body');
+    return new Response('body required', { status: 400 });
+  }
+
+  const envRef = env;
+  const bodyReader = request.body.getReader();
+
+  // خواندن هدر VLESS از ابتدای استریم
+  let headerBuf = new Uint8Array(0);
+  let remoteEarly = null;
+  let parsed = null;
+  let readChunks = 0;
+
+  const appendBuf = (a, b) => {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+  };
+
+  try {
+    while (headerBuf.length < 512) {
+      const { done, value } = await bodyReader.read();
+      readChunks++;
+      if (done && (!value || !value.byteLength)) {
+        xlog('body read done', { bufLen: headerBuf.length, chunks: readChunks });
+        break;
+      }
+      if (value && value.byteLength) {
+        headerBuf = appendBuf(headerBuf, value instanceof Uint8Array ? value : new Uint8Array(value));
+        xlog('body chunk', { n: value.byteLength, total: headerBuf.length, hex: hexPreview(value) });
+      }
+      if (headerBuf.length >= 24) {
+        const tryParse = parseVlessHeader(
+          headerBuf.buffer.slice(headerBuf.byteOffset, headerBuf.byteOffset + headerBuf.byteLength)
+        );
+        if (tryParse.ok) {
+          parsed = tryParse;
+          if (parsed.rest && parsed.rest.byteLength > 0) {
+            remoteEarly = new Uint8Array(parsed.rest);
+          }
+          xlog('VLESS header OK', {
+            uuid: parsed.uuid,
+            cmd: parsed.cmd,
+            addr: parsed.address,
+            port: parsed.port,
+            early: remoteEarly?.byteLength || 0,
+            headerBytes: headerBuf.length,
+            ms: Date.now() - t0,
+          });
+          break;
+        }
+        xlog('VLESS parse not yet', { bufLen: headerBuf.length, hex: hexPreview(headerBuf) });
+      }
+      if (done) break;
+      if (headerBuf.length > 4096) {
+        xlog('header buffer overflow', { bufLen: headerBuf.length, hex: hexPreview(headerBuf, 64) });
+        break;
+      }
+    }
+  } catch (e) {
+    xlog('read header EXCEPTION', e?.message || String(e));
+    return new Response('bad request', { status: 400 });
+  }
+
+  if (!parsed || !parsed.ok) {
+    xlog('REJECT invalid vless', {
+      bufLen: headerBuf.length,
+      chunks: readChunks,
+      hex: hexPreview(headerBuf, 64),
+      firstByte: headerBuf.length ? headerBuf[0] : null,
+      ms: Date.now() - t0,
+    });
+    try {
+      bodyReader.releaseLock();
+    } catch {}
+    return new Response('invalid vless', { status: 400 });
+  }
+
+  const userUuid = parsed.uuid.toLowerCase();
+  const cfg = getUserByUuid(userUuid);
+  if (!cfg) {
+    xlog('REJECT user not found / disabled / expired', {
+      uuid: userUuid,
+      loaded: usersByUuid.size,
+      hasKey: usersByUuid.has(userUuid),
+    });
+    try {
+      bodyReader.releaseLock();
+    } catch {}
+    return new Response('unauthorized', { status: 403 });
+  }
+  const userId = cfg.id;
+  xlog('user ok', { id: userId, name: cfg.name, ipLimit: cfg.ipLimit, speed: cfg.speedLimitKBps });
+
+  // DNS / DoT
+  const dnsAddrs = [
+    '1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4', '9.9.9.9',
+    'dns.google', 'dns.google.com', 'cloudflare-dns.com', 'dns.adguard.com',
+    'dns.quad9.net', 'dns.dnsforge.de', 'one.one.one.one', 'dns.cloudflare.com',
+  ];
+  const addrLower = String(parsed.address || '').toLowerCase();
+  const isDot = parsed.port === 853;
+  const isDnsRequest =
+    parsed.port === 53 ||
+    (parsed.cmd === 2 && (parsed.port === 53 || dnsAddrs.includes(addrLower)));
+
+  if (isDot) {
+    dnsStats.dotBlocked += 1;
+    xlog('REJECT DoT', { addr: parsed.address, port: parsed.port });
+    try {
+      bodyReader.releaseLock();
+    } catch {}
+    return new Response('dot blocked', { status: 403 });
+  }
+
+  if (parsed.cmd === 2 && !isDnsRequest) {
+    xlog('REJECT udp non-dns', { cmd: parsed.cmd, port: parsed.port });
+    try {
+      bodyReader.releaseLock();
+    } catch {}
+    return new Response('udp not supported', { status: 400 });
+  }
+  if (parsed.cmd !== 1 && parsed.cmd !== 2) {
+    xlog('REJECT bad cmd', { cmd: parsed.cmd });
+    try {
+      bodyReader.releaseLock();
+    } catch {}
+    return new Response('only TCP', { status: 400 });
+  }
+
+  // IP limit
+  const acq = await tryAcquireIp(envRef, userId, clientIP, cfg.ipLimit);
+  if (!acq.ok) {
+    xlog('REJECT ip limit', { userId, clientIP, acq });
+    try {
+      bodyReader.releaseLock();
+    } catch {}
+    return new Response('ip limit', { status: 429 });
+  }
+  xlog('ip ok', acq);
+
+  const userBlockAds = cfg.blockAds === true;
+  const limiter = getLimiter(userUuid, cfg.speedLimitKBps);
+  let bytesUp = 0;
+  let bytesDown = 0;
+  let sessionBytes = 0;
+  let lastReported = 0;
+  let closed = false;
+
+  activeConns.set(userUuid, (activeConns.get(userUuid) || 0) + 1);
+  const sessionRef = {
+    close: () => {
+      closed = true;
+    },
+  };
+  if (!activeSessions.has(userUuid)) activeSessions.set(userUuid, new Set());
+  activeSessions.get(userUuid).add(sessionRef);
+
+  const flushUsage = () => {
+    if (!userId || bytesUp + bytesDown === 0) return;
+    const u = bytesUp;
+    const d = bytesDown;
+    bytesUp = 0;
+    bytesDown = 0;
+    ctx.waitUntil(dbAddUsage(envRef, userId, u, d).catch(() => {}));
+  };
+
+  const maybeReport = () => {
+    if (sessionBytes - lastReported >= REPORT_THRESHOLD) {
+      flushUsage();
+      lastReported = sessionBytes;
+      if (userId) touchActiveIp(envRef, userId, clientIP);
+    }
+  };
+
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    activeConns.set(userUuid, Math.max(0, (activeConns.get(userUuid) || 1) - 1));
+    flushUsage();
+    if (activeSessions.has(userUuid)) {
+      const set = activeSessions.get(userUuid);
+      set.delete(sessionRef);
+      if (set.size === 0) activeSessions.delete(userUuid);
+    }
+    xlog('cleanup', {
+      userId,
+      up: bytesUp,
+      down: bytesDown,
+      session: sessionBytes,
+      ms: Date.now() - t0,
+    });
+  };
+
+  // DNS mode via DoH — پاسخ مستقیم در body
+  if (isDnsRequest) {
+    xlog('DNS mode', { addr: parsed.address, port: parsed.port, early: remoteEarly?.byteLength || 0 });
+    try {
+      const queries = [];
+      if (remoteEarly && remoteEarly.byteLength > 0) {
+        queries.push(remoteEarly);
+      }
+      for (;;) {
+        const { done, value } = await bodyReader.read();
+        if (value && value.byteLength) {
+          queries.push(value instanceof Uint8Array ? value : new Uint8Array(value));
+        }
+        if (done) break;
+      }
+      let all = new Uint8Array(0);
+      for (const q of queries) all = appendBuf(all, q);
+
+      const parts = [];
+      let usedLengthPrefix = false;
+      if (all.byteLength >= 2) {
+        let off = 0;
+        while (off + 2 <= all.byteLength) {
+          const len = (all[off] << 8) | all[off + 1];
+          if (len < 12 || off + 2 + len > all.byteLength) break;
+          parts.push(all.subarray(off + 2, off + 2 + len));
+          off += 2 + len;
+          usedLengthPrefix = true;
+        }
+      }
+      if (!parts.length && all.byteLength >= 12) {
+        parts.push(all);
+        usedLengthPrefix = false;
+      }
+
+      const outChunks = [];
+      outChunks.push(new Uint8Array([0, 0]));
+      for (const query of parts) {
+        if (limiter.enabled) await limiter.take(query.byteLength);
+        bytesUp += query.byteLength;
+        sessionBytes += query.byteLength;
+        const resp = await dohResolve(query, userBlockAds);
+        if (!resp || resp.byteLength < 12) continue;
+        let out;
+        if (usedLengthPrefix) {
+          out = new Uint8Array(2 + resp.byteLength);
+          out[0] = (resp.byteLength >> 8) & 0xff;
+          out[1] = resp.byteLength & 0xff;
+          out.set(resp, 2);
+        } else {
+          out = resp;
+        }
+        if (limiter.enabled) await limiter.take(out.byteLength);
+        bytesDown += out.byteLength;
+        sessionBytes += out.byteLength;
+        outChunks.push(out);
+      }
+      maybeReport();
+      cleanup();
+
+      let totalLen = 0;
+      for (const c of outChunks) totalLen += c.byteLength;
+      const body = new Uint8Array(totalLen);
+      let o = 0;
+      for (const c of outChunks) {
+        body.set(c, o);
+        o += c.byteLength;
+      }
+      xlog('DNS response', { parts: parts.length, outLen: totalLen, ms: Date.now() - t0 });
+      return new Response(body, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Cache-Control': 'no-store',
+          'X-Accel-Buffering': 'no',
+        },
+      });
+    } catch (e) {
+      xlog('DNS fail', e?.message || e);
+      cleanup();
+      return new Response('dns fail', { status: 502 });
+    }
+  }
+
+  // ad-block
+  if (cfg.blockAds === true && (await isAdHost(parsed.address))) {
+    xlog('REJECT ad blocked', { host: parsed.address });
+    cleanup();
+    try {
+      bodyReader.releaseLock();
+    } catch {}
+    return new Response('ad blocked', { status: 403 });
+  }
+
+  // TCP connect
+  let remoteSocket;
+  try {
+    xlog('connect start', { host: parsed.address, port: parsed.port });
+    remoteSocket = connect({ hostname: parsed.address, port: parsed.port });
+    xlog('connect opened', { host: parsed.address, port: parsed.port, ms: Date.now() - t0 });
+  } catch (e) {
+    xlog('connect FAIL', { host: parsed.address, port: parsed.port, err: e?.message || String(e) });
+    cleanup();
+    try {
+      bodyReader.releaseLock();
+    } catch {}
+    return new Response('connect fail', { status: 502 });
+  }
+
+  const remoteWriter = remoteSocket.writable.getWriter();
+
+  // آپلود: early data + باقی bodyReader → remote
+  const uploadDone = (async () => {
+    try {
+      if (remoteEarly && remoteEarly.byteLength > 0) {
+        if (limiter.enabled) await limiter.take(remoteEarly.byteLength);
+        bytesUp += remoteEarly.byteLength;
+        sessionBytes += remoteEarly.byteLength;
+        await remoteWriter.write(remoteEarly);
+        maybeReport();
+        xlog('upload early', { n: remoteEarly.byteLength });
+      }
+      while (!closed) {
+        const { done, value } = await bodyReader.read();
+        if (value && value.byteLength) {
+          const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+          if (limiter.enabled) await limiter.take(chunk.byteLength);
+          bytesUp += chunk.byteLength;
+          sessionBytes += chunk.byteLength;
+          maybeReport();
+          await remoteWriter.write(chunk);
+        }
+        if (done) {
+          xlog('upload body done', { up: bytesUp });
+          break;
+        }
+        if (userUuid && !getUserByUuid(userUuid)) {
+          xlog('upload stop: user revoked');
+          closed = true;
+          break;
+        }
+      }
+    } catch (e) {
+      xlog('upload ERR', e?.message || String(e));
+    } finally {
+      try {
+        await remoteWriter.close();
+      } catch {}
+      try {
+        bodyReader.releaseLock();
+      } catch {}
+      xlog('upload finally', { up: bytesUp, ms: Date.now() - t0 });
+    }
+  })();
+
+  // دانلود: remote → response stream (+ هدر پاسخ VLESS اول)
+  const { readable, writable } = new TransformStream();
+  const downWriter = writable.getWriter();
+
+  const downloadDone = (async () => {
+    try {
+      await downWriter.write(new Uint8Array([0, 0]));
+      xlog('download sent vless ok header');
+      const reader = remoteSocket.readable.getReader();
+      while (!closed) {
+        const { done, value } = await reader.read();
+        if (value && value.byteLength) {
+          const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+          if (userUuid && !getUserByUuid(userUuid)) {
+            xlog('download stop: user revoked');
+            closed = true;
+            break;
+          }
+          if (limiter.enabled) await limiter.take(chunk.byteLength);
+          bytesDown += chunk.byteLength;
+          sessionBytes += chunk.byteLength;
+          maybeReport();
+          await downWriter.write(chunk);
+        }
+        if (done) {
+          xlog('download remote done', { down: bytesDown });
+          break;
+        }
+      }
+      try {
+        reader.releaseLock();
+      } catch {}
+    } catch (e) {
+      xlog('download ERR', e?.message || String(e));
+    } finally {
+      try {
+        await downWriter.close();
+      } catch {}
+      try {
+        remoteSocket.close();
+      } catch {}
+      cleanup();
+    }
+  })();
+
+  ctx.waitUntil(
+    Promise.allSettled([uploadDone, downloadDone]).then((results) => {
+      xlog('session settled', {
+        up: results[0]?.status,
+        down: results[1]?.status,
+        bytesUp,
+        bytesDown,
+        ms: Date.now() - t0,
+      });
+      cleanup();
+    })
+  );
+
+  xlog('RESPONSE stream start', {
+    dest: `${parsed.address}:${parsed.port}`,
+    userId,
+    ms: Date.now() - t0,
+  });
+
+  return new Response(readable, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'Cache-Control': 'no-store',
+      'X-Accel-Buffering': 'no',
+    },
+  });
+}
+
+// ====================== VLESS WebSocket (legacy fallback) ======================
 async function handleVlessWebSocket(request, env, ctx) {
   if ((request.headers.get('Upgrade') || '').toLowerCase() !== 'websocket') {
     return new Response('Expected Upgrade: websocket', { status: 426 });
@@ -1131,17 +1822,43 @@ export default {
         let activeUsersCount = 0;
         for (const c of activeConns.values()) if (c > 0) activeUsersCount++;
         return new Response(JSON.stringify({
-          ok: true, id: childId, version: VERSION, mode: 'push-d1-doh-dns',
+          ok: true, id: childId, version: VERSION, mode: 'push-d1-doh-xhttp',
+          transport: ['xhttp', 'ws'],
           activeUsers: Math.max(activeUsersCount, ips.length),
           usersLoaded: usersByUuid.size, activeIpEntries: ips.length,
           nodeDisabled, lastSyncAt: lastSyncAt || null, hasDB: !!env.DB,
           doh: DOH_URL, dohClean: DOH_CLEAN_URL, dohCacheSize: dohCache.size,
           dns: { ...dnsStats },
+          limits: Array.from(usersByUuid.values()).slice(0, 20).map((u) => ({
+            id: u.id,
+            ipLimit: u.ipLimit,
+            speedLimitKBps: u.speedLimitKBps,
+            blockAds: u.blockAds,
+          })),
+          memIpUsers: memIps.size,
         }), { headers: { 'content-type': 'application/json' } });
       }
 
+      // XHTTP stream-one: هر POST غیر از /sync (با body)
+      if (request.method === 'POST' && request.body) {
+        console.log('[route] POST → xhttp', path, request.headers.get('host'), getClientIP(request));
+        return handleVlessXhttp(request, env, ctx);
+      }
+
+      // WebSocket legacy (برای سازگاری موقت)
       if (isWs) {
+        console.log('[route] WS → vless', path, getClientIP(request));
         return handleVlessWebSocket(request, env, ctx);
+      }
+
+      // سایر متدها — برای دیباگ اینکه کلاینت چه می‌فرستد
+      if (path !== '/' && path !== '/version' && path !== '/health') {
+        console.log('[route] OTHER', request.method, path, {
+          host: request.headers.get('host'),
+          upgrade: request.headers.get('upgrade'),
+          ct: request.headers.get('content-type'),
+          ip: getClientIP(request),
+        });
       }
 
       if (path === '/') return serveStatusPage(childId);
@@ -1149,7 +1866,7 @@ export default {
       if (path === '/version') {
         await ensureUsersLoaded(env);
         return new Response(JSON.stringify({
-          version: VERSION, role: 'node', mode: 'push-d1-doh-dns', id: childId,
+          version: VERSION, role: 'node', mode: 'push-d1-doh-xhttp', id: childId,
           usersLoaded: usersByUuid.size, nodeDisabled,
           lastSyncAt: lastSyncAt || null, hasDB: !!env.DB,
           doh: DOH_URL, dohClean: DOH_CLEAN_URL,
