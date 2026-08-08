@@ -9,8 +9,8 @@
 // 1) Mother control-plane for a distributed VLESS proxy panel
 // 2) Telegram bot for admins and end-users (shop / support / services)
 // 3) D1-backed API for child proxy nodes (heartbeat, connect, usage, IP limits)
-// 4) Subscription generator (/pull?token=UUID) that builds VLESS links pointing
-//    at healthy child workers
+// 4) Subscription generator (/pull?token=UUID) that builds full Xray JSON configs
+//    (VLESS over WS+TLS) pointing at healthy child workers
 
 // Architecture:
 //   Telegram users  <->  Mother Worker (bot + D1 + /pull + /api)
@@ -205,7 +205,7 @@
 //   All real links use child hostname as WS host/SNI, path /?u=USERID
 
 // Domains: ensureDomainsList (GitHub list), ensureIrcfResolved (DNS A cache)
-// buildVlessLink / buildInfoLink / formatBytesShort / daysRemaining
+// buildXrayJsonConfig / buildInfoXrayConfig / formatBytesShort / daysRemaining
 
 // --------------------------------------------------------------------------------
 // CHILD WORKER (separate script childWorker.js) — expected behavior
@@ -243,8 +243,8 @@
 
 // END OF MAP
 // ================================================================================
-const VERSION = "mother-bot-3.11-push";
-const BOT_VERSION = "3.9.0";
+const VERSION = "3.16.1-ws-lb";
+const BOT_VERSION = "3.11.0";
 const TG = "https://api.telegram.org";
 const CF_API = "https://api.cloudflare.com/client/v4";
 const CHILD_WORKER_URL = "https://raw.githubusercontent.com/isfwic10-arch/babysaow/refs/heads/main/childWorker.js";
@@ -257,6 +257,38 @@ const SUB_PATH = "/pull";
 const NODE_TTL = 1 * 60 * 1000; // ۱ دقیقه بدون پاسخ → آفلاین
 const IP_IDLE_MS = 5 * 60 * 1000;
 const API_SECRET = "saow-pan2";
+const BACKUP_INTERVAL_MS = 60 * 60 * 1000; // تست: هر ۲ دقیقه (بعداً برگردان به 60*60*1000)
+
+/** نوار پیشرفت گرافیکی ▰▱ */
+function progressBar(percent, width = 10) {
+  const p = Math.max(0, Math.min(100, Number(percent) || 0));
+  const filled = Math.round((p / 100) * width);
+  return "▰".repeat(filled) + "▱".repeat(width - filled);
+}
+
+/** متن مرحله ساخت/آپدیت نود */
+function progressText(title, step, total, label) {
+  const pct = Math.round((step / total) * 100);
+  return (
+    `${title}\n\n` +
+    `${progressBar(pct)} <b>${faNum(pct)}٪</b>\n\n` +
+    `⏳ مرحله ${faNum(step)}/${faNum(total)} — ${label}`
+  );
+}
+
+/** نوار مصرف درخواست روزانه مادر (سقف پیش‌فرض ۱۰۰هزار) */
+function motherUsageBar(reqs, limit = 100000) {
+  if (reqs == null || !Number.isFinite(Number(reqs))) {
+    return "📈 درخواست امروز مادر: <b>—</b>";
+  }
+  const n = Number(reqs);
+  const pct = Math.min(100, Math.round((n / limit) * 100));
+  return (
+    `📈 درخواست امروز مادر: <b>${n.toLocaleString("fa-IR")}</b>\n` +
+    `${progressBar(pct)} <b>${faNum(pct)}٪</b> از ${Number(limit).toLocaleString("fa-IR")}`
+  );
+}
+
 
 // ====================== Main Entry ======================
 export default {
@@ -310,13 +342,19 @@ export default {
         ctx.waitUntil(ensureDomainsList());
         ctx.waitUntil(ensureIrcfResolved());
         const body = await generateSubscription(env, user, url.hostname);
-        return new Response(body, {
-          headers: {
-            "content-type": "text/plain; charset=utf-8",
-            "cache-control": "no-store",
-            "profile-update-interval": "6",
-          },
-        });
+        // یک آبجکت JSON معتبر — سازگار با import در v2rayNG (Custom configuration)
+        const headers = {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+          "profile-update-interval": "6",
+        };
+        try {
+          const titleBytes = new TextEncoder().encode(String(user.name || "SAOW").slice(0, 64));
+          let bin = "";
+          for (const b of titleBytes) bin += String.fromCharCode(b);
+          headers["profile-title"] = "base64:" + btoa(bin);
+        } catch {}
+        return new Response(body, { headers });
       }
 
       if (path === "/") {
@@ -324,7 +362,7 @@ export default {
       }
 
       if (path === "/version") {
-        return json({ v: VERSION, r: "core+bot+push" });
+        return json({ v: VERSION, r: "core+bot+push+monitor" });
       }
 
       return new Response("Not Found", { status: 404 });
@@ -334,9 +372,14 @@ export default {
     }
   },
 
-  // Cron Trigger: هر دقیقه یک Full Sync کامل
+  // Cron Trigger: هر دقیقه Full Sync + مانیتور
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(fullSyncAll(env));
+    ctx.waitUntil(
+      (async () => {
+        await fullSyncAll(env);
+        await runMonitorTasks(env);
+      })()
+    );
   },
 };
 
@@ -498,6 +541,210 @@ async function processChildReport(env, node, report) {
 /** فراخوانی همگام‌سازی پس از تغییرات مدیریتی (بدون مسدود کردن پاسخ تلگرام) */
 function triggerSync(env) {
   fullSyncAll(env).catch((e) => console.log("triggerSync:", e?.message));
+}
+
+
+// ====================== Monitor (بکاپ خودکار + اعلان قطع نود) ======================
+
+async function getMonitorConfig(env) {
+  return {
+    autoBackup: (await getShopSetting(env, "monitor_auto_backup", "0")) === "1",
+    nodeAlert: (await getShopSetting(env, "monitor_node_alert", "0")) === "1",
+    lastBackupAt: parseInt(await getShopSetting(env, "monitor_last_backup_at", "0"), 10) || 0,
+  };
+}
+
+async function runMonitorTasks(env) {
+  if (!(await d1Ready(env))) return;
+  try {
+    const cfg = await getMonitorConfig(env);
+
+    // ۱) بکاپ خودکار (فاصله: BACKUP_INTERVAL_MS)
+    if (cfg.autoBackup) {
+      const now = Date.now();
+      if (now - cfg.lastBackupAt >= BACKUP_INTERVAL_MS) {
+        await sendAutoBackupToAdmins(env);
+        await setShopSetting(env, "monitor_last_backup_at", String(now));
+      }
+    }
+
+    // ۲) مانیتور قطع شدن نود
+    if (cfg.nodeAlert) {
+      await checkNodesAndAlert(env);
+    }
+  } catch (e) {
+    console.error("runMonitorTasks:", e?.message);
+  }
+}
+
+async function sendAutoBackupToAdmins(env) {
+  try {
+    const backup = await createFullBackup(env);
+    const jsonStr = JSON.stringify(backup, null, 2);
+    const filename = `saow-backup-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.json`;
+
+    const adminIds = (env.ADMIN_IDS || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+
+    if (!adminIds.length) {
+      console.error("sendAutoBackup: ADMIN_IDS empty");
+      throw new Error("ADMIN_IDS خالی است — در Variables ورکر تنظیم کنید");
+    }
+    if (!env.BOT_TOKEN) {
+      throw new Error("BOT_TOKEN تنظیم نشده");
+    }
+
+    const intervalMin = Math.round(BACKUP_INTERVAL_MS / 60000);
+    let sent = 0;
+    let lastErr = "";
+
+    for (const adminId of adminIds) {
+      const form = new FormData();
+      form.append("chat_id", adminId);
+      form.append(
+        "document",
+        new Blob([jsonStr], { type: "application/json" }),
+        filename
+      );
+      form.append(
+        "caption",
+        `💾 <b>بکاپ خودکار (هر ${intervalMin} دقیقه)</b>\n` +
+          `📅 ${new Date().toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })}\n` +
+          `👥 کاربران: ${(backup.tables?.users || []).length}\n` +
+          `🖥 نودها: ${(backup.tables?.managed_nodes || []).length}`
+      );
+      form.append("parse_mode", "HTML");
+
+      const res = await fetch(`${TG}/bot${env.BOT_TOKEN}/sendDocument`, {
+        method: "POST",
+        body: form,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data.ok) {
+        sent++;
+      } else {
+        lastErr = data.description || `HTTP ${res.status}`;
+        console.error("sendDocument fail:", adminId, lastErr);
+      }
+    }
+
+    if (!sent) {
+      throw new Error(lastErr || "هیچ ادمینی بکاپ دریافت نکرد");
+    }
+    console.log(`auto backup sent to ${sent}/${adminIds.length} admins`);
+  } catch (e) {
+    console.error("sendAutoBackupToAdmins:", e?.message);
+    throw e;
+  }
+}
+
+async function checkNodesAndAlert(env) {
+  try {
+    const managed = await getManagedNodes(env);
+    if (!managed.length) return;
+
+    const alive = await getHealthyChildren(env);
+    const currentOnline = new Set();
+
+    for (const m of managed) {
+      if (m.is_disabled === 1) continue;
+      const isLive = alive.some(
+        (a) =>
+          a.id.includes(m.script_name) ||
+          (m.url && a.id.includes(String(m.script_name || "").replace(/-/g, ""))) ||
+          (m.url && a.url && String(a.url).includes(m.script_name))
+      );
+      if (isLive) currentOnline.add(m.script_name || m.id);
+    }
+
+    // وضعیت قبلی
+    let prevOnline = [];
+    try {
+      const raw = await getShopSetting(env, "monitor_prev_online", "[]");
+      prevOnline = JSON.parse(raw || "[]");
+      if (!Array.isArray(prevOnline)) prevOnline = [];
+    } catch {
+      prevOnline = [];
+    }
+
+    const prevSet = new Set(prevOnline);
+    const wentOffline = [];
+
+    for (const name of prevSet) {
+      if (!currentOnline.has(name)) {
+        const stillManaged = managed.find(
+          (m) => (m.script_name === name || m.id === name) && m.is_disabled !== 1
+        );
+        if (stillManaged) wentOffline.push(name);
+      }
+    }
+
+    // ذخیره وضعیت فعلی
+    await setShopSetting(env, "monitor_prev_online", JSON.stringify([...currentOnline]));
+
+    if (!wentOffline.length) return;
+
+    const adminIds = (env.ADMIN_IDS || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+
+    const list = wentOffline.map((n) => `• <code>${escape(n)}</code>`).join("\n");
+    const text =
+      `🔴 <b>هشدار قطع نود</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `نود(های) زیر قطع شدند:\n${list}\n\n` +
+      `📅 ${new Date().toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })}`;
+
+    for (const adminId of adminIds) {
+      await send(adminId, text, env, [
+        [{ text: "🖥 وضعیت نودها", callback_data: "nodes" }],
+        [{ text: "📡 مانیتور", callback_data: "monitor" }],
+      ]);
+    }
+  } catch (e) {
+    console.error("checkNodesAndAlert:", e?.message);
+  }
+}
+
+async function showBackupMenu(chatId, env, msgId = null) {
+  const cfg = await getMonitorConfig(env);
+  const lastBackup =
+    cfg.lastBackupAt > 0
+      ? new Date(cfg.lastBackupAt).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })
+      : "هنوز ارسال نشده";
+  const intervalMin = Math.round(BACKUP_INTERVAL_MS / 60000);
+
+  const text =
+    `💾 <b>بکاپ و بازیابی</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `بکاپ خودکار: ${cfg.autoBackup ? "🟢 روشن" : "🔴 خاموش"}\n` +
+    `بازه: هر <b>${faNum(intervalMin)}</b> دقیقه\n` +
+    `آخرین ارسال: <code>${escape(lastBackup)}</code>\n\n` +
+    `خروجی کامل کاربران، نودها، فروشگاه و اکانت‌ها.`;
+
+  const kb = [
+    [
+      { text: "📤 خروجی بکاپ", callback_data: "backup_db" },
+      { text: "📥 ایمپورت بکاپ", callback_data: "import_backup" },
+    ],
+    [{ text: "──────────", callback_data: "noop" }],
+    [
+      {
+        text: cfg.autoBackup ? "🔴 خاموش بکاپ خودکار" : "🟢 روشن بکاپ خودکار",
+        callback_data: "monitor_toggle_backup",
+      },
+    ],
+    [{ text: "⚡ ارسال بکاپ الان", callback_data: "monitor_send_backup_now" }],
+    [{ text: "🔙 منو اصلی", callback_data: "main" }],
+  ];
+  return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
+}
+
+async function showMonitor(chatId, env, msgId = null) {
+  return showBackupMenu(chatId, env, msgId);
 }
 
 
@@ -1135,7 +1382,16 @@ async function serveSubPage(request, env, user, url) {
   const country = request.cf?.country || "—";
 
   const linksText = await generateSubscription(env, user, url.hostname);
-  const links = linksText.split("\n").filter((l) => l.startsWith("vless://"));
+  // ساب = یک کانفیگ JSON کامل
+  let links = [];
+  try {
+    const cfg = JSON.parse(linksText);
+    const outbound = cfg?.outbounds?.find((o) => o.tag === "proxy");
+    const addr = outbound?.settings?.vnext?.[0]?.address || "—";
+    links = [cfg.remarks || user.name || "SAOW", `server: ${addr}`];
+  } catch {
+    links = ["JSON config"];
+  }
 
   const usedGB = full.usage?.totalGB || 0;
   const quotaGB = user.quotaBytes > 0 ? +(user.quotaBytes / 1073741824).toFixed(2) : 0;
@@ -1699,10 +1955,7 @@ async function showShopAdmin(chatId, env, msgId = null) {
       { text: cfg.enabled ? "🔴 تعطیل فروش" : "🟢 باز کردن فروش", callback_data: "shop_toggle" },
       { text: cfg.forceJoin ? "🔓 خاموش قفل" : "🔒 روشن قفل", callback_data: "shop_force_toggle" },
     ],
-    [
-      { text: "💳 کارت", callback_data: "shop_set_card" },
-      { text: "💬 پشتیبانی", callback_data: "shop_support" },
-    ],
+    [{ text: "💳 شماره کارت", callback_data: "shop_set_card" }],
     [
       { text: "📢 آیدی کانال", callback_data: "shop_channel" },
       { text: "🔗 لینک کانال", callback_data: "shop_channel_link" },
@@ -1713,9 +1966,9 @@ async function showShopAdmin(chatId, env, msgId = null) {
     ],
     [
       { text: "🧾 سفارش‌ها", callback_data: "shop_orders" },
-      { text: "📝 متن‌ها", callback_data: "shop_texts" },
+      { text: "📝 متن‌ها و پشتیبانی", callback_data: "shop_texts" },
     ],
-    [{ text: "🔙 منو ادمین", callback_data: "main" }],
+    [{ text: "🔙 منو اصلی", callback_data: "main" }],
   ];
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
@@ -2550,7 +2803,6 @@ async function handleMessage(msg, env) {
     if (replyText.includes("توکن API کلودفلر را ارسال کنید") || replyText.includes("توکن کلودفلر را ارسال کنید")) {
       const token = text.trim();
       if (!token || token.length < 30) return send(chatId, "❌ توکن نامعتبر است.", env);
-      await send(chatId, "⏳ در حال ساخت نود... لطفاً صبر کنید.", env);
       return createCloudflareNode(chatId, token, env);
     }
 
@@ -2655,20 +2907,7 @@ async function handleMessage(msg, env) {
     }
 
     if (text && !text.startsWith("/")) {
-      const uuid = extractUuidFromText(text);
-      if (uuid) {
-        const user = await getUserByUuid(env, uuid);
-        if (user) return showUser(chatId, user.id, env);
-      }
-
-      const found = await findUserByText(text, env);
-      if (found) return showUser(chatId, found, env);
-
-      const looksLikeVless = /^vless:\/\//i.test(text.trim());
-      if (!looksLikeVless) {
-        const node = await findManagedNodeByText(text, env);
-        if (node) return showNodeDetail(chatId, node, env);
-      }
+      return handleGlobalSearch(chatId, text, env);
     }
 
     if (text === "/start" || text === "/menu" || text === "منو") {
@@ -2747,6 +2986,74 @@ function extractIdFromReply(replyText) {
   return match ? match[1] : null;
 }
 
+async function handleGlobalSearch(chatId, text, env) {
+  const q = String(text || "").trim();
+  if (!q) return showMain(chatId, env);
+
+  const uuid = extractUuidFromText(q);
+  if (uuid) {
+    const user = await getUserByUuid(env, uuid);
+    if (user) return showUser(chatId, user.id, env);
+  }
+
+  const needle = q.toLowerCase();
+  const users = await getUsers(env);
+  const matchedUsers = [];
+  for (const u of users) {
+    const hay = [u.id, u.name, u.uuid, u.notes, u.cleanIp, u.forcedNode]
+      .map((x) => String(x || "").toLowerCase())
+      .join(" ");
+    if (hay.includes(needle)) matchedUsers.push(u);
+  }
+
+  const managed = await getManagedNodes(env);
+  const matchedNodes = [];
+  for (const n of managed) {
+    const hay = [n.id, n.script_name, n.url, n.account_id, n.db_name, n.db_id]
+      .map((x) => String(x || "").toLowerCase())
+      .join(" ");
+    if (hay.includes(needle)) matchedNodes.push(n);
+  }
+
+  if (matchedUsers.length === 1 && !matchedNodes.length) {
+    return showUser(chatId, matchedUsers[0].id, env);
+  }
+  if (matchedNodes.length === 1 && !matchedUsers.length) {
+    return showNodeDetail(chatId, matchedNodes[0], env);
+  }
+
+  if (!matchedUsers.length && !matchedNodes.length) {
+    return send(
+      chatId,
+      `🔍 نتیجه‌ای برای <code>${escape(q)}</code> پیدا نشد.\n\nدر نام، UUID، یادداشت کاربران و نام/آدرس نودها جستجو شد.`,
+      env,
+      [[{ text: "🏠 منو", callback_data: "main" }]]
+    );
+  }
+
+  let msg = `🔍 <b>نتایج جستجو</b>\n<code>${escape(q)}</code>\n\n`;
+  const kb = [];
+  if (matchedUsers.length) {
+    msg += `👥 کاربران: <b>${faNum(matchedUsers.length)}</b>\n`;
+    for (const u of matchedUsers.slice(0, 12)) {
+      kb.push([{ text: `👤 ${u.name || u.id}`.slice(0, 60), callback_data: `user:${u.id}` }]);
+    }
+  }
+  if (matchedNodes.length) {
+    msg += `🖥 نودها: <b>${faNum(matchedNodes.length)}</b>\n`;
+    for (const n of matchedNodes.slice(0, 12)) {
+      kb.push([
+        {
+          text: `🖥 ${n.script_name || n.id}`.slice(0, 60),
+          callback_data: `node_detail:${n.id}`,
+        },
+      ]);
+    }
+  }
+  kb.push([{ text: "🏠 منو", callback_data: "main" }]);
+  return send(chatId, msg, env, kb);
+}
+
 async function findUserByText(text, env) {
   let uuid = null;
   if (text.startsWith("vless://")) {
@@ -2779,6 +3086,56 @@ async function handleCallback(cq, env) {
   // همیشه اول answer بزن
   await answer(cq.id, "", env);
 
+  if (data === "noop") return;
+
+  // ==================== Backup / Monitor toggles ====================
+  if (data === "monitor" || data === "backup_menu") return showBackupMenu(chatId, env, msgId);
+  if (data === "monitor_toggle_backup") {
+    const cur = (await getShopSetting(env, "monitor_auto_backup", "0")) === "1";
+    await setShopSetting(env, "monitor_auto_backup", cur ? "0" : "1");
+    if (!cur) {
+      await setShopSetting(env, "monitor_last_backup_at", "0");
+    }
+    return showBackupMenu(chatId, env, msgId);
+  }
+  if (data === "monitor_toggle_node") {
+    const cur = (await getShopSetting(env, "monitor_node_alert", "0")) === "1";
+    await setShopSetting(env, "monitor_node_alert", cur ? "0" : "1");
+    if (!cur) {
+      try {
+        const managed = await getManagedNodes(env);
+        const alive = await getHealthyChildren(env);
+        const online = [];
+        for (const m of managed) {
+          if (m.is_disabled === 1) continue;
+          const isLive = alive.some(
+            (a) =>
+              a.id.includes(m.script_name) ||
+              (m.url && a.url && String(a.url).includes(m.script_name))
+          );
+          if (isLive) online.push(m.script_name || m.id);
+        }
+        await setShopSetting(env, "monitor_prev_online", JSON.stringify(online));
+      } catch {}
+    }
+    return showNodesManage(chatId, env, msgId);
+  }
+  if (data === "monitor_send_backup_now") {
+    await edit(chatId, msgId, "⏳ در حال ساخت و ارسال بکاپ...", env);
+    try {
+      await sendAutoBackupToAdmins(env);
+      await setShopSetting(env, "monitor_last_backup_at", String(Date.now()));
+      return edit(chatId, msgId, "✅ بکاپ ارسال شد.", env, [
+        [{ text: "💾 بکاپ و بازیابی", callback_data: "backup_menu" }],
+        [{ text: "🏠 منو", callback_data: "main" }],
+      ]);
+    } catch (e) {
+      return edit(chatId, msgId, `❌ خطا:\n<code>${escape(e.message)}</code>`, env, [
+        [{ text: "🔙", callback_data: "backup_menu" }],
+      ]);
+    }
+  }
+
   // ==================== Backup / Import / Update All ====================
   if (data === "backup_db") {
     try {
@@ -2801,11 +3158,12 @@ async function handleCallback(cq, env) {
       if (!dataRes.ok) throw new Error(dataRes.description || "sendDocument failed");
 
       return edit(chatId, msgId, `✅ بکاپ ارسال شد.\nفایل: <code>${escape(fileName)}</code>`, env, [
+        [{ text: "💾 بکاپ و بازیابی", callback_data: "backup_menu" }],
         [{ text: "🔙 منو", callback_data: "main" }],
       ]);
     } catch (e) {
       return edit(chatId, msgId, `❌ خطا در بکاپ:\n<code>${escape(e.message)}</code>`, env, [
-        [{ text: "🔙", callback_data: "main" }],
+        [{ text: "🔙", callback_data: "backup_menu" }],
       ]);
     }
   }
@@ -2813,7 +3171,7 @@ async function handleCallback(cq, env) {
   if (data === "import_backup") {
     await setUserState(env, userId, { step: "waiting_backup_import" });
     return edit(chatId, msgId, "📁 فایل بکاپ JSON را همین‌جا ارسال کنید.\n\nانصراف: /start", env, [
-      [{ text: "❌ انصراف", callback_data: "main" }],
+      [{ text: "❌ انصراف", callback_data: "backup_menu" }],
     ]);
   }
 
@@ -2972,12 +3330,15 @@ async function handleCallback(cq, env) {
   }
 
   if (data === "shop_texts") {
-    return edit(chatId, msgId, `📝 <b>متن‌های ربات</b>`, env, [
+    return edit(chatId, msgId, `📝 <b>متن‌ها و پشتیبانی</b>`, env, [
       [
         { text: "👋 خوش‌آمد", callback_data: "shop_welcome" },
         { text: "📖 آموزش", callback_data: "shop_guide" },
       ],
-      [{ text: "📢 متن اسپانسر", callback_data: "shop_sponsor" }],
+      [
+        { text: "📢 اسپانسر", callback_data: "shop_sponsor" },
+        { text: "💬 پشتیبانی", callback_data: "shop_support" },
+      ],
       [{ text: "🔙 تنظیمات فروش", callback_data: "shop_admin" }],
     ]);
   }
@@ -3356,18 +3717,15 @@ async function showMain(chatId, env, msgId = null) {
   ]);
 
   const alive = nodes.length;
-  const reqsText =
-    motherReqs != null
-      ? Number(motherReqs).toLocaleString("fa-IR")
-      : "—";
 
   const text =
-    `🎛️ <b>پنل مدیریت Mother (Push Mode)</b>\n\n` +
-    `🤖 نسخه ربات: <code>${BOT_VERSION}</code>\n` +
-    `🖥 نسخه پنل: <code>${VERSION}</code>\n` +
-    `🖥 نودها: 🟢 ${alive} فعال\n` +
-    `📈 درخواست امروز مادر: <b>${reqsText}(۱۰۰٬۰۰۰)</b>\n\n` +
-    `از دکمه‌های شیشه‌ای استفاده کنید.\nمی‌توانید UUID یا لینک vless ارسال کنید.`;
+    `🎛️ <b>پنل مدیریت Mother</b>\n` +
+    `<i>Push Mode</i>\n\n` +
+    `🤖 ربات: <code>${BOT_VERSION}</code>  ·  🖥 پنل: <code>${VERSION}</code>\n` +
+    `👥 کاربران: <b>${faNum(statusData.users)}</b>  ·  🖥 نود: 🟢 <b>${faNum(alive)}</b>\n\n` +
+    `${motherUsageBar(motherReqs)}\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🔍 هر متنی بفرستید تا در کاربران و نودها جستجو شود.`;
 
   const kb = [
     [
@@ -3375,16 +3733,10 @@ async function showMain(chatId, env, msgId = null) {
       { text: "👥 کاربران", callback_data: "users:0" },
     ],
     [
-      { text: "➕ ساخت کاربر جدید", callback_data: "create" },
       { text: "🖥 مدیریت نودها", callback_data: "nodes_manage" },
+      { text: "💾 بکاپ و بازیابی", callback_data: "backup_menu" },
     ],
-    [
-      { text: "💾 بکاپ دیتابیس", callback_data: "backup_db" },
-      { text: "📥 ایمپورت بکاپ", callback_data: "import_backup" },
-    ],
-    [
-      { text: "♻️ آپدیت همه نودها", callback_data: "update_all_nodes" },
-    ],
+    [{ text: "──────────", callback_data: "noop" }],
     [{ text: "🛍 تنظیمات فروش", callback_data: "shop_admin" }],
   ];
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
@@ -3455,6 +3807,13 @@ async function showStatus(chatId, env, msgId = null) {
       "\n\n🖥 <b>خلاصه نودها:</b>\n" + lines.join("\n");
   }
 
+  // تعداد کاربران تلگرامی فروشگاه (یکتا)
+  let tgUsersCount = 0;
+  try {
+    const orders = await env.DB.prepare("SELECT DISTINCT user_id FROM shop_orders").all();
+    tgUsersCount = (orders.results || []).length;
+  } catch {}
+
   const motherTxt =
     motherReqs != null ? Number(motherReqs).toLocaleString("fa-IR") : "—";
   const nodesReqTxt =
@@ -3470,10 +3829,11 @@ async function showStatus(chatId, env, msgId = null) {
   const text =
     `📊 <b>وضعیت سیستم</b>\n\n` +
     `🔖 نسخه: <code>${VERSION}</code>\n\n` +
-    `👥 <b>کل کاربران:</b> ${res.users}\n` +
-    `✅ <b>فعال:</b> ${res.activeUsers}\n` +
-    `🟢 <b>آنلاین:</b> ${res.onlineUsers}\n` +
-    `🖥 <b>نودها:</b> ${res.nodes}\n` +
+    `👥 <b>کل کاربران پنل:</b> ${faNum(res.users)}\n` +
+    `🛒 <b>کاربران تلگرامی فروشگاه:</b> ${faNum(tgUsersCount)}\n` +
+    `✅ <b>فعال:</b> ${faNum(res.activeUsers)}\n` +
+    `🟢 <b>آنلاین:</b> ${faNum(res.onlineUsers)}\n` +
+    `🖥 <b>نودها:</b> ${faNum(res.nodes)}\n` +
     `📈 <b>ترافیک کل:</b> ${res.totalTrafficGB} GB\n\n` +
     `📡 <b>درخواست امروز:</b>\n` +
     `• مادر: <b>${motherTxt}</b>\n` +
@@ -3498,7 +3858,7 @@ async function showUsers(chatId, page, env, msgId = null) {
   page = Math.max(0, Math.min(page, totalPages - 1));
   const slice = full.slice(page * perPage, (page + 1) * perPage);
 
-  let text = `👥 <b>لیست کاربران</b> (${full.length} نفر)\nصفحه ${page + 1} از ${totalPages}\n\n🟢 فعال 🟡 محدودیت حجم 🔴 غیرفعال\n\n`;
+  let text = `👥 <b>کاربران</b> · ${faNum(full.length)} نفر · صفحه ${faNum(page + 1)}/${faNum(totalPages)}\n🟢 فعال  🟡 محدودیت  🔴 غیرفعال\n\n🔍 نام، UUID، یادداشت یا آیدی را بفرستید.\n\n`;
   const kb = [];
   for (let i = 0; i < slice.length; i += 2) {
     const row = [];
@@ -3520,9 +3880,10 @@ async function showUsers(chatId, page, env, msgId = null) {
   if (page < totalPages - 1) nav.push({ text: "بعدی ▶️", callback_data: `users:${page + 1}` });
   if (nav.length) kb.push(nav);
   kb.push([
+    { text: "➕ ساخت کاربر", callback_data: "create" },
     { text: "🔄 بروزرسانی", callback_data: `users:${page}` },
-    { text: "🔙 منو اصلی", callback_data: "main" },
   ]);
+  kb.push([{ text: "🔙 منو اصلی", callback_data: "main" }]);
   return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
 }
 
@@ -3795,24 +4156,36 @@ async function doDelete(chatId, id, env, msgId) {
 // ====================== Nodes UI ======================
 async function showNodesManage(chatId, env, msgId = null) {
   try {
-    const [alive, managed] = await Promise.all([
+    const [alive, managed, mon] = await Promise.all([
       getHealthyChildren(env),
       getManagedNodes(env),
+      getMonitorConfig(env),
     ]);
 
     const text =
-      `🖥 <b>مدیریت نودها (Push Mode)</b>\n\n` +
-      `🟢 آنلاین: <b>${alive.length}</b>\n` +
-      `📦 ثبت‌شده: <b>${managed.length}</b>\n\n` +
-      `از این بخش نودها را مدیریت کنید.\n` +
-      `همگام‌سازی هر دقیقه توسط مادر انجام می‌شود.`;
+      `🖥 <b>مدیریت نودها</b>\n` +
+      `<i>Push Mode · همگام‌سازی هر دقیقه</i>\n\n` +
+      `🟢 آنلاین: <b>${faNum(alive.length)}</b>  ·  📦 ثبت‌شده: <b>${faNum(managed.length)}</b>\n` +
+      `🔔 هشدار قطع نود: ${mon.nodeAlert ? "🟢 روشن" : "🔴 خاموش"}`;
 
     const kb = [
-      [{ text: "📊 وضعیت / حذف / آپدیت نودها", callback_data: "nodes" }],
-      [{ text: "➕ ساخت نود جدید", callback_data: "node_create" }],
-      [{ text: "🔄 آپدیت نود مادر", callback_data: "update_mother" }],
-      [{ text: "📈 وضعیت اکانت مادر", callback_data: "mother_account_status" }],
-      [{ text: "🔙 بازگشت", callback_data: "main" }],
+      [{ text: "📊 لیست نودها · حذف · جزئیات", callback_data: "nodes" }],
+      [
+        { text: "➕ ساخت نود", callback_data: "node_create" },
+        { text: "♻️ آپدیت همه", callback_data: "update_all_nodes" },
+      ],
+      [{ text: "──────────", callback_data: "noop" }],
+      [
+        { text: "🔄 آپدیت مادر", callback_data: "update_mother" },
+        { text: "📈 اکانت مادر", callback_data: "mother_account_status" },
+      ],
+      [
+        {
+          text: mon.nodeAlert ? "🔴 خاموش هشدار قطع" : "🟢 روشن هشدار قطع",
+          callback_data: "monitor_toggle_node",
+        },
+      ],
+      [{ text: "🔙 منو اصلی", callback_data: "main" }],
     ];
 
     return msgId ? edit(chatId, msgId, text, env, kb) : send(chatId, text, env, kb);
@@ -4164,7 +4537,34 @@ async function showNodes(chatId, env, msgId = null) {
 
 // ====================== Cloudflare Node Ops ======================
 async function createCloudflareNode(chatId, token, env) {
+  const TOTAL = 6;
+  let progMsgId = null;
+  async function setProg(step, label) {
+    const t = progressText("🛠 در حال ساخت نود…", step, TOTAL, label);
+    try {
+      if (progMsgId) {
+        await edit(chatId, progMsgId, t, env);
+      } else {
+        // send first progress and capture id via Telegram API
+        const res = await fetch(`${TG}/bot${env.BOT_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: t,
+            parse_mode: "HTML",
+          }),
+        });
+        const data = await res.json();
+        if (data.ok) progMsgId = data.result.message_id;
+      }
+    } catch (e) {
+      console.log("setProg:", e?.message);
+    }
+  }
+
   try {
+    await setProg(1, "بررسی اکانت کلودفلر");
     const accountsRes = await cfFetch("/accounts?per_page=5", token);
     if (!accountsRes.success || !accountsRes.result?.length) {
       return send(chatId, `❌ خطا در دریافت اکانت:\n<code>${escape(JSON.stringify(accountsRes.errors || accountsRes))}</code>`, env);
@@ -4223,10 +4623,12 @@ async function createCloudflareNode(chatId, token, env) {
       );
     }
 
+    await setProg(2, "آماده‌سازی ساب‌دامین");
     const codeRes = await fetch(CHILD_WORKER_URL);
     if (!codeRes.ok) return send(chatId, `❌ خطا در دریافت کد ورکر فرزند`, env);
     let workerCode = await codeRes.text();
 
+    await setProg(3, "دریافت کد ورکر فرزند");
     // سازگاری با کدهای قدیمی (MOTHER_URL دیگر لازم نیست اما binding را نگه می‌داریم)
     workerCode = workerCode.replace(
       /(?:const|let|var)\s+MOTHER_URL\s*=\s*[^;]+;?/,
@@ -4242,6 +4644,7 @@ async function createCloudflareNode(chatId, token, env) {
     const dbName = `db-${randomNum}`;
     const nodeUrl = `https://${scriptName}.${accountSubdomain}.workers.dev`;
 
+    await setProg(4, "ساخت دیتابیس D1");
     const dbRes = await cfFetch(`/accounts/${accountId}/d1/database`, token, {
       method: "POST",
       body: JSON.stringify({ name: dbName }),
@@ -4263,6 +4666,7 @@ async function createCloudflareNode(chatId, token, env) {
       ],
     };
 
+    await setProg(5, "آپلود ورکر");
     const form = new FormData();
     form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
     form.append("worker.js", new Blob([workerCode], { type: "application/javascript+module" }), "worker.js");
@@ -4281,6 +4685,7 @@ async function createCloudflareNode(chatId, token, env) {
       return send(chatId, `❌ خطا در آپلود ورکر:\n<code>${escape(JSON.stringify(uploadJson.errors || uploadJson))}</code>`, env);
     }
 
+    await setProg(6, "فعال‌سازی و ذخیره");
     try {
       await cfFetch(`/accounts/${accountId}/workers/scripts/${scriptName}/subdomain`, token, {
         method: "POST",
@@ -4534,7 +4939,7 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
     await edit(
       chatId,
       msgId,
-      `⏳ <b>آپدیت نود</b>\n<code>${escape(oldScript)}</code>\n\n🗑 حذف Worker...`,
+      progressText(`♻️ آپدیت نود\n<code>${escape(oldScript)}</code>`, 1, 5, "حذف Worker"),
       env
     );
     try {
@@ -4552,7 +4957,7 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
     await edit(
       chatId,
       msgId,
-      `⏳ <b>آپدیت نود</b>\n<code>${escape(oldScript)}</code>\n\n🗑 حذف D1...`,
+      progressText(`♻️ آپدیت نود\n<code>${escape(oldScript)}</code>`, 2, 5, "حذف D1"),
       env
     );
     if (oldDbId) {
@@ -4596,7 +5001,7 @@ async function updateChildNode(chatId, nodeId, env, msgId) {
     await edit(
       chatId,
       msgId,
-      `⏳ <b>آپدیت نود</b>\n<code>${escape(oldScript)}</code>\n\n🚀 نصب نسخه جدید...\n(رکورد قدیمی بعد از موفقیت حذف می‌شود)`,
+      progressText(`♻️ آپدیت نود\n<code>${escape(oldScript)}</code>`, 4, 5, "نصب نسخه جدید"),
       env
     );
 
@@ -5260,24 +5665,205 @@ function daysRemaining(expiry) {
   if (!Number.isFinite(ms) || ms <= 0) return "۰";
   return faNum(Math.ceil(ms / 86400000));
 }
-function buildVlessLink({ ip, port, uuid, host, path, name, fp = "chrome" }) {
-  const qs = new URLSearchParams({
-    security: "tls",
-    sni: host,
-    fp,
-    type: "ws",
-    path: path || "/",
-    host,
-    encryption: "none",
-    alpn: "http/1.1",
-  });
-  return `vless://${uuid}@${ip}:${port}?${qs.toString()}#${encodeURIComponent(name)}`;
+/**
+ * یک outbound VLESS+WS برای یک نود
+ */
+function buildProxyOutbound({ tag, address, port, uuid, host, path, fp }) {
+  return {
+    tag,
+    protocol: "vless",
+    settings: {
+      vnext: [
+        {
+          address: String(address),
+          port: Number(port) || 443,
+          users: [{ id: uuid, encryption: "none", flow: "" }],
+        },
+      ],
+    },
+    streamSettings: {
+      network: "ws",
+      security: "tls",
+      tlsSettings: {
+        serverName: host,
+        allowInsecure: false,
+        fingerprint: fp || "chrome",
+        alpn: ["http/1.1"],
+      },
+      wsSettings: {
+        path: path || "/",
+        headers: { Host: host },
+      },
+    },
+  };
 }
-function buildInfoLink(uuid, host, title) {
-  return buildVlessLink({ ip: "127.0.0.1", port: 1, uuid, host, path: "/", name: title });
+
+/**
+ * کانفیگ کامل Xray با یک یا چند نود
+ * اگر nodes.length > 1 → balancer + observatory (leastPing)
+ * اگر 1 نود → outbound تگ proxy ساده
+ */
+function buildXrayJsonConfig({ nodes, uuid, path, name, single }) {
+  // سازگاری با فراخوانی قدیمی تک‌نود
+  if (!nodes && single) {
+    nodes = [single];
+  }
+  nodes = Array.isArray(nodes) ? nodes.filter(Boolean) : [];
+  if (!nodes.length) {
+    nodes = [
+      {
+        address: "127.0.0.1",
+        port: 1,
+        host: "127.0.0.1",
+        path: path || "/",
+        fp: "chrome",
+        tag: "proxy",
+      },
+    ];
+  }
+
+  const useBalancer = nodes.length > 1;
+  const proxyOutbounds = nodes.map((n, i) =>
+    buildProxyOutbound({
+      tag: n.tag || (useBalancer ? `proxy-${i}` : "proxy"),
+      address: n.address,
+      port: n.port || 443,
+      uuid,
+      host: n.host,
+      path: n.path || path || "/",
+      fp: n.fp || "chrome",
+    })
+  );
+
+  const outbounds = [
+    ...proxyOutbounds,
+    {
+      tag: "direct",
+      protocol: "freedom",
+      settings: { domainStrategy: "UseIP" },
+    },
+    {
+      tag: "block",
+      protocol: "blackhole",
+      settings: { response: { type: "http" } },
+    },
+  ];
+
+  const routingRules = [
+    {
+      type: "field",
+      outboundTag: "direct",
+      ip: ["geoip:ir", "geoip:private"],
+    },
+    {
+      type: "field",
+      outboundTag: "direct",
+      domain: ["regexp:.*\\.ir$", "domain:ir"],
+    },
+    {
+      type: "field",
+      outboundTag: "direct",
+      protocol: ["bittorrent"],
+    },
+  ];
+
+  if (useBalancer) {
+    routingRules.push({
+      type: "field",
+      network: "tcp,udp",
+      balancerTag: "saow-lb",
+    });
+  } else {
+    routingRules.push({
+      type: "field",
+      outboundTag: "proxy",
+      network: "tcp,udp",
+    });
+  }
+
+  const cfg = {
+    remarks: name || "SAOW",
+    dns: {
+      servers: [
+        "8.8.8.8",
+        "1.1.1.1",
+        {
+          address: "localhost",
+          domains: ["geosite:cn", "geosite:private", "regexp:.*\\.ir$", "domain:ir"],
+        },
+      ],
+      queryStrategy: "UseIPv4",
+      disableCache: false,
+    },
+    inbounds: [
+      {
+        tag: "socks",
+        port: 10808,
+        listen: "127.0.0.1",
+        protocol: "socks",
+        settings: { udp: true, auth: "noauth" },
+        sniffing: {
+          enabled: true,
+          destOverride: ["http", "tls", "quic"],
+          routeOnly: true,
+        },
+      },
+      {
+        tag: "http",
+        port: 10809,
+        listen: "127.0.0.1",
+        protocol: "http",
+        settings: {},
+        sniffing: {
+          enabled: true,
+          destOverride: ["http", "tls", "quic"],
+          routeOnly: true,
+        },
+      },
+    ],
+    outbounds,
+    routing: {
+      domainStrategy: "IPIfNonMatch",
+      rules: routingRules,
+      ...(useBalancer
+        ? {
+            balancers: [
+              {
+                tag: "saow-lb",
+                selector: ["proxy-"],
+                strategy: { type: "leastPing" },
+                fallbackTag: proxyOutbounds[0]?.tag || "proxy-0",
+              },
+            ],
+          }
+        : {}),
+    },
+  };
+
+  // چک سلامت دوره‌ای نودها (برای leastPing)
+  if (useBalancer) {
+    cfg.observatory = {
+      subjectSelector: ["proxy-"],
+      probeURL: "https://www.gstatic.com/generate_204",
+      probeInterval: "30s",
+      enableConcurrency: true,
+    };
+  }
+
+  return cfg;
 }
+
+/** یک JSON pretty برای پاسخ ساب (v2rayNG فقط یک آبجکت معتبر می‌پذیرد) */
+function stringifySubConfig(cfg) {
+  return JSON.stringify(cfg, null, 2);
+}
+
+/**
+ * سابسکریپشن = یک کانفیگ کامل Xray JSON
+ * همه نودهای سالم در outbounds + balancer leastPing + observatory
+ * اگر forcedNode داشت فقط همان نود
+ */
 async function generateSubscription(env, user, motherHost) {
-  const links = [];
   const total = await getUsage(env, user.id);
   const daily = await getDailyUsage(env, user.id);
   const base = user.name || user.id;
@@ -5286,26 +5872,27 @@ async function generateSubscription(env, user, motherHost) {
   const isDailyExceeded = user.dailyQuotaBytes > 0 && daily.total >= user.dailyQuotaBytes;
   const isDisabled = !user.enabled;
 
-  let sponsorText = "";
-  try {
-    const cfg = await getShopConfig(env);
-    sponsorText = (cfg.sponsorText || "").trim();
-  } catch {}
+  let statusRemark = base;
+  if (isDisabled) statusRemark = `🚫 حساب غیرفعال — ${base}`;
+  else if (isExpired) statusRemark = `⏰ منقضی — ${base}`;
+  else if (isQuotaExceeded) statusRemark = `📦 حجم تمام — ${base}`;
+  else if (isDailyExceeded) statusRemark = `📅 حجم روزانه تمام — ${base}`;
 
   if (isDisabled || isExpired || isQuotaExceeded || isDailyExceeded) {
-    if (isDisabled) links.push(buildInfoLink(user.uuid, motherHost, `🚫 حساب شما غیرفعال شده است`));
-    if (isExpired) links.push(buildInfoLink(user.uuid, motherHost, `⏰ زمان اشتراک به پایان رسیده`));
-    if (isQuotaExceeded) links.push(buildInfoLink(user.uuid, motherHost, `📦 حجم کل تمام شده`));
-    if (isDailyExceeded) links.push(buildInfoLink(user.uuid, motherHost, `📅 حجم روزانه تمام شده`));
-    if (sponsorText) {
-      // چند خط اسپانسر را به صورت بنر جداگانه
-      for (const line of sponsorText.split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 4)) {
-        links.push(buildInfoLink(user.uuid, motherHost, line.slice(0, 64)));
-      }
-    } else {
-      links.push(buildInfoLink(user.uuid, motherHost, `🔄 برای تمدید با پشتیبانی در ارتباط باشید`));
-    }
-    return links.join("\n");
+    return stringifySubConfig(
+      buildXrayJsonConfig({
+        uuid: user.uuid,
+        name: statusRemark,
+        single: {
+          address: "127.0.0.1",
+          port: 1,
+          host: motherHost || "127.0.0.1",
+          path: "/",
+          fp: "chrome",
+          tag: "proxy",
+        },
+      })
+    );
   }
 
   const rawManaged = await getManagedNodes(env);
@@ -5331,11 +5918,8 @@ async function generateSubscription(env, user, motherHost) {
     return false;
   }
 
-  // ---------- انتخاب نود ----------
-  // 1) اگر کاربر قفل روی نود خاص باشد → همان
-  // 2) وگرنه بین نودهای سالم که exclude_sub=0 نیستند، کم‌بارترین (کمترین درخواست امروز)
-  let selectedUrl = null;
-  let selectedNode = null;
+  // لیست نودهای کاندید
+  let candidateNodes = [];
 
   if (user.forcedNode) {
     const forced = managed.find(
@@ -5344,146 +5928,178 @@ async function generateSubscription(env, user, motherHost) {
         m.id === user.forcedNode ||
         (m.url && m.url.includes(user.forcedNode))
     );
-    if (forced && forced.url) {
-      selectedNode = forced;
-      selectedUrl = forced.url;
-    }
+    if (forced && forced.url) candidateNodes = [forced];
   }
 
-  if (!selectedUrl) {
-    const healthyManaged = [];
+  if (!candidateNodes.length) {
+    // اول نودهای سالم (heartbeat)
     for (const m of managed) {
       if (!m.url || m.is_disabled === 1) continue;
-      if (m.exclude_sub === 1) continue; // خارج از چرخه ساب
+      if (m.exclude_sub === 1) continue;
       if (alive.some((a) => isAliveMatch(m, a))) {
-        healthyManaged.push(m);
+        candidateNodes.push(m);
       }
     }
+  }
 
-    if (healthyManaged.length) {
-      const scored = await Promise.all(
-        healthyManaged.map(async (m) => {
-          let reqs = Number.MAX_SAFE_INTEGER;
-          try {
-            const token = await resolveNodeToken(env, m);
-            if (token && m.account_id) {
-              const r = await getAccountRequestsToday(token, m.account_id);
-              if (typeof r === "number") reqs = r;
-            }
-          } catch {}
-          return { node: m, reqs };
-        })
-      );
-      scored.sort((a, b) => a.reqs - b.reqs);
-      selectedNode = scored[0].node;
-      selectedUrl = selectedNode.url;
+  // اگر هیچ heartbeat زنده‌ای نبود → همه نودهای managed با url
+  if (!candidateNodes.length) {
+    candidateNodes = managed.filter(
+      (m) => m.url && m.is_disabled !== 1 && m.exclude_sub !== 1
+    );
+  }
+
+  // اگر هنوز خالی → از alive خام
+  if (!candidateNodes.length && alive.length) {
+    candidateNodes = alive
+      .filter((a) => a.url)
+      .map((a) => ({ url: a.url, script_name: a.id || "alive" }));
+  }
+
+  if (!candidateNodes.length) {
+    return stringifySubConfig(
+      buildXrayJsonConfig({
+        uuid: user.uuid,
+        name: `⚠️ هیچ نود فعالی نیست — ${base}`,
+        single: {
+          address: "127.0.0.1",
+          port: 1,
+          host: motherHost || "127.0.0.1",
+          path: "/",
+          fp: "chrome",
+          tag: "proxy",
+        },
+      })
+    );
+  }
+
+  // امتیازدهی بر اساس درخواست روزانه CF (کم‌بارتر اول)
+  const scored = await Promise.all(
+    candidateNodes.map(async (m) => {
+      let reqs = Number.MAX_SAFE_INTEGER;
+      try {
+        const token = await resolveNodeToken(env, m);
+        if (token && m.account_id) {
+          const r = await getAccountRequestsToday(token, m.account_id);
+          if (typeof r === "number") reqs = r;
+        }
+      } catch {}
+      return { node: m, reqs };
+    })
+  );
+  scored.sort((a, b) => a.reqs - b.reqs);
+
+  // حداکثر نود و IP برای سبکی کانفیگ
+  const MAX_NODES = 6;
+  const IPS_PER_NODE = 3; // چند clean IP به ازای هر نود
+  const MAX_OUTBOUNDS = 12; // سقف کل outboundهای پروکسی
+  const picked = scored.slice(0, MAX_NODES);
+
+  // IPهای clean کلودفلر برای address
+  let cleanIps = [];
+  try {
+    const gh = await ensureDomainsList();
+    for (const item of gh || []) {
+      if (!item) continue;
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(item)) {
+        if (!cleanIps.includes(item)) cleanIps.push(item);
+      } else {
+        try {
+          const ip = await resolveDomain(item);
+          if (ip && !cleanIps.includes(ip)) cleanIps.push(ip);
+        } catch {}
+      }
+      if (cleanIps.length >= 12) break;
+    }
+  } catch {}
+  if (cleanIps.length < 3) {
+    try {
+      const resolved = await ensureIrcfResolved();
+      for (const item of IRCF_DOMAINS) {
+        const ip = resolved[item.domain];
+        if (ip && !cleanIps.includes(ip)) cleanIps.push(ip);
+        if (cleanIps.length >= 12) break;
+      }
+    } catch {}
+  }
+
+  const wsPath = `/?u=${user.id}`;
+  const fps = ["chrome", "firefox", "safari", "edge", "chrome", "random"];
+  const ports = [443, 443, 8443, 2053, 2083, 2087];
+
+  // هر نود × چند clean IP = چند outbound جدا
+  // balancer + observatory بینشان سوییچ می‌کند (leastPing)
+  const nodeEntries = [];
+  let obIdx = 0;
+
+  for (let i = 0; i < picked.length; i++) {
+    if (obIdx >= MAX_OUTBOUNDS) break;
+    const m = picked[i].node;
+    const host = hostFromUrl(m.url);
+    if (!host) continue;
+    const childNo = shortChildId(m.script_name || m.id || host.split(".")[0] || "");
+
+    const ipsForNode = [];
+    if (cleanIps.length) {
+      for (let k = 0; k < IPS_PER_NODE; k++) {
+        const ip = cleanIps[(i * IPS_PER_NODE + k) % cleanIps.length];
+        if (ip && !ipsForNode.includes(ip)) ipsForNode.push(ip);
+      }
+    }
+    if (!ipsForNode.length) ipsForNode.push(host);
+
+    for (let k = 0; k < ipsForNode.length; k++) {
+      if (obIdx >= MAX_OUTBOUNDS) break;
+      nodeEntries.push({
+        tag: `proxy-${obIdx}`,
+        address: ipsForNode[k],
+        port: ports[(i + k) % ports.length],
+        host,
+        path: wsPath,
+        fp: fps[(i + k) % fps.length],
+        _label: childNo,
+        _reqs: picked[i].reqs,
+      });
+      obIdx++;
     }
   }
 
-  if (!selectedUrl) {
-    // fallback: هر نود مدیریت‌شده غیرقفل (حتی exclude_sub) با url
-    const withUrl = managed.find((m) => m.url && m.is_disabled !== 1 && m.exclude_sub !== 1);
-    if (withUrl) {
-      selectedNode = withUrl;
-      selectedUrl = withUrl.url;
-    }
+  if (nodeEntries.length === 1) {
+    nodeEntries[0].tag = "proxy";
   }
 
-  if (!selectedUrl && alive.length && alive[0].url) {
-    selectedUrl = alive[0].url;
-  }
-
-  let childHost = hostFromUrl(selectedUrl);
-  if (!selectedUrl) {
-    links.push(buildInfoLink(user.uuid, motherHost, `⚠️ هیچ نود فعالی وجود ندارد`));
-    return links.join("\n");
-  }
-
-  if (!childHost) {
-    links.push(buildInfoLink(user.uuid, motherHost, `⚠️ نود نامعتبر`));
-    return links.join("\n");
+  if (!nodeEntries.length) {
+    return stringifySubConfig(
+      buildXrayJsonConfig({
+        uuid: user.uuid,
+        name: `⚠️ هیچ نود فعالی نیست — ${base}`,
+        single: {
+          address: "127.0.0.1",
+          port: 1,
+          host: motherHost || "127.0.0.1",
+          path: "/",
+          fp: "chrome",
+          tag: "proxy",
+        },
+      })
+    );
   }
 
   const activeCount = await getActiveIPCount(env, user.id);
-  const childNo = shortChildId(
-    selectedNode?.script_name || selectedNode?.id || childHost.split(".")[0] || ""
-  );
   const usedStr = formatBytesShort(total.total);
   const quotaStr = user.quotaBytes > 0 ? formatBytesShort(user.quotaBytes) : "∞";
   const daysStr = daysRemaining(user.expiry);
-  // بنر خلاصه + شماره child
-  links.push(
-    buildVlessLink({
-      ip: "127.0.0.1",
-      port: 1,
-      uuid: user.uuid,
-      host: motherHost,
-      path: "/",
-      name: `📋 #${childNo} │ ${usedStr}/${quotaStr} │ ${daysStr}روز │ IP ${faNum(activeCount)}/${faNum(user.ipLimit)}`,
-    })
-  );
+  // ریمارک: به جای لیست نودها فقط «all»
+  const remark = `${base} │ all │ ${usedStr}/${quotaStr} │ ${daysStr}روز │ IP ${faNum(activeCount)}/${faNum(user.ipLimit)}`;
 
-  if (sponsorText) {
-    for (const line of sponsorText.split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 3)) {
-      links.push(buildInfoLink(user.uuid, motherHost, line.slice(0, 64)));
-    }
-  }
+  const cfg = buildXrayJsonConfig({
+    nodes: nodeEntries,
+    uuid: user.uuid,
+    path: wsPath,
+    name: remark,
+  });
 
-  // دامنه‌های گیت‌هاب (ترجیحاً IP رزولوشن‌شده)
-  let gh = [];
-  try {
-    gh = await ensureDomainsList();
-  } catch {}
-  const preferred = (gh || []).slice(0, 5);
-  const ports = [443, 8443, 2053, 2083, 2087];
-  const fps = ["chrome", "firefox", "safari", "edge", "random"];
-  for (let i = 0; i < preferred.length; i++) {
-    let addr = preferred[i];
-    // اگر دامنه است، IP بگیر (در غیر این صورت همان IP/رشته)
-    if (addr && !/^\d{1,3}(\.\d{1,3}){3}$/.test(addr)) {
-      try {
-        const resolvedIp = await resolveDomain(addr);
-        if (resolvedIp) addr = resolvedIp;
-      } catch {}
-    }
-    links.push(
-      buildVlessLink({
-        ip: addr,
-        port: ports[i % ports.length],
-        uuid: user.uuid,
-        host: childHost,
-        path: `/?u=${user.id}`,
-        name: `⭐ ${base} | P${i + 1}`,
-        fp: fps[i % fps.length],
-      })
-    );
-  }
-
-  // دامنه‌های IRCF (همیشه IP با TTL ۵ دقیقه)
-  let resolved = {};
-  try {
-    resolved = await ensureIrcfResolved();
-  } catch {}
-  let idx = 0;
-  const ircfFps = ["chrome", "firefox", "safari", "edge", "random"];
-  for (const item of IRCF_DOMAINS) {
-    const ip = resolved[item.domain];
-    if (!ip) continue;
-    links.push(
-      buildVlessLink({
-        ip,
-        port: 443,
-        uuid: user.uuid,
-        host: childHost,
-        path: `/?u=${user.id}`,
-        name: `⚡ ${base} | ${item.name}`,
-        fp: ircfFps[idx % ircfFps.length],
-      })
-    );
-    idx++;
-  }
-
-  return links.join("\n");
+  return stringifySubConfig(cfg);
 }
 
 // ====================== API (دیگر برای گزارش از فرزند استفاده نمی‌شود) ======================
